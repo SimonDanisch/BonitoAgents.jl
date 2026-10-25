@@ -33,12 +33,15 @@ function install_workspace!(session::Bonito.Session,
                    style = Bonito.Styles("min-height" => "0"))
     pane.workspace[] = ws
 
-    # The chat panel doubles as the Home/dashboard view (current_view == ""). A
-    # sidebar click (Home or a project) must (1) bring this panel to the front —
-    # the user may have a file/app tab active — and (2) relabel its tab so "Home"
-    # reads as Home, not a stale "Chat". `Panel.label` is an Observable, so the
-    # tab updates live.
-    relabel_chat_panel!() = (chat_panel.label[] = isempty(current_view[]) ? "Home" : "Chat")
+    # The chat panel doubles as the Home/dashboard view (current_view == "") and
+    # the Settings page. A sidebar click (Home, Settings or a project) must (1)
+    # bring this panel to the front — the user may have a file/app tab active —
+    # and (2) relabel its tab so "Home" reads as Home, not a stale "Chat".
+    # `Panel.label` is an Observable, so the tab updates live.
+    function relabel_chat_panel!()
+        label = isempty(current_view[]) ? "Home" : current_view[] == SETTINGS_VIEW ? "Settings" : "Chat"
+        chat_panel.label[] == label || (chat_panel.label[] = label)
+    end
     relabel_chat_panel!()
     on(session, current_view) do _
         relabel_chat_panel!()
@@ -100,6 +103,13 @@ function install_workspace!(session::Bonito.Session,
             if (window.Bonito && window.Bonito.Sessions && window.Bonito.Sessions.move_dom_node)
                 window.Bonito.Sessions.move_dom_node(n, p, null);
             else p.appendChild(n); };
+        // On the slot (what tests read) and its frame (what the CSS reads).
+        const setDetached = (slot, on) => {
+            for (const n of [slot, slot.closest('.bt-embed-frame')]) {
+                if (!n) continue;
+                if (on) n.dataset.detached = '1'; else delete n.dataset.detached;
+            }
+        };
         function adopt(tid) {
             if (!tid) return;
             let tries = 90;
@@ -112,7 +122,7 @@ function install_workspace!(session::Bonito.Session,
                     const body  = lib.toolSlot(tid);
                     const embed = body && body.querySelector('.bt-embed');
                     const slot  = body && body.querySelector('.bt-slot');
-                    if (embed) { move(embed, frame); if (slot) slot.dataset.detached = '1'; }
+                    if (embed) { move(embed, frame); if (slot) setDetached(slot, true); }
                 });
             };
             step();
@@ -128,7 +138,7 @@ function install_workspace!(session::Bonito.Session,
             $(ChatLib).then(lib => {
                 const body = lib.toolSlot(tid);
                 const slot = body && body.querySelector('.bt-slot');
-                if (slot) { move(embed, slot); delete slot.dataset.detached; }
+                if (slot) { move(embed, slot); setDetached(slot, false); }
             });
         });
     }
@@ -193,9 +203,10 @@ const WorkspaceStageStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "font-size" => "11px", "font-style" => "italic",
         "display" => "none"),
-    # The controller marks the slot detached while the embed lives in the app
-    # panel; reveal the placeholder in the now-empty inline spot.
-    Bonito.CSS(".bt-embed-frame:has(.bt-slot[data-detached]) .bt-detach-placeholder",
+    # The controller marks the slot and its frame detached while the embed
+    # lives in the app panel; reveal the placeholder in the now-empty inline
+    # spot.
+    Bonito.CSS(".bt-embed-frame[data-detached] .bt-detach-placeholder",
         "display" => "inline"),
     # A detached app's panel content: the frame fills the panel and scrolls; the
     # adopted embed (moved in by `app_adopt_content`) fills the frame.

@@ -133,13 +133,32 @@ end
 session_notice_capability() = Dict("jetbrains" => Dict("air" => Dict(
     "version" => 1, "capabilities" => ["sessionFailure"])))
 
-function session_notice_record(params::AbstractDict)
+# The version-1 AIR envelope (`_meta.jetbrains.air`) a frame carries, or nothing.
+function air_meta(params::AbstractDict)
     value = params
     for key in ("_meta", "jetbrains", "air")
         value = get(value, key, nothing)
         value isa AbstractDict || return nothing
     end
     get(value, "version", nothing) == 1 || return nothing
+    return value
+end
+
+"""
+    session_notice_record(params) -> Union{Dict{String,Any},Nothing}
+
+The session-failure record a frame carries in its AIR envelope, or `nothing`.
+
+Two frames carry one. A `session_info_update` reports a notice while the turn
+runs (a retry warning, a stalled transport). The `session/prompt` RESPONSE
+reports how the turn ended: codex-acp (2.2.2, captured in
+`test/fixtures/codex_usage_limit_responses.json`) resolves a FAILED turn as a
+plain `end_turn` and puts the failure only there, as a record with
+`severity = "error"`. Nothing else on the wire says the turn failed.
+"""
+function session_notice_record(params::AbstractDict)
+    value = air_meta(params)
+    value === nothing && return nothing
     record = get(value, "sessionFailure", nothing)
     record isa AbstractDict || return nothing
     all(k -> get(record, k, nothing) isa AbstractString, ("id", "severity", "title")) || return nothing
@@ -201,10 +220,10 @@ session. Content the user watches appear — prose, thoughts, tool calls, plans 
 is work; `available_commands` / `current_mode` / `session_info` / `usage` are
 metadata that arrives on bind and at turn boundaries.
 
-The distinction matters because these updates also arrive with NO prompt open
-(see `Unprompted`), and treating every one of them as "the agent is busy" makes a
-chat that has done nothing look busy: a fresh session emits
-`available_commands_update` right after `session/new`.
+The distinction matters because these updates also arrive with NO prompt open,
+and only work starts a turn of the agent's own (`AgentTurn`): a fresh session
+emits `available_commands_update` right after `session/new`, and a chat that has
+done nothing must not look busy for it.
 
 `SubagentUpdate` is work, but reaches this only in tests — on the wire it is
 addressed to its owner before liveness is ever consulted.
@@ -219,16 +238,14 @@ is_agent_work(::SubagentUpdate) = true
 
 # ── Autonomous cycles ────────────────────────────────────────────────────────
 # claude-agent-acp tags the `usage_update` it sends at a CYCLE'S RESULT with
-# `_meta["_claude/origin"].kind`, and that tag is the only end-of-episode signal
-# on the wire. When the agent auto-wakes after backgrounded work finishes, it
-# streams prose and tools with no prompt open — an episode with an obvious start
-# and, without this, no observable end at all.
+# `_meta["_claude/origin"].kind`. For a cycle the model ran on its own (it
+# reports back on backgrounded work, or answers a peer) that tag is where the
+# cycle ends, and the connection ends its `AgentTurn` there.
 #
 # The set is the adapter's own `AUTONOMOUS_RESULT_ORIGINS` (acp-agent.js): work
 # the model did on its own. The user's turn is tagged `human`, and
 # `auto-continuation` continues the user's turn, so neither counts. Verified in
-# both captured wires — the auto-wake's last frame is a `usage_update` with
-# `kind = "task-notification"`.
+# both captured wires, also for a cancelled cycle.
 const AUTONOMOUS_ORIGINS = ("task-notification", "peer", "coordinator",
                             "observer", "observer-activity")
 
@@ -240,53 +257,6 @@ Whether an origin tag marks the result of a cycle the model ran on its own.
 """
 is_autonomous_origin(::Nothing) = false
 is_autonomous_origin(kind::AbstractString) = kind in AUTONOMOUS_ORIGINS
-
-# ── What the session is doing ────────────────────────────────────────────────
-# ONE value, replacing the pile of independent booleans this used to be
-# (`unprompted_work`, `cancelling`, and — a layer up — `busy_active` and
-# `autowake`). Each of those was a latch whose SET and CLEAR lived on different
-# code paths, and each had at least one path where the clear never ran:
-#
-#   * `cancelling` was cleared by a cancelled prompt's response, so cancelling
-#     UN-prompted work latched it forever and the session went silent until the
-#     user reloaded.
-#   * `busy_active`/`autowake` were cleared by a `usage_update` the agent tags
-#     with an autonomous origin — which claude-agent-acp emits conditionally and
-#     can simply omit — so the spinner ran over an idle agent, and because the
-#     composer queues while busy, the chat became unusable.
-#
-# The rule this type enforces: EVERY state has an exit that does not depend on
-# the agent volunteering anything.
-abstract type SessionActivity end
-
-"Nothing of ours is open and the agent is not streaming."
-struct Idle <: SessionActivity end
-
-"At least one `session/prompt` of ours is open. Ends at its response."
-struct Prompted <: SessionActivity end
-
-"""
-The agent is working with no prompt of ours open — it auto-woke after
-backgrounded work finished, or a background subagent is reporting.
-
-This is the one state the wire gives no end marker for: an auto-wake episode is
-prose and tools that simply stop. `AUTONOMOUS_ORIGINS` tags the usual last frame
-but is not guaranteed, so it is treated as a hint, never as the only way out —
-`quiet_since` bounds the state instead (see `settle`).
-"""
-struct Unprompted <: SessionActivity end
-
-"A cancel is on the wire and we are waiting for the turn to wind down."
-struct Cancelling <: SessionActivity end
-
-"""
-Whether the agent has work in flight that a cancel could reach.
-
-`Idle` is the only state where stop has nothing to do — and that is exactly the
-moment a UI should treat its own spinner as stale rather than act on it.
-"""
-is_working(::SessionActivity) = true
-is_working(::Idle) = false
 
 # ── The message stream ───────────────────────────────────────────────────────
 # Whole, ordered messages coalesced from the raw `session/update` soup. The
@@ -343,6 +313,90 @@ function wait_rendered(m::StreamFlush)
     return nothing
 end
 
+# ── Turns ────────────────────────────────────────────────────────────────────
+"""
+    Turn
+
+One run of the agent's loop: a prompt of ours (`PromptTurn`) or a cycle the
+agent started itself (`AgentTurn`). Only the connection ends one, where the wire
+says it ended. `over` is a latch closed at the end (`wait`, `isover`); `flush`
+marks the end on the main stream.
+"""
+abstract type Turn end
+
+"""
+A `session/prompt` of ours. Over at the agent's answer (`response` takes the
+stop reason or the error) or when the connection dies. Its `flush` goes on the
+main stream at the answer's frame, so steering cannot merge the next prompt's
+text into this one's bubble.
+"""
+struct PromptTurn <: Turn
+    id::Int
+    response::Channel{Any}
+    flush::StreamFlush
+    over::Channel{Nothing}
+end
+PromptTurn(id::Int) = PromptTurn(id, Channel{Any}(1), StreamFlush(), Channel{Nothing}(0))
+
+"""
+A cycle the agent started itself (needs `Connection(...; agent_turns = true)`).
+Opens at a work frame while no turn is open, announced by `TurnStarted`. Over at
+its autonomous-origin result, a non-cancelled answer to a prompt of ours, or
+teardown.
+"""
+struct AgentTurn <: Turn
+    flush::StreamFlush
+    over::Channel{Nothing}
+end
+AgentTurn() = AgentTurn(StreamFlush(), Channel{Nothing}(0))
+
+"Whether `t` is over."
+isover(t::Turn) = !isopen(t.over)
+
+# The connection's, and the only way a turn ends.
+end_turn!(t::Turn) = (close(t.over); nothing)
+
+"Block until `t` is over."
+Base.wait(t::Turn) = (wait_closed(t.over); nothing)
+
+"""
+    wait_over(turns; timeout) -> Bool
+
+Block until every turn in `turns` is over, or `timeout` seconds have passed.
+Returns whether they are all over.
+"""
+function wait_over(turns; timeout::Real)
+    deadline = time() + timeout
+    return all(t -> wait_closed(t.over; timeout = deadline - time()), turns)
+end
+
+# Block until `latch` closes or `timeout` passes; whether it closed. A latch is
+# a channel nothing is put on: closing it reaches every waiter.
+function wait_closed(latch::Channel; timeout::Real = Inf)
+    isopen(latch) || return true
+    if !isfinite(timeout)
+        for _ in latch end
+        return true
+    end
+    timeout > 0 || return false
+    result = Channel{Bool}(2)              # room for both answers: neither put! blocks
+    timer = Timer(_ -> put!(result, false), timeout)
+    Base.errormonitor(@async ((for _ in latch end); put!(result, true)))
+    closed = take!(result)
+    close(timer)
+    return closed
+end
+
+"""
+    TurnStarted(turn)
+
+On the main stream, ahead of the first thing an `AgentTurn` says: the agent
+started a turn of its own. Ours need no announcement, `prompt!` hands them back.
+"""
+struct TurnStarted <: Message
+    turn::AgentTurn
+end
+
 # ── Session config options ────────────────────────────────────────────────────
 # ACP "Session Config Options": the session-setup response MAY carry a list of
 # select-type options (`configOptions`) with their current values; the agent
@@ -385,7 +439,13 @@ struct UsageUpdateNotif <: SessionUpdate
     cost_amount::Union{Float64,Nothing}
     cost_currency::Union{String,Nothing}
     origin_kind::Union{String,Nothing}
+    # Claude Code's estimate of the tokens the model has thought so far in this
+    # response (`_meta["_claude/thinkingTokens"]`), on the updates
+    # claude-agent-acp sends while the model thinks; `nothing` on every other.
+    thinking_tokens::Union{Int,Nothing}
 end
+UsageUpdateNotif(used, size, cost_amount, cost_currency, origin_kind) =
+    UsageUpdateNotif(used, size, cost_amount, cost_currency, origin_kind, nothing)
 
 # One slash command (`available_commands_update`): pushed at session start
 # and re-pushed whenever claude's command set changes. `hint` is the
@@ -660,6 +720,7 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
             v isa AbstractString && (name = String(v))
         end
     end
+    isempty(name) && (name = codex_tool_name(params))
     if isempty(name)
         t = get(params, "title", nothing)
         if t isa AbstractString &&
@@ -676,6 +737,32 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
     cx = codex_mcp_envelope(rinput_d)
     cx === nothing && return (name, rinput_d)
     return cx
+end
+
+"""
+    CONTEXT_COMPACTION_TOOL
+
+The tool name a context compaction gets: the agent's runtime summarising the
+conversation so it fits its context window again.
+
+codex-acp reports one as a nameless `think` tool call titled "Compact
+conversation", tagged only by a `contextCompaction` key in its `_meta`: at the
+top in 1.11.0, inside the AIR envelope (`_meta.jetbrains.air`) in 2.2.2 (both
+captured in `test/fixtures/codex_*compaction.jsonl`). It runs before a turn
+whenever the context is nearly full, so it says nothing about whether the agent
+did anything. Without a name it is indistinguishable from real tool work, and a
+Codex turn that failed at the compaction step looked like a turn that worked.
+"""
+const CONTEXT_COMPACTION_TOOL = "ContextCompaction"
+
+# A tool name only codex-acp's `_meta` tags give, or "".
+function codex_tool_name(params::AbstractDict)
+    meta = get(params, "_meta", nothing)
+    meta isa AbstractDict || return ""
+    air = air_meta(params)
+    compaction = haskey(meta, "contextCompaction") ||
+                 (air !== nothing && haskey(air, "contextCompaction"))
+    return compaction ? CONTEXT_COMPACTION_TOOL : ""
 end
 
 """
@@ -843,12 +930,14 @@ function parse_session_update_kind(params::AbstractDict)::SessionUpdate
         meta = get(params, "_meta", nothing)
         origin = meta isa AbstractDict ? get(meta, "_claude/origin", nothing) : nothing
         okind = origin isa AbstractDict ? get(origin, "kind", nothing) : nothing
+        thinking = meta isa AbstractDict ? get(meta, "_claude/thinkingTokens", nothing) : nothing
         return UsageUpdateNotif(
             round(Int, get(params, "used", 0)),
             round(Int, get(params, "size", 0)),
             cost isa AbstractDict ? Float64(get(cost, "amount", 0.0)) : nothing,
             cost isa AbstractDict ? String(get(cost, "currency", "USD")) : nothing,
-            okind isa AbstractString ? String(okind) : nothing)
+            okind isa AbstractString ? String(okind) : nothing,
+            thinking isa Real && isfinite(thinking) ? round(Int, thinking) : nothing)
     elseif kind == "available_commands_update"
         cmds = CommandInfo[]
         for c in get(params, "availableCommands", [])

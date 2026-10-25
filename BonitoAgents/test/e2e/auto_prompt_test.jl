@@ -56,7 +56,10 @@
     # 2. Tear the freshly-bound session down so we're back to the production
     #    pre-condition the GitHub flow sets up: a registered project with NO
     #    live ChatModel and an empty transcript. `stop_session!` evicts the
-    #    model from `state.chat_models`.
+    #    model from `state.chat_models`. Leave the chat first: a chat the
+    #    server closes while a tab shows it comes straight back
+    #    (`e2e:chat_closed_under_tab`), before the prompt below is seeded.
+    TK.to_dashboard(s)
     BT.stop_session!(state, proj)
     @test TK.wait_for(s, "session torn down",
         "true"; timeout = 1) == true  # settle the @async teardown notify
@@ -130,8 +133,7 @@
         BT.save_projects!(state)
         reloaded = BT.ServerState(;
             state_dir     = state.state_dir,
-            working_dir   = state.working_dir,
-            worker_secret = state.worker_secret)
+            working_dir   = state.working_dir)
         @test haskey(reloaded.projects[], pid)
         @test reloaded.projects[][pid].auto_prompt === nothing
     end

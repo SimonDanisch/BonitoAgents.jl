@@ -99,9 +99,15 @@ wait_frames(ws, n; timeout = 60.0) = timedwait(() -> length(ws.frames) >= n, tim
     end
 
     @testset "run_eval_host refuses to start without its environment" begin
-        withenv("BONITOAGENTS_SERVER_URL" => nothing, "BONITOAGENTS_SECRET" => nothing,
-                "BONITOAGENTS_PROJECT_ID" => nothing, M.HOST_ENV_WORKER => nothing) do
+        # No relay grant, or no worker identity: nothing to connect as.
+        withenv("BONITOAGENTS_CONTROL_URL" => nothing, "BONITOAGENTS_CONTROL_TOKEN" => nothing,
+                M.HOST_ENV_WORKER => "some-worker") do
             @test_throws ErrorException M.run_eval_host()
+        end
+        withenv("BONITOAGENTS_CONTROL_URL" => "ws://127.0.0.1:1", "BONITOAGENTS_CONTROL_TOKEN" => "t",
+                "BONITOAGENTS_EVAL_TOKEN" => "e", M.HOST_ENV_WORKER => nothing) do
+            err = try M.run_eval_host(); nothing catch e; e end
+            @test err isa ErrorException && occursin(M.HOST_ENV_WORKER, err.msg)
         end
         @test M.host_worker_id() == ""
     end

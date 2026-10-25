@@ -39,7 +39,7 @@
     @testset "several panes mounted, exactly one visible" begin
         npanes = TK.eval_js(s, "document.querySelectorAll('.bt-chatpane').length")
         @test (npanes === nothing ? 0 : Int(npanes)) >= 3
-        nvis = TK.eval_js(s, "[...document.querySelectorAll('.bt-chatpane')].filter(p=>p.offsetParent!==null).length")
+        nvis = TK.eval_js(s, "[...document.querySelectorAll('.bt-chatpane')].filter(p=>p.getAttribute('aria-hidden') !== 'true').length")
         @test (nvis === nothing ? 0 : Int(nvis)) == 1
     end
 

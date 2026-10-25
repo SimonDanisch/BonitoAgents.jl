@@ -1,0 +1,335 @@
+# A server behind a tunnel (`TunnelAuth`, tunnel.jl): no Caddy in front, the
+# server asks Authelia about every request itself and serves Authelia's login
+# under its own name. Against the real Authelia, over plain HTTP to 127.0.0.1 the
+# way cloudflared delivers requests. `e2e:tunnel_login` logs in from a browser.
+
+@testitem "unit:tunnel the login gate against the real Authelia" tags = [:unit] begin
+    import BonitoAgents, Bonito
+    const BT = BonitoAgents
+    const BW = BT.BonitoWorker
+    using Test, HTTP, JSON, Dates, SHA
+    Sys.islinux() || return
+
+    # An authenticator app's one-time code (RFC 6238: 30 s steps, 6 digits, SHA-1),
+    # from the secret in the `otpauth://` link the server hands out.
+    B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    function unbase32(text)
+        bits = join(string(findfirst(==(c), B32) - 1; base = 2, pad = 5) for c in text)
+        return [parse(UInt8, bits[i:i+7]; base = 2) for i in 1:8:(length(bits) - 7)]
+    end
+    secret_of(a) = unbase32(match(r"[?&]secret=([A-Z2-7]+)", a.uri)[1])
+    function totp(secret::Vector{UInt8}, step::Integer)
+        h = SHA.hmac_sha1(secret, reverse(reinterpret(UInt8, [UInt64(step)])))
+        o = h[end] & 0x0f
+        code = (UInt32(h[o+1] & 0x7f) << 24) | (UInt32(h[o+2]) << 16) | (UInt32(h[o+3]) << 8) | UInt32(h[o+4])
+        return lpad(string(code % UInt32(1_000_000)), 6, '0')
+    end
+
+    bins = BT.fetch_proxy_binaries(joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")),
+                                            "bonitoagents-test", "proxy-bin"))
+    dir = mktempdir()
+    users_file = joinpath(mkpath(joinpath(dir, "authelia")), "users.yml")
+    port, aport = BT.free_port(), BT.free_port()
+    write(joinpath(dir, "proxy.json"), JSON.json(Dict(
+        "domain" => "team.example.com", "admin" => "bob", "port" => port, "authelia_port" => aport,
+        "tls" => "tunnel", "authelia_bin" => bins.authelia, "users_file" => users_file,
+        "session_socket" => joinpath(dirname(users_file), "sessions", "store.sock"))))
+    auth = BT.auth_mode(dir)
+    @test auth isa BT.TunnelAuth
+    # bob, an admin, with the password Authelia made and an authenticator app.
+    pw = BT.authelia_random_password(auth.config)
+    BT.atomic_write_json(joinpath(dir, "accounts.json"),
+                         [Dict(BT.Account("bob", "Bob B", "bob@example.com", ["admins"], false, pw.hash))])
+
+    state = BT.serve(; port, auth, state_dir = dir, working_dir = mktempdir(), scan_on_connect = false)
+    config = BT.authelia_config_file(auth.config)
+    # The server registers bob's authenticator, as the installer has it do for the
+    # first admin: before Authelia ever ran.
+    bobs = BT.register_authenticator!(state, "bob")
+    @test startswith(bobs.uri, "otpauth://totp/team.example.com:bob?") && occursin("issuer=team.example.com", bobs.uri)
+    @test bobs.qr[1:4] == UInt8[0x89, 0x50, 0x4e, 0x47]     # a PNG
+    secret = secret_of(bobs)
+    # Authelia keeps its sessions in the store the server configured, as on an install.
+    store = BT.start_session_store(bins.valkey, auth.config.session_socket; log = joinpath(dir, "sessions.log"))
+    log = joinpath(dir, "authelia.log")
+    authelia = run(pipeline(`$(bins.authelia) --config $(config)`; stdout = log, stderr = log); wait = false)
+    url = "http://127.0.0.1:$(port)"
+    try
+        up() = try
+            HTTP.get("$(url)/authelia/api/health"; retry = false, status_exception = false).status == 200
+        catch e
+            e isa HTTP.ConnectError || rethrow()
+            false
+        end
+        @test timedwait(up, 30.0; pollint = 0.5) === :ok
+
+        # What the installer's answers make: the address people use, Authelia's
+        # login under it, and no Caddy.
+        @test state.base_url[] == "https://team.example.com"
+        @test BT.portal_url(auth) == "https://team.example.com/authelia"
+        @test !isfile(joinpath(dir, "Caddyfile"))
+        cfg_text = read(config, String)
+        @test occursin("address: 'tcp://127.0.0.1:$(aport)/authelia'", cfg_text)
+        # A login that outlasts an open tab (Authelia's own default ends it
+        # after 5 idle minutes, under a tab that talks over its websocket).
+        @test occursin("inactivity: '1w'", cfg_text) && occursin("expiration: '4w'", cfg_text)
+        @test occursin("- domain: 'team.example.com'", cfg_text)
+
+        get_(target, headers = Pair{String,String}[]) =
+            HTTP.get(url * target, ["Accept" => "text/html", headers...];
+                     status_exception = false, retry = false, redirect = false, cookies = false)
+        login_first(r) = r.status == 302 &&
+            startswith(HTTP.header(r, "Location"), "https://team.example.com/authelia/?rd=") &&
+            HTTP.header(r, "Cache-Control") == "no-store"
+
+        @testset "logged out: every route is the login first" begin
+            for target in ("/", "/acp-log", "/acp-log/p1", "/download/p1?path=x", "/attachment/p1?file=a.png",
+                           "/assets/anything.js", "/no-such-route")
+                @test login_first(get_(target))
+            end
+            # Whatever a client claims to be.
+            @test login_first(get_("/", ["Remote-User" => "bob", "Remote-Groups" => "admins"]))
+            @test login_first(get_("/", ["X-Forwarded-User" => "bob", "X-Forwarded-Host" => "team.example.com"]))
+            # Nothing rides on the open routes: only their exact targets are open.
+            for target in ("/install.sh?/acp-log", "/install.sh/../acp-log", "/invite/$("0"^64)?/acp-log",
+                           "/invite/$("0"^64)/x", "/w?x", "/install.shx")
+                @test login_first(get_(target))
+            end
+            # A websocket (a dashboard tab's connection) is refused before it opens.
+            @test_throws Exception HTTP.WebSockets.open(ws -> nothing, "ws://127.0.0.1:$(port)/some-session")
+        end
+
+        @testset "open to anyone: the installer, invites, Authelia's login page" begin
+            script = get_("/install.sh")
+            @test script.status == 200 && occursin("https://team.example.com", String(script.body))
+            @test get_("/invite/" * "0"^64).status == 404           # the invite page's own answer
+            portal = get_("/authelia/")
+            @test portal.status == 200 && occursin("text/html", HTTP.header(portal, "Content-Type"))
+        end
+
+        @testset "workers: only with a credential, which the server checks" begin
+            worker(id, credential) = BW.Worker(BW.WorkerConfig(; server_url = url, credential, worker_id = id,
+                name = id, mcp_command = "julia", mcp_arguments = String[], projects_root = mktempdir()))
+            stranger = worker("stranger", "")
+            refused = try BW.connect_once!(stranger); nothing catch e; e end
+            close(stranger)
+            @test refused isa BW.WorkerLink.LinkRefused && occursin("no valid worker credential", refused.reason)
+            issued = BT.add_worker_credential!(state, "bob")
+            @test isempty(state.worker_credentials[][first(split(issued, ':'))].hash)   # no Caddy to check a hash
+            admitted = worker("admitted", issued)
+            task = @async BW.serve(admitted; retry_delay = 0.2)
+            try
+                @test timedwait(() -> BT.worker_connected(state, "admitted"), 30.0) === :ok
+                @test BT.revoke_worker_credential!(state, first(split(issued, ':')))
+                @test timedwait(() -> !BT.worker_connected(state, "admitted"), 30.0) === :ok
+            finally
+                close(admitted)
+                wait(task)
+            end
+        end
+
+        # Logging in through Authelia's API, as its login page does: its cookie
+        # is for the dashboard's name, so it is carried by hand.
+        post_(target, body, cookie = "") = HTTP.post(url * target,
+            ["Content-Type" => "application/json", "Accept" => "application/json",
+             (isempty(cookie) ? () : ("Cookie" => cookie,))...], JSON.json(body);
+            status_exception = false, retry = false, redirect = false, cookies = false)
+        session_cookie(r) = (m = match(r"authelia_session=([^;]+)", HTTP.header(r, "Set-Cookie", ""));
+                             m === nothing ? "" : "authelia_session=" * m[1])
+
+        @testset "logged in: the dashboard, as Authelia says who" begin
+            wrong = post_("/authelia/api/firstfactor", Dict("username" => "bob", "password" => pw.password * "x",
+                                                          "keepMeLoggedIn" => false))
+            @test wrong.status == 401
+            first_ = post_("/authelia/api/firstfactor", Dict("username" => "bob", "password" => pw.password,
+                                                           "keepMeLoggedIn" => false,
+                                                           "targetURL" => "https://team.example.com/"))
+            @test first_.status == 200
+            cookie = session_cookie(first_)
+            @test !isempty(cookie)
+            # One factor is not enough.
+            @test login_first(get_("/", ["Cookie" => cookie]))
+            second = post_("/authelia/api/secondfactor/totp",
+                           Dict("token" => totp(secret, floor(Int, time() / 30)),
+                                "targetURL" => "https://team.example.com/"), cookie)
+            @test second.status == 200
+            cookie = something(let c = session_cookie(second); isempty(c) ? nothing : c end, cookie)
+            # Signed in with the authenticator the server registered, adding a
+            # passkey needs nothing more: no code by mail first.
+            json_(r) = JSON.parse(String(copy(r.body)))["data"]
+            elevation = HTTP.get(url * "/authelia/api/user/session/elevation", ["Cookie" => cookie];
+                                 status_exception = false, retry = false, cookies = false)
+            @test elevation.status == 200 && json_(elevation)["skip_second_factor"] == true
+            passkey = HTTP.request("PUT", url * "/authelia/api/secondfactor/webauthn/credential/register",
+                                   ["Cookie" => cookie, "Content-Type" => "application/json"],
+                                   JSON.json(Dict("description" => "Proton Pass"));
+                                   status_exception = false, retry = false, cookies = false)
+            @test passkey.status == 200
+            options = json_(passkey)["publicKey"]
+            @test options["rp"]["id"] == "team.example.com" && options["user"]["name"] == "bob"
+
+            # What an open tab checks: it answers through the login only.
+            @test get_("/session", ["Cookie" => cookie]).status == 204
+            @test login_first(get_("/session"))
+            page = get_("/", ["Cookie" => cookie])
+            html = String(page.body)
+            @test page.status == 200
+            @test !occursin("answers only through its login proxy", html)
+            # Only the browser keeps what is behind the login.
+            @test HTTP.header(page, "Cache-Control") == "no-store"
+            asset = match(r"\"(/assets/[^\"?]+\.js(?:\?[^\"]*)?)\"", html)
+            @test asset !== nothing
+            js = get_(asset[1], ["Cookie" => cookie])
+            @test js.status == 200 && startswith(HTTP.header(js, "Cache-Control"), "private")
+            @test !occursin("public", HTTP.header(js, "Cache-Control"))
+
+            # Who the request is from is Authelia's word, whatever the client sent.
+            gate = BT.TunnelGate(auth)
+            req = HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, "Accept" => "text/html",
+                                                   "Remote-User" => "carol", "Remote-Groups" => "nobody"])
+            @test Bonito.HTTPServer.gate_request(gate, req) === nothing
+            user = BT.request_user(auth, req)
+            @test user.name == "bob" && user.groups == ["admins"] && user.display_name == "Bob B"
+            forged = HTTP.Request("GET", "/acp-log", ["Remote-User" => "bob", "Remote-Groups" => "admins"])
+            @test Bonito.HTTPServer.gate_request(gate, forged) isa HTTP.Response
+            @test BT.request_user(auth, forged) === nothing
+
+            # A browser let through and later turned away gets ONE log line saying
+            # whether it still sent the cookie that worked (Authelia forgot the
+            # login) or another one (something replaced it). Logins that ended
+            # every few minutes left no other trace.
+            who = ["Cf-Connecting-Ip" => "203.0.113.7", "User-Agent" => "a test browser"]
+            @test Bonito.HTTPServer.gate_request(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...])) === nothing
+
+            # A page's live connection is recorded when it reaches the gate: whose
+            # tab it is and whether it was let through. A phone waited seconds for
+            # its socket and nothing said whether they passed before the server.
+            upgrade(target, headers...) = HTTP.Request("GET", target, ["Connection" => "Upgrade", "Upgrade" => "websocket",
+                "Sec-WebSocket-Key" => "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version" => "13", headers...])
+            @test Bonito.HTTPServer.gate_request(gate, upgrade("/abcdef12-3456-7890?x=1", "Cookie" => cookie, who...)) === nothing
+            up = last(gate.timings.kinds[:ws_upgrade])
+            @test (up.detail["tab"], up.detail["status"]) == ("abcdef12", 101) && up.seconds < 5
+            @test Bonito.HTTPServer.gate_request(gate, upgrade("/abcdef12-3456-7890")) isa HTTP.Response
+            @test last(gate.timings.kinds[:ws_upgrade]).detail["status"] == 401   # no page: no redirect
+            # A plain request is not a live connection.
+            n = length(gate.timings.kinds[:ws_upgrade])
+            Bonito.HTTPServer.gate_request(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            @test length(gate.timings.kinds[:ws_upgrade]) == n
+
+            # Logged out, it is the login first again. The logout passes the gate,
+            # which logs it with the cookie it ended: Authelia logs no login and no
+            # logout, and logins that ended minutes after they were made left
+            # nothing to say what ended them.
+            out = HTTP.Request("POST", "/authelia/api/logout",
+                               ["Cookie" => cookie, "Content-Type" => "application/json", who...], "{}")
+            logs, answer = Test.collect_test_logs(() -> Bonito.HTTPServer.gate_request(gate, out))
+            @test answer.status == 200
+            kw = Dict(only(l for l in logs if l.message == "login: Authelia").kwargs)
+            @test kw[:path] == "/authelia/api/logout" && kw[:status] == 200
+            @test kw[:cookie] == BT.cookie_digest(cookie) && !occursin(cookie, string(kw))
+            @test login_first(get_("/", ["Cookie" => cookie]))
+
+            refused(req) = Test.collect_test_logs(() -> Bonito.HTTPServer.gate_request(gate, req))
+            logs, answer = refused(HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            @test answer isa HTTP.Response
+            line = only(l for l in logs if occursin("turned away a device that was logged in", l.message))
+            kw = Dict(line.kwargs)
+            @test kw[:same_cookie] == true && kw[:last_user] == "bob" && kw[:cookies_sent] == 1
+            @test kw[:cookie] == kw[:last_accepted] && !occursin(cookie, string(kw))   # digests, never the cookie
+            @test kw[:new_cookie_to_browser] != "none"   # Authelia hands a refused browser a fresh cookie
+            # Once per incident: the next refusal of that browser is not logged again.
+            logs2, _ = refused(HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            @test !any(l -> occursin("turned away a device", l.message), logs2)
+        end
+
+        @testset "an account made while Authelia runs, and a new authenticator" begin
+            code_login(name, password, a) = begin
+                first_ = post_("/authelia/api/firstfactor", Dict("username" => name, "password" => password,
+                                                               "keepMeLoggedIn" => false))
+                first_.status == 200 || return first_.status
+                post_("/authelia/api/secondfactor/totp", Dict("token" => totp(secret_of(a), floor(Int, time() / 30))),
+                      session_cookie(first_)).status
+            end
+            dave = BT.add_account!(state, "dave")
+            # Authelia rereads its users database when it changes; give it that moment.
+            @test timedwait(() -> code_login("dave", dave.password, dave.authenticator) == 200, 10.0; pollint = 1.0) === :ok
+            # "New authenticator": the old one's codes stop working. (Authelia takes
+            # one code per account and 30 s step, so this is an account that has
+            # not logged in yet.)
+            erin = BT.add_account!(state, "erin")
+            renewed = BT.register_authenticator!(state, "erin")
+            @test secret_of(renewed) != secret_of(erin.authenticator)
+            @test timedwait(() -> code_login("erin", erin.password, erin.authenticator) == 403, 10.0; pollint = 1.0) === :ok
+            @test code_login("erin", erin.password, renewed) == 200
+
+            # The page a new account lands on: one button that signs them in and
+            # makes their passkey (the browser half, `PASSKEY_JS`), the password
+            # and authenticator folded away for whoever cannot use one.
+            page = String(BT.account_ready_page(auth, "erin", (password = erin.password, authenticator = renewed)).body)
+            @test occursin("<button id=\"create-passkey\"", page) && occursin("window.btPasskeys", page)
+            @test occursin("'/authelia/api'", page)
+            @test occursin("<details>", page) && occursin("<code class=\"pw\">$(erin.password)</code>", page)
+            @test occursin("const account = \"erin\"", page)
+        end
+
+        @testset "the login's log, for the debug tools" begin
+            logs(args...) = BT.dev_op(state, Val(:logs), Dict{String,Any}(args...))
+            r = logs("source" => "authelia", "contains" => "erin")
+            @test r["ok"] && r["path"] == BT.authelia_log_file(auth.config)
+            @test any(l -> occursin("Unsuccessful TOTP authentication attempt by user 'erin'", l), r["lines"])
+            # Its lines carry Authelia's own stamps, which the time filter reads.
+            today = Dates.format(Dates.now(), "yyyy-mm-dd")
+            @test !isempty(logs("source" => "authelia", "since" => today * " 00:00")["lines"])
+            later = logs("source" => "authelia", "since" => "2999-01-01 00:00")
+            @test isempty(later["lines"]) && !haskey(later, "note")
+            @test "authelia" in [x["source"] for x in logs("source" => "all")["sources"]]
+            # Bounded like the server's own: copied aside, truncated in place, and
+            # Authelia goes on writing at the new start (it appends).
+            path = BT.authelia_log_file(auth.config)
+            @test BT.rotate_by_copy!(path, 0) && filesize(path) == 0 && filesize(path * ".1") > 0
+            get_("/")                                   # Authelia logs the refusal
+            @test timedwait(() -> filesize(path) > 0, 10.0) === :ok
+            @test read(path)[1] != 0x00                 # no hole where the old content was
+            @test !BT.rotate_by_copy!(path, 10^9)
+        end
+
+        @testset "without Authelia nothing behind the login answers" begin
+            kill(authelia); wait(authelia)
+            down = get_("/")
+            @test down.status == 502 && occursin("login service", String(down.body))
+            @test HTTP.header(down, "Cache-Control") == "no-store"
+            @test get_("/install.sh").status == 200
+        end
+    finally
+        process_running(authelia) && kill(authelia)
+        BT.stop_worker_proc!(store)
+        close(state.srv)
+    end
+
+    # A login or logout is logged, and so is any other answer that gives the
+    # browser another login cookie; the portal's other requests are not.
+    login_call = HTTP.Request("POST", "/authelia/api/firstfactor/passkey", ["Cookie" => "authelia_session=old"])
+    @test_logs (:info, "login: Authelia") BT.log_login_event(login_call,
+        HTTP.Response(200, ["Set-Cookie" => "authelia_session=new; Path=/; HttpOnly"]))
+    @test_logs (:info, "login: Authelia") BT.log_login_event(HTTP.Request("GET", "/authelia/api/state"),
+        HTTP.Response(200, ["Set-Cookie" => "authelia_session=other; Path=/"]))
+    @test_logs BT.log_login_event(HTTP.Request("GET", "/authelia/api/state", ["Cookie" => "authelia_session=old"]),
+        HTTP.Response(200, ["Set-Cookie" => "authelia_session=old; Path=/"]))
+    @test_logs BT.log_login_event(HTTP.Request("GET", "/authelia/"), HTTP.Response(200))
+    # A login cookie Authelia hands out while letting a request through goes to
+    # the browser with the route's answer: kept back, the browser's next request
+    # would carry one Authelia no longer knows.
+    renewed = HTTP.Request("GET", "/")
+    renewed.context[:login_cookies] = ["authelia_session=new; Path=/; HttpOnly"]
+    response = Bonito.HTTPServer.gate_response(BT.TunnelGate(auth), renewed, HTTP.Response(200))
+    @test HTTP.header(response, "Set-Cookie") == "authelia_session=new; Path=/; HttpOnly"
+    @test !HTTP.hasheader(Bonito.HTTPServer.gate_response(BT.TunnelGate(auth), HTTP.Request("GET", "/"),
+                                                         HTTP.Response(200)), "Set-Cookie")
+
+    # What a shared cache may keep: nothing, whatever a route said.
+    @test BT.private_cache("") == "private"
+    @test BT.private_cache("public, max-age=31536000, immutable") == "private, max-age=31536000, immutable"
+    @test BT.private_cache("no-store") == "no-store"
+    @test BT.private_cache("private, max-age=60") == "private, max-age=60"
+    @test BT.private_cache("no-cache") == "private, no-cache"
+end

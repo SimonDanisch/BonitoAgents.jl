@@ -2,9 +2,123 @@
 // deno-lint-ignore-file
 // This code was bundled using `deno bundle` and it's not recommended to edit it manually
 
+function editSteps(a, b, maxD) {
+    const n = a.length, m = b.length, limit = Math.min(n + m, maxD), off = limit + 1;
+    const v = new Int32Array(2 * limit + 3);
+    const trace = [];
+    for(let d = 0; d <= limit; d++){
+        trace.push(v.slice(off - d - 1, off + d + 2));
+        for(let k = -d; k <= d; k += 2){
+            let x = k === -d || k !== d && v[k - 1 + off] < v[k + 1 + off] ? v[k + 1 + off] : v[k - 1 + off] + 1;
+            let y = x - k;
+            while(x < n && y < m && a[x] === b[y]){
+                x++;
+                y++;
+            }
+            v[k + off] = x;
+            if (x >= n && y >= m) {
+                const steps = [];
+                for(let dd = d; dd > 0; dd--){
+                    const w = trace[dd], kk = x - y;
+                    const down = kk === -dd || kk !== dd && w[kk + dd] < w[kk + dd + 2];
+                    const pk = down ? kk + 1 : kk - 1, px = w[pk + dd + 1], py = px - pk;
+                    while(x > (down ? px : px + 1) && y > (down ? py + 1 : py)){
+                        steps.push('=');
+                        x--;
+                        y--;
+                    }
+                    steps.push(down ? '+' : '-');
+                    x = px;
+                    y = py;
+                }
+                while(x > 0 && y > 0){
+                    steps.push('=');
+                    x--;
+                    y--;
+                }
+                return steps.reverse();
+            }
+        }
+    }
+    return null;
+}
+function changedRanges(a, b) {
+    const ta = a.match(/\w+|\s+|[^\w\s]/g) || [], tb = b.match(/\w+|\s+|[^\w\s]/g) || [];
+    const steps = editSteps(ta, tb, 200);
+    if (!steps) return null;
+    const ra = [], rb = [];
+    let i = 0, j = 0, pa = 0, pb = 0, kept = 0;
+    const add = (ranges, from, to)=>{
+        const last = ranges[ranges.length - 1];
+        if (last && last[1] === from) last[1] = to;
+        else ranges.push([
+            from,
+            to
+        ]);
+    };
+    for (const st of steps){
+        if (st === '=') {
+            pa += ta[i].length;
+            pb += tb[j].length;
+            kept += ta[i].length;
+            i++;
+            j++;
+        } else if (st === '-') {
+            add(ra, pa, pa + ta[i].length);
+            pa += ta[i++].length;
+        } else {
+            add(rb, pb, pb + tb[j].length);
+            pb += tb[j++].length;
+        }
+    }
+    if (kept * 3 < Math.max(a.length, b.length)) return null;
+    return [
+        ra,
+        rb
+    ];
+}
 if (typeof document !== 'undefined') {
     const vp = document.querySelector('meta[name="viewport"]');
     if (vp && !vp.content.includes('interactive-widget')) vp.content += ', interactive-widget=resizes-content';
+}
+const storage = (()=>{
+    const refused = (error, key)=>{
+        if (!(error instanceof DOMException) || ![
+            'SecurityError',
+            'QuotaExceededError'
+        ].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get (key) {
+            try {
+                return localStorage.getItem(key);
+            } catch (e) {
+                refused(e, key);
+                return null;
+            }
+        },
+        set (key, value) {
+            try {
+                localStorage.setItem(key, value);
+            } catch (e) {
+                refused(e, key);
+            }
+        },
+        remove (key) {
+            try {
+                localStorage.removeItem(key);
+            } catch (e) {
+                refused(e, key);
+            }
+        }
+    };
+})();
+function formatTokens(n) {
+    if (n < 1000) return String(Math.round(n));
+    if (n < 10000) return (n / 1000).toFixed(1) + 'k';
+    if (n < 1000000) return Math.round(n / 1000) + 'k';
+    return (n / 1000000).toFixed(1) + 'M';
 }
 function queueLabel(pos) {
     if (!Number.isInteger(pos) || pos < 1) return 'queued';
@@ -19,11 +133,11 @@ class Collapsable {
         this.native = opts.native || false;
         this.editMode = opts.editMode || false;
         this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.compactHeight = opts.compactHeight || 240;
-        this.expandedHeight = opts.expandedHeight || 2000;
         this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
         this.discardOnCollapse = this.editMode ? false : opts.discardOnCollapse || false;
         this.onExpand = opts.onExpand || null;
+        this.reserve = opts.reserve || null;
+        this.onToggle = opts.onToggle || null;
         this.lazy = !!this.onExpand;
         this.loaded = !this.lazy;
         this.expanded = false;
@@ -35,6 +149,7 @@ class Collapsable {
             headerEl.addEventListener('click', (e)=>{
                 if (this.expanded && this.toggle && e.target !== this.toggle && !this.toggle.contains(e.target)) return;
                 this.applyExpanded(!this.expanded);
+                this.onToggle && this.onToggle(this.expanded);
             });
         }
     }
@@ -53,7 +168,6 @@ class Collapsable {
             if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
             if (this.editMode && !this.hideBodyOnCollapse) {
                 this.body.style.display = '';
-                this.applyEditHeight(expanded ? this.expandedHeight : this.compactHeight);
             } else {
                 this.body.style.display = expanded ? '' : 'none';
             }
@@ -62,7 +176,7 @@ class Collapsable {
         if (expanded && (!this.editMode || editBodyEmpty)) {
             if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
                 this.loaded = true;
-                this.body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+                this.showPlaceholder();
                 this.onExpand && this.onExpand();
             }
         } else if (!expanded && this.discardOnCollapse) {
@@ -70,73 +184,507 @@ class Collapsable {
             this.loaded = false;
         }
     }
-    applyEditHeight(h) {
-        const divs = this.body.querySelectorAll('.monaco-diff-editor-div');
-        divs.forEach((div)=>{
-            const monaco = div.__btMonacoDiff;
-            if (monaco && typeof monaco.setMaxHeight === 'function') monaco.setMaxHeight(h);
-        });
+    showPlaceholder() {
+        showLoading(this.body, this.reserve ? this.reserve() : null);
     }
     fill(html) {
         if (html != null) this.body.innerHTML = html;
         this.loaded = true;
     }
 }
+const CODE_STATE = new WeakMap();
+const CODE_OBSERVERS = new WeakMap();
+const CODE_CHUNKS = new WeakMap();
+function codeLines(text) {
+    return text === '' ? [] : text.split('\n');
+}
+function codeRow(kind, text, side, index, gutter) {
+    const shown = text.endsWith('\r') ? text.slice(0, -1) : text;
+    return {
+        el: null,
+        kind,
+        gutter,
+        text: shown,
+        side,
+        index,
+        marks: null
+    };
+}
+function* codeRows(sources, ops) {
+    if (ops === undefined) {
+        const lines = codeLines(sources[0]);
+        if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+        for(let i = 0; i < lines.length; i++)yield codeRow('', lines[i], 0, i, null);
+        return;
+    }
+    const a = codeLines(sources[0]), b = codeLines(sources[1]);
+    const w = String(Math.max(a.length, b.length, 1)).length;
+    const pad = (x)=>(x === null ? '' : String(x)).padStart(w);
+    const gutter = (i, j, sign)=>`${pad(i === null ? null : i + 1)} ${pad(j === null ? null : j + 1)} ${sign}`;
+    let i = 0, j = 0;
+    const runs = ops.split(' ').filter(Boolean).map((op)=>[
+            op[0],
+            parseInt(op.slice(1), 10)
+        ]);
+    for(let r = 0; r < runs.length; r++){
+        const [k, n] = runs[r];
+        if (k === '=') {
+            for(let t = 0; t < n; t++, i++, j++)yield codeRow('', b[j], 1, j, gutter(i, j, ' '));
+        } else if (k === '-') {
+            const removed = [];
+            for(let t = 0; t < n; t++, i++){
+                const row = codeRow('del', a[i], 0, i, gutter(i, null, '-'));
+                removed.push(row);
+                yield row;
+            }
+            if (r + 1 < runs.length && runs[r + 1][0] === '+') {
+                const [, m] = runs[++r];
+                for(let t = 0; t < m; t++, j++){
+                    const row = codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+                    const old = removed[t];
+                    if (old) {
+                        const ranges = changedRanges(old.text, row.text);
+                        if (ranges) {
+                            old.marks = ranges[0];
+                            row.marks = ranges[1];
+                        }
+                    }
+                    yield row;
+                }
+            }
+        } else {
+            for(let t = 0; t < n; t++, j++)yield codeRow('add', b[j], 1, j, gutter(null, j, '+'));
+        }
+    }
+}
+function markRange(row, from, to) {
+    if (from >= to) return;
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for(let n = walker.nextNode(); n; n = walker.nextNode())nodes.push(n);
+    let pos = 0;
+    for (const node of nodes){
+        const start = pos, end = pos + node.data.length;
+        pos = end;
+        const a = Math.max(from, start), b = Math.min(to, end);
+        if (a >= b) continue;
+        let mid = node;
+        if (a > start) mid = mid.splitText(a - start);
+        if (b < end) mid.splitText(b - a);
+        const span = document.createElement('span');
+        span.className = 'bt-ch';
+        mid.replaceWith(span);
+        span.appendChild(mid);
+    }
+}
+function markRanges(row) {
+    if (row.marks) for (const [from, to] of row.marks)markRange(row.el, from, to);
+}
+function resource(line, text) {
+    const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
+    let i = 0, col = 0, carry = 0;
+    const out = [];
+    for(let node = walker.nextNode(); node; node = walker.nextNode()){
+        let need = node.data.length, s = '';
+        while(need > 0){
+            if (carry > 0) {
+                const k = Math.min(carry, need);
+                carry -= k;
+                need -= k;
+                continue;
+            }
+            if (i >= text.length) return false;
+            const c = text[i++];
+            if (c === '\t') {
+                const w = 4 - col % 4;
+                s += c;
+                col += w;
+                const k = Math.min(w, need);
+                need -= k;
+                carry = w - k;
+            } else {
+                s += c;
+                col += 1;
+                need -= 1;
+            }
+        }
+        out.push([
+            node,
+            s
+        ]);
+    }
+    if (i !== text.length || carry !== 0) return false;
+    for (const [node, s] of out)node.data = s;
+    return true;
+}
+async function highlightCode(el) {
+    const st = CODE_STATE.get(el);
+    CODE_STATE.set(el, null);
+    if (!st.lib) {
+        el.dataset.btHighlighted = 'true';
+        return;
+    }
+    const lib = await st.lib;
+    const lang = st.lang || (st.path ? await lib.language_for_path(st.path) : 'plaintext');
+    if (lang === 'plaintext') {
+        st.highlighter.forget(el);
+        el.dataset.btHighlighted = 'true';
+        return;
+    }
+    const tpl = document.createElement('template');
+    for(let side = 0; side < st.sources.length; side++){
+        if (!el.isConnected || st.highlighter.closed) return;
+        const rows = new Map(st.rows.filter((r)=>r.side === side).map((r)=>[
+                r.index,
+                r
+            ]));
+        if (!rows.size) continue;
+        await lib.colorize_lines(st.sources[side], lang, (index, html)=>{
+            if (!el.isConnected || st.highlighter.closed) return false;
+            const row = rows.get(index);
+            if (!row) return;
+            row.html = html;
+            if (row.chunk.wanted) paintCodeRow(row, tpl);
+        });
+    }
+    if (el.isConnected && !st.highlighter.closed) el.dataset.btHighlighted = 'true';
+}
+function paintCodeRow(row, tpl) {
+    if (row.html == null) return;
+    tpl.innerHTML = row.html;
+    row.html = null;
+    if (!resource(tpl.content, row.text)) return;
+    const selection = window.getSelection();
+    const point = (node, offset)=>{
+        if (!node || !row.el.contains(node)) return {
+            node,
+            offset
+        };
+        const range = document.createRange();
+        range.selectNodeContents(row.el);
+        range.setEnd(node, offset);
+        return {
+            index: range.toString().length
+        };
+    };
+    const anchor = point(selection.anchorNode, selection.anchorOffset);
+    const focus = point(selection.focusNode, selection.focusOffset);
+    row.el.replaceChildren(tpl.content);
+    markRanges(row);
+    if (anchor.index === undefined && focus.index === undefined) return;
+    const restore = (p)=>{
+        if (p.index === undefined) return p;
+        const walker = document.createTreeWalker(row.el, NodeFilter.SHOW_TEXT);
+        let left = p.index;
+        for(let n = walker.nextNode(); n; n = walker.nextNode()){
+            if (left <= n.length) return {
+                node: n,
+                offset: left
+            };
+            left -= n.length;
+        }
+        return {
+            node: row.el,
+            offset: row.el.childNodes.length
+        };
+    };
+    const a = restore(anchor), f = restore(focus);
+    selection.setBaseAndExtent(a.node, a.offset, f.node, f.offset);
+}
+class CodeHighlighter {
+    constructor(root){
+        this.pending = [];
+        this.running = false;
+        this.closed = false;
+        this.paintPending = [];
+        this.painting = false;
+        this.observer = new IntersectionObserver((entries)=>{
+            for (const e of entries){
+                if (!e.isIntersecting) continue;
+                this.observer.unobserve(e.target);
+                this.pending.push(e.target);
+            }
+            this.drain();
+        }, {
+            root,
+            rootMargin: '100% 0px'
+        });
+        this.chunks = new IntersectionObserver((entries)=>{
+            for (const e of entries){
+                if (!e.isIntersecting) continue;
+                this.chunks.unobserve(e.target);
+                const chunk = CODE_CHUNKS.get(e.target);
+                chunk.wanted = true;
+                this.paintPending.push(chunk.rows);
+            }
+            this.paint();
+        }, {
+            root,
+            rootMargin: '100% 0px'
+        });
+    }
+    observe(el) {
+        const st = CODE_STATE.get(el);
+        st.highlighter = this;
+        for (const chunk of st.chunks)this.chunks.observe(chunk);
+        this.observer.observe(el);
+    }
+    forget(body) {
+        for (const el of body.querySelectorAll('.bt-code'))this.observer.unobserve(el);
+        for (const el of body.querySelectorAll('.bt-code-chunk'))this.chunks.unobserve(el);
+    }
+    disconnect() {
+        this.closed = true;
+        this.observer.disconnect();
+        this.chunks.disconnect();
+        this.pending.length = 0;
+        this.paintPending.length = 0;
+    }
+    async paint() {
+        if (this.painting) return;
+        this.painting = true;
+        const tpl = document.createElement('template');
+        let until = performance.now() + 3;
+        try {
+            while(!this.closed && this.paintPending.length){
+                for (const row of this.paintPending.shift()){
+                    if (!row.el.isConnected) continue;
+                    paintCodeRow(row, tpl);
+                    if (performance.now() >= until) {
+                        await new Promise((resolve)=>setTimeout(resolve, 0));
+                        until = performance.now() + 3;
+                    }
+                }
+            }
+        } finally{
+            this.painting = false;
+        }
+    }
+    async drain() {
+        if (this.running) return;
+        this.running = true;
+        let until = performance.now() + 3;
+        try {
+            while(!this.closed && this.pending.length){
+                const el = this.pending.shift();
+                if (el.isConnected) await highlightCode(el);
+                if (performance.now() >= until) {
+                    await new Promise((resolve)=>setTimeout(resolve, 0));
+                    until = performance.now() + 3;
+                }
+            }
+        } finally{
+            this.running = false;
+        }
+    }
+}
+function observeCode(el) {
+    const root = el.closest('.bt-messages');
+    const key = root || document;
+    let highlighter = CODE_OBSERVERS.get(key);
+    if (!highlighter) {
+        highlighter = new CodeHighlighter(root);
+        CODE_OBSERVERS.set(key, highlighter);
+    }
+    highlighter.observe(el);
+}
+async function mountCode(el, lib) {
+    if (CODE_STATE.has(el)) return;
+    CODE_STATE.set(el, null);
+    el.dataset.btHighlighted = 'false';
+    const sources = [
+        ...el.querySelectorAll(':scope > pre.bt-code-src')
+    ].map((p)=>p.textContent);
+    const rows = [];
+    let until = performance.now() + 3;
+    for (const row of codeRows(sources, el.dataset.ops)){
+        rows.push(row);
+        if (performance.now() >= until) {
+            await new Promise((resolve)=>setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
+    }
+    const last = rows[rows.length - 1];
+    if (el.dataset.ops !== undefined && last?.kind === '' && last.text === '') rows.pop();
+    const lines = document.createElement('div');
+    const chunks = [];
+    lines.className = 'bt-code-lines';
+    lines.style.setProperty('--bt-code-height', rows.length * 18 + 'px');
+    for(let i = 0; i < rows.length; i += 32){
+        const chunk = document.createElement('div');
+        chunk.className = 'bt-code-chunk';
+        chunk.style.setProperty('--bt-code-height', Math.min(32, rows.length - i) * 18 + 'px');
+        const state = {
+            rows: rows.slice(i, i + 32),
+            wanted: false
+        };
+        if (lib) CODE_CHUNKS.set(chunk, state);
+        for (const row of state.rows){
+            row.el = document.createElement('div');
+            row.el.className = row.kind ? `bt-l bt-l-${row.kind}` : 'bt-l';
+            if (row.gutter !== null) row.el.dataset.g = row.gutter;
+            row.el.textContent = row.text;
+            if (lib) row.chunk = state;
+            chunk.appendChild(row.el);
+            markRanges(row);
+        }
+        lines.appendChild(chunk);
+        chunks.push(chunk);
+        if (performance.now() >= until) {
+            await new Promise((resolve)=>setTimeout(resolve, 0));
+            if (!el.isConnected) return;
+            until = performance.now() + 3;
+        }
+    }
+    el.replaceChildren(lines);
+    if (lib) {
+        CODE_STATE.set(el, {
+            lib,
+            lang: el.dataset.lang || '',
+            path: el.dataset.path || '',
+            sources,
+            rows,
+            chunks
+        });
+        observeCode(el);
+    } else {
+        CODE_STATE.set(el, null);
+        el.dataset.btHighlighted = 'true';
+    }
+    bodyMounted(el);
+}
 const filterKey = (msg)=>msg.type === 'tool' ? 'tool:' + (msg.tool || 'other') : msg.type;
 const DEFAULT_HIDDEN = [
     'tool:ToolSearch'
 ];
+function formatBytes(n) {
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+function showLoading(body, shape) {
+    body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+    if (shape) Object.assign(body.firstElementChild.style, {
+        boxSizing: 'border-box'
+    }, shape);
+}
 class BonitoChat {
-    constructor(container, comm){
+    constructor(container, comm, init = {}){
         this.container = container;
+        this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
+        this.workspacePanel = container.closest('.bw-ws-panel');
+        this.workspaceVisible = this.workspacePanel?.dataset.bwVisible !== 'false';
+        this.paneVisible = this.projectVisible && this.workspaceVisible;
+        this.onWorkspaceVisibility = (e)=>{
+            this.workspaceVisible = e.detail;
+            this.updateVisibility();
+        };
+        this.workspacePanel?.addEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.showRestoreRaf = 0;
+        this.showRestoreTimers = [];
         this.comm = comm;
         this.destroyed = false;
         this.cache = new Map();
-        this.heights = new Map();
-        this.rendered = new Set();
+        this.expandState = new Map();
+        this.order = [];
         this.nodeById = new Map();
-        this.observed = new Set();
         this.totalCount = 0;
-        this.EST_HEIGHT = 80;
-        this.OVERSCAN = 8;
-        this.initialLoad = false;
-        this.pendingAnchor = null;
-        this.bootstrapped = false;
-        this.measuredHeightSum = 0;
-        this.measuredHeightCount = 0;
-        this.spacerTopHeight = -1;
-        this.spacerBottomHeight = -1;
-        this.requestedAt = new Map();
+        this.seq = null;
+        this.plo = 0;
+        this.phi = -1;
+        this.CHUNK = 40;
+        this.MAX_WINDOW = 160;
+        this.reqSeq = 0;
+        this.pending = {};
         this.epoch = 0;
         this.STREAM_APPLY_MS = 100;
-        this.messageHeightObserver = new ResizeObserver((entries)=>{
+        this.rowObserver = new ResizeObserver((entries)=>{
             if (this.destroyed) return;
-            let changed = false;
-            for (const e of entries){
-                const idx = e.target.__btIdx;
-                if (idx === undefined) continue;
-                const h = e.borderBoxSize && e.borderBoxSize.length ? e.borderBoxSize[0].blockSize : e.target.offsetHeight;
-                if (h > 0 && this.heights.get(idx) !== h) {
-                    if (!this.heightIsFinal(e.target)) continue;
-                    this.heights.set(idx, h);
-                    changed = true;
+            const c = this.container;
+            if (!this.paneVisible || c.clientHeight === 0) return;
+            const st = c.scrollTop;
+            const sb = st + c.clientHeight;
+            const last = this.cache.get(this.order[this.order.length - 1]);
+            const rows = entries.map((e)=>[
+                    e.target,
+                    e.borderBoxSize && e.borderBoxSize.length ? e.borderBoxSize[0].blockSize : e.target.offsetHeight
+                ]).sort(([a], [b])=>a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+            let above = 0;
+            let shift = 0;
+            let grew = false;
+            for (const [node, h] of rows){
+                const prev = node.__btH;
+                node.__btH = h;
+                if (prev === undefined || prev === h) continue;
+                grew = true;
+                if (node.collapsable && node.classList.contains('bt-tool-msg')) {
+                    this.scheduleBodyReport(node);
+                    this.onBodyMounted(node);
+                }
+                const top = node.offsetTop - shift;
+                shift += h - prev;
+                if (node.offsetParent === null) continue;
+                if (top < st - 1 && (top + prev <= st + 1 || top + prev < sb && node !== last)) {
+                    above += h - prev;
                 }
             }
-            if (changed && !this.scrollbarDrag) this.queueRefresh();
+            if (above !== 0 && !this.followMode && !this.railDrag) {
+                c.scrollTop = st + above;
+                this.prevScrollTop = c.scrollTop;
+            }
+            if (grew && this.followMode) this.queueScrollToBottom();
+            if (grew) this.updateRail();
         });
         const wantKeepalive = typeof window !== 'undefined' && Number.isFinite(window.BT_APP_KEEPALIVE) ? window.BT_APP_KEEPALIVE : 6;
         this.APP_KEEPALIVE = Math.min(10, Math.max(0, wantKeepalive));
-        this.parked = new Set();
         this.appLru = [];
-        this.ITEM_GAP = parseFloat(getComputedStyle(container).rowGap) || 0;
-        this.PAD_TOP = parseFloat(getComputedStyle(container).paddingTop) || 0;
+        this.visibleApps = new Set();
+        this.appObserver = new IntersectionObserver((entries)=>{
+            if (this.destroyed) return;
+            for (const e of entries){
+                const idx = e.target.__btIdx;
+                if (idx === undefined) continue;
+                if (e.isIntersecting) this.visibleApps.add(idx);
+                else this.visibleApps.delete(idx);
+                this.touchApp(idx);
+            }
+            this.enforceAppLru();
+        }, {
+            root: container
+        });
+        this.freeObserver = new IntersectionObserver((entries)=>{
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            for (const e of entries)if (!e.isIntersecting) this.freeBody(e.target);
+        }, {
+            root: container,
+            rootMargin: '300% 0px'
+        });
+        this.mountObserver = new IntersectionObserver((entries)=>{
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            for (const e of entries){
+                if (!e.isIntersecting) continue;
+                const n = e.target;
+                if (n.dataset.btFreed) {
+                    this.unfreeBody(n);
+                } else if (n.dataset.btWantsBody) {
+                    delete n.dataset.btWantsBody;
+                    this.comm.notify({
+                        type: 'tool.render',
+                        id: n.dataset.msgId
+                    });
+                }
+            }
+        }, {
+            root: container,
+            rootMargin: '150% 0px'
+        });
         this.followMode = true;
         this.unreadCount = 0;
         this.pillShown = false;
         this.AT_BOTTOM_PX = 20;
         this.prevScrollTop = container.scrollTop;
-        this.spacerTop = container.querySelector('.bt-spacer-top');
-        this.spacerBottom = container.querySelector('.bt-spacer-bottom');
+        this.rowsEnd = container.querySelector('.bt-rows-end');
         this.toolbarEl = (container.closest('.bt-app') || container.parentElement).querySelector('.bt-chat-toolbar');
         if (this.toolbarEl) this.toolbarEl.style.display = 'none';
         this.hiddenTypes = new Set(DEFAULT_HIDDEN);
@@ -146,7 +694,6 @@ class BonitoChat {
         this.nativeImages = true;
         this.nativeVideos = true;
         this.lensActive = false;
-        this.lensVisible = null;
         this.lensActions = null;
         this.lensQuery = '';
         this.lensVocab = [];
@@ -157,37 +704,24 @@ class BonitoChat {
         this.waitingEl = container.querySelector('.bt-waiting');
         this.thinkingEl = container.querySelector('.bt-thinking');
         this.thinkingCountEl = container.querySelector('.bt-thinking-count');
+        this.thinkingEstimate = false;
         this.tailEl = container.querySelector('.bt-messages-tail');
         this.sizeTail();
-        this.measureEl = document.createElement('div');
-        this.measureEl.className = 'bt-measure';
-        container.parentElement.appendChild(this.measureEl);
-        this.startSettle();
         comm.on((msg)=>{
             if (this.destroyed) return false;
             if (msg && typeof msg === 'object') this.dispatch(msg);
         });
-        const cur = comm.value;
-        if (cur && cur.type === 'msgs.count' && cur.n > 0) {
-            this.applyCount(cur.n);
-        } else if (cur && cur.type === 'msgs.range') {
-            this.startSettle();
-            this.onRange(cur);
-            this.startPrefetch();
-        }
-        comm.notify({
-            type: 'init'
-        });
-        this.lastUserInputT = 0;
+        this.lastUserInputT = -Infinity;
         this.pendingUserScroll = false;
         const markUserInput = ()=>{
             this.lastUserInputT = performance.now();
             this.pendingUserScroll = true;
-            this.pendingAnchor = null;
             this.cancelPendingScroll();
+            this.cancelShowRestore();
         };
         container.addEventListener('wheel', markUserInput, {
-            passive: true
+            passive: true,
+            capture: true
         });
         container.addEventListener('touchstart', markUserInput, {
             passive: true
@@ -199,6 +733,35 @@ class BonitoChat {
             passive: true
         });
         this.markUserInput = markUserInput;
+        this.onMediaSized = (e)=>{
+            const el = e.target;
+            if (!(el instanceof HTMLElement) || !el.classList.contains('bt-media')) return;
+            const path = el.closest('.bt-media-wrap')?.dataset.workerPath;
+            const video = el.tagName === 'VIDEO';
+            const w = video ? el.videoWidth : el.naturalWidth;
+            const h = video ? el.videoHeight : el.naturalHeight;
+            if (!path || !w || !h) return;
+            if (+el.getAttribute('width') === w && +el.getAttribute('height') === h) return;
+            el.setAttribute('width', w);
+            el.setAttribute('height', h);
+            this.comm.notify({
+                type: 'media.size',
+                path,
+                w,
+                h
+            });
+        };
+        container.addEventListener('load', this.onMediaSized, true);
+        container.addEventListener('loadedmetadata', this.onMediaSized, true);
+        container.addEventListener('click', (e)=>{
+            const chip = e.target.closest('.bt-tool-jump');
+            if (!chip || !container.contains(chip)) return;
+            e.preventDefault();
+            e.stopPropagation();
+            this.jumpToMessage(parseInt(chip.dataset.jumpIndex ?? '-1', 10), chip.dataset.jumpId);
+        }, {
+            capture: true
+        });
         container.addEventListener('click', (e)=>{
             const link = e.target.closest('.bt-path-link');
             if (!link || !container.contains(link)) return;
@@ -213,31 +776,17 @@ class BonitoChat {
         }, {
             capture: true
         });
-        this.scrollbarDrag = false;
-        this.onContainerMouseDown = ()=>{
-            this.scrollbarDrag = true;
-            markUserInput();
-        };
-        this.onWindowMouseUp = ()=>{
-            if (!this.container.isConnected) {
-                this.lazyDestroy();
-                return;
-            }
-            if (!this.scrollbarDrag) return;
-            this.scrollbarDrag = false;
-            markUserInput();
-            for (const idx of this.rendered){
-                const node = this.cache.get(idx);
-                if (node && node.isConnected && node.dataset.btAutoExpand) {
-                    delete node.dataset.btAutoExpand;
-                    node.collapsable?.setExpanded(true);
-                }
-            }
-            this.queueRefresh();
-        };
-        container.addEventListener('mousedown', this.onContainerMouseDown, {
-            passive: true
+        container.addEventListener('click', (e)=>{
+            const img = e.target.closest('.bt-agent-msg img, .bt-tool-md img');
+            if (!img || img.closest('a, .bt-media-wrap')) return;
+            e.stopPropagation();
+            openLightbox(img);
         });
+        this.scrollbarDrag = false;
+        this.railDrag = null;
+        this.onWindowMouseUp = ()=>{
+            if (!this.container.isConnected) this.lazyDestroy();
+        };
         window.addEventListener('mouseup', this.onWindowMouseUp, {
             passive: true
         });
@@ -335,7 +884,9 @@ class BonitoChat {
                 p.lastT = performance.now();
                 try {
                     this.container.setPointerCapture(e.pointerId);
-                } catch (_) {}
+                } catch (error) {
+                    if (error.name !== 'NotFoundError') throw error;
+                }
                 this.container.classList.add('bt-messages-grabbing');
                 this.lastUserInputT = performance.now();
                 this.cancelPendingScroll();
@@ -374,9 +925,7 @@ class BonitoChat {
             const vel = p.velocity;
             this.panState = null;
             if (!engaged) return;
-            try {
-                this.container.releasePointerCapture(e.pointerId);
-            } catch (_) {}
+            if (this.container.hasPointerCapture(e.pointerId)) this.container.releasePointerCapture(e.pointerId);
             this.container.classList.remove('bt-messages-grabbing');
             if (Math.abs(vel) > 0.10) {
                 this.momentumRaf = requestAnimationFrame(()=>momentumStep(vel));
@@ -392,7 +941,7 @@ class BonitoChat {
         this.onPanMove = onPanMove;
         this.onPanUp = onPanUp;
         this.onScroll = ()=>{
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             this.lastGoodTop = this.container.scrollTop;
             const userDriven = this.scrollbarDrag || this.pendingUserScroll || performance.now() - this.lastUserInputT < 400;
             this.pendingUserScroll = false;
@@ -407,14 +956,14 @@ class BonitoChat {
                 this.queueScrollToBottom();
             }
             this.updateScrollAffordance(atBot);
-            this.refresh();
+            this.ensureWindow();
         };
         container.addEventListener('scroll', this.onScroll, {
             passive: true
         });
         this.viewportObserver = new ResizeObserver(()=>{
             if (this.destroyed) return;
-            if (this.container.clientHeight === 0) return;
+            if (!this.paneVisible || this.container.clientHeight === 0) return;
             this.sizeTail();
             if (this.followMode) this.queueScrollToBottom();
         });
@@ -430,12 +979,23 @@ class BonitoChat {
         }
         Promise.resolve().then(()=>{
             this.setupInputs();
+            this.setCancelling(this.cancelling ?? false);
             this.setupLiveTicker();
             this.setupLens();
+        });
+        this.setupRail();
+        const tail = init.tail;
+        if (tail && Number.isInteger(tail.n)) this.applyTail(tail);
+        comm.notify({
+            type: 'init'
         });
     }
     destroy() {
         this.destroyed = true;
+        this.workspacePanel?.removeEventListener('bw-panel-visibility', this.onWorkspaceVisibility);
+        this.cancelShowRestore();
+        CODE_OBSERVERS.get(this.container)?.disconnect();
+        CODE_OBSERVERS.delete(this.container);
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
             this.elapsedTimer = null;
@@ -444,13 +1004,16 @@ class BonitoChat {
             this.container.removeEventListener('scroll', this.onScroll);
         }
         if (this.markUserInput) {
-            this.container.removeEventListener('wheel', this.markUserInput);
+            this.container.removeEventListener('wheel', this.markUserInput, {
+                capture: true
+            });
             this.container.removeEventListener('touchstart', this.markUserInput);
             this.container.removeEventListener('touchmove', this.markUserInput);
             this.container.removeEventListener('keydown', this.markUserInput);
         }
-        if (this.onContainerMouseDown) {
-            this.container.removeEventListener('mousedown', this.onContainerMouseDown);
+        if (this.onMediaSized) {
+            this.container.removeEventListener('load', this.onMediaSized, true);
+            this.container.removeEventListener('loadedmetadata', this.onMediaSized, true);
         }
         if (this.onWindowMouseUp) {
             window.removeEventListener('mouseup', this.onWindowMouseUp);
@@ -471,9 +1034,12 @@ class BonitoChat {
         if (this.viewportObserver) {
             this.viewportObserver.disconnect();
         }
-        if (this.messageHeightObserver) this.messageHeightObserver.disconnect();
+        if (this.rowObserver) this.rowObserver.disconnect();
+        if (this.appObserver) this.appObserver.disconnect();
+        if (this.freeObserver) this.freeObserver.disconnect();
+        if (this.mountObserver) this.mountObserver.disconnect();
         if (this.moveObserver) this.moveObserver.disconnect();
-        this.observed.clear();
+        this.teardownRail();
         if (this.onPaste && this.textInput) {
             this.textInput.removeEventListener('paste', this.onPaste);
         }
@@ -491,6 +1057,24 @@ class BonitoChat {
         if (this.onAppClickCapture && this.app) {
             this.app.removeEventListener('click', this.onAppClickCapture, true);
         }
+        if (this.onDraftInput && this.textInput) {
+            this.flushDraft();
+            this.textInput.removeEventListener('input', this.onDraftInput);
+            this.textInput.removeEventListener('blur', this.flushDraft);
+            window.removeEventListener('pagehide', this.flushDraft);
+            document.removeEventListener('visibilitychange', this.onDraftVisibility);
+        }
+        if (this.textInput) {
+            this.textInput.removeEventListener('compositionstart', this.onCompositionStart);
+            this.textInput.removeEventListener('compositionend', this.onCompositionEnd);
+            if (this.onInputResize) {
+                this.textInput.removeEventListener('input', this.onInputResize);
+                this.textInput.removeEventListener('bt-composer-resize', this.onInputResize);
+            }
+        }
+        if (this.inputResizeFrame) cancelAnimationFrame(this.inputResizeFrame);
+        this.inputWidthObserver?.disconnect();
+        this.inputMeasure?.remove();
         if (this.onAppChange && this.app) {
             this.app.removeEventListener('change', this.onAppChange);
         }
@@ -503,12 +1087,6 @@ class BonitoChat {
             this.onDrop && this.app.removeEventListener('drop', this.onDrop);
         }
         clearTimeout(this.attachErrorTimer);
-        clearTimeout(this.prefetchTimer);
-        if (!this.settleDone && this.paneEl) delete this.paneEl.dataset.btSettling;
-        if (this.measureEl) {
-            this.measureEl.remove();
-            this.measureEl = null;
-        }
         if (this.tickerId) {
             clearInterval(this.tickerId);
             this.tickerId = null;
@@ -524,14 +1102,36 @@ class BonitoChat {
         if (this.destroyed) return;
         try {
             this.destroy();
-        } catch (_) {}
-        CHAT_INSTANCES.delete(this);
+        } finally{
+            CHAT_INSTANCES.delete(this);
+        }
     }
     dispatch(msg) {
         if (typeof msg.n === 'number' && msg.n > this.totalCount) {
             this.totalCount = msg.n;
         }
+        if (this.thinkingEstimate && [
+            'chunk',
+            'agent',
+            'thought',
+            'tool',
+            'tool_update',
+            'plan',
+            'summary',
+            'agent_final',
+            'thinking',
+            'busy_end',
+            'session_reset'
+        ].includes(msg.type)) this.endThinkingEstimate();
         switch(msg.type){
+            case 'queue.state':
+                return this.renderQueue(msg);
+            case 'queue.delivered':
+                return this.queueDelivered(msg);
+            case 'cancel.state':
+                this.turnSeq = msg.seq;
+                this.setCancelling(msg.stopping);
+                return;
             case 'msgs.count':
                 return this.applyCount(msg.n);
             case 'msgs.reload':
@@ -558,6 +1158,7 @@ class BonitoChat {
                 if (this.followMode) this.queueScrollToBottom();
                 return;
             case 'busy_end':
+                this.setCancelling(false);
                 this.busyEl?.classList.remove('bt-busy-active');
                 if (this.followMode) this.queueScrollToBottom();
                 return;
@@ -565,6 +1166,8 @@ class BonitoChat {
                 return this.onAgentFinal(msg);
             case 'thinking':
                 return this.onThinking(msg);
+            case 'thinking_tokens':
+                return this.onThinkingTokens(msg.tokens);
             case 'permission':
                 return this.onPermission(msg);
             case 'permission_done':
@@ -604,85 +1207,375 @@ class BonitoChat {
                 return this.appendNewMessage(msg);
         }
     }
-    onMsgsReload(n) {
-        for (const node of this.cache.values())node.remove();
-        this.cache.clear();
-        this.heights.clear();
-        this.pendingAnchor = null;
-        this.rendered.clear();
-        this.nodeById.clear();
-        this.observed.clear();
-        this.requestedAt.clear();
-        this.cancelPendingScroll();
-        this.epoch++;
-        this.prefetchStarted = false;
-        this.prefetchCursor = null;
-        this.prefetchPending = null;
-        clearTimeout(this.prefetchTimer);
-        this.totalCount = 0;
-        this.bootstrapped = false;
-        this.followMode = true;
-        this.unreadCount = 0;
-        this.applyCount(n);
+    seqLength() {
+        return this.seq ? this.seq.length : this.totalCount;
+    }
+    seqIndex(p) {
+        return this.seq ? this.seq[p] : p;
+    }
+    seqPos(idx) {
+        if (!this.seq) return idx >= 0 && idx < this.totalCount ? idx : -1;
+        let lo = 0, hi = this.seq.length - 1;
+        while(lo <= hi){
+            const mid = lo + hi >> 1;
+            const v = this.seq[mid];
+            if (v === idx) return mid;
+            if (v < idx) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        return -1;
+    }
+    blockEmpty() {
+        return this.phi < this.plo;
+    }
+    atTail() {
+        return this.phi === this.seqLength() - 1;
+    }
+    applyTail(tail) {
+        this.totalCount = Math.max(this.totalCount, tail.n);
+        if (tail.n === 0) {
+            this.markReady();
+            this.updateRail();
+            return;
+        }
+        const items = (tail.msgs || []).map((m, i)=>[
+                tail.start + i,
+                m
+            ]);
+        this.replaceBlock(items, {
+            kind: 'tail'
+        });
     }
     applyCount(n) {
-        if (n <= 0) {
-            this.startSettle();
-            this.settle();
+        if (n < this.totalCount) {
+            this.onMsgsReload(n);
             return;
         }
         this.totalCount = n;
-        if (!this.bootstrapped) {
-            this.bootstrapped = true;
-            this.initialLoad = true;
+        if (n === 0) {
+            this.markReady();
+            this.updateRail();
+            return;
         }
-        this.startSettle();
-        this.refresh();
-        if (this.initialLoad && !this.rangeMissing()) this.runInitialMountCascade();
-        this.startPrefetch();
+        if (this.blockEmpty()) {
+            if (!this.pending.block) this.loadTail();
+            return;
+        }
+        this.ensureWindow();
     }
-    startSettle() {
-        if (this.settleWatch || this.settleDone) return;
-        this.settleWatch = true;
-        this.settleStartedAt = performance.now();
-        this.settleLastHeight = -1;
-        this.settleStable = 0;
-        this.paneEl = this.container.closest('.bt-chatpane');
-        if (this.paneEl) {
-            delete this.paneEl.dataset.btSettled;
-            this.paneEl.dataset.btSettling = '1';
+    onMsgsReload(n) {
+        this.totalCount = n;
+        this.seq = null;
+        if (this.lensActive) this.runLens(this.lensQuery);
+        this.clearBlock();
+        this.setFollowMode(true);
+        this.unreadCount = 0;
+        this.loadTail();
+    }
+    loadTail() {
+        const len = this.seqLength();
+        if (len === 0) {
+            this.clearBlock();
+            this.markReady();
+            this.updateRail();
+            return;
         }
-        this.announceSettle('bt-chat-settling');
-        const watch = ()=>{
-            if (this.destroyed || this.settleDone) return;
-            const h = this.container.scrollHeight;
-            if (h === this.settleLastHeight) this.settleStable++;
-            else {
-                this.settleStable = 0;
-                this.settleLastHeight = h;
-            }
-            const elapsed = performance.now() - this.settleStartedAt;
-            const pendingBody = [
-                ...this.container.querySelectorAll('.bt-collapsable-loading')
-            ].some((el)=>!(el.closest('.bt-tool-msg')?.dataset.showMime || '').startsWith('video/'));
-            const pendingImg = [
-                ...this.container.querySelectorAll('img')
-            ].some((img)=>!img.complete);
-            const settled = this.settleStable >= 10 && elapsed > 400 && !this.initialLoad && !pendingBody && !pendingImg;
-            if (settled || elapsed > 5000) this.settle();
-            else requestAnimationFrame(watch);
+        this.requestBlock(Math.max(0, len - this.CHUNK), len - 1, {
+            kind: 'tail'
+        });
+    }
+    requestBlock(pa, pb, opts) {
+        this.epoch++;
+        this.pending = {};
+        this.request('block', pa, pb, opts);
+    }
+    request(slot, pa, pb, opts = {}) {
+        if (pa > pb) return;
+        const id = ++this.reqSeq;
+        this.pending[slot] = {
+            ...opts,
+            id,
+            slot,
+            pa,
+            pb
         };
-        requestAnimationFrame(watch);
+        const msg = {
+            type: 'msgs.request',
+            epoch: this.epoch,
+            req: id
+        };
+        if (this.seq) msg.indices = this.seq.slice(pa, pb + 1);
+        else msg.range = [
+            pa,
+            pb
+        ];
+        this.comm.notify(msg);
     }
-    settle() {
-        if (this.settleDone) return;
-        this.settleDone = true;
-        this.settleWatch = false;
-        if (this.followMode) this.scrollToBottom();
-        if (this.paneEl) {
-            delete this.paneEl.dataset.btSettling;
-            this.paneEl.dataset.btSettled = '1';
+    onRange(msg) {
+        if (msg.epoch !== undefined && msg.epoch !== null && msg.epoch !== this.epoch) return;
+        const req = Object.values(this.pending).find((r)=>r.id === msg.req);
+        if (!req) return;
+        delete this.pending[req.slot];
+        const msgs = msg.msgs ?? [];
+        const items = Array.isArray(msg.indices) ? msg.indices.map((idx, i)=>[
+                idx,
+                msgs[i]
+            ]) : msgs.map((m, i)=>[
+                msg.start + i,
+                m
+            ]);
+        if (req.slot === 'older') this.prependItems(items);
+        else if (req.slot === 'newer') this.appendItems(items);
+        else this.replaceBlock(items, req);
+        this.ensureWindow();
+    }
+    makeRow(idx, data) {
+        const node = this.createNode(data);
+        node.__btIdx = idx;
+        node.__btId = data.id;
+        this.cache.set(idx, node);
+        this.keyByIdx.set(idx, filterKey(data));
+        if (data.id) this.nodeById.set(data.id, node);
+        this.applyVisibility(idx, node);
+        if (this.lensActions?.get(idx) === 'expand') node.dataset.btAutoExpand = '1';
+        return node;
+    }
+    adoptRows(nodes) {
+        for (const node of nodes){
+            this.mountDeferred(node);
+            if (this.lensActions?.get(node.__btIdx) === 'collapse') {
+                node.collapsable?.setExpanded(false);
+            }
         }
+        for (const node of nodes){
+            if (node.offsetParent !== null) node.__btH = node.getBoundingClientRect().height;
+            this.rowObserver.observe(node);
+            if (node.classList.contains('bt-tool-msg')) {
+                this.freeObserver.observe(node);
+                this.mountObserver.observe(node);
+            }
+            if (node.dataset.btApp) {
+                this.appObserver.observe(node);
+                this.touchApp(node.__btIdx);
+            }
+        }
+    }
+    removeRow(idx) {
+        const node = this.cache.get(idx);
+        if (!node) return;
+        this.rowObserver.unobserve(node);
+        this.freeObserver.unobserve(node);
+        this.mountObserver.unobserve(node);
+        clearTimeout(node.__btBodyTimer);
+        if (node.dataset.btApp) {
+            this.appObserver.unobserve(node);
+            this.visibleApps.delete(idx);
+            const li = this.appLru.indexOf(idx);
+            if (li !== -1) this.appLru.splice(li, 1);
+        }
+        if (node.__btId && this.nodeById.get(node.__btId) === node) this.nodeById.delete(node.__btId);
+        this.cache.delete(idx);
+        this.keyByIdx.delete(idx);
+        this.clearPendingStream(node);
+        node.remove();
+    }
+    clearBlock() {
+        for (const idx of this.order)this.removeRow(idx);
+        this.order = [];
+        this.plo = 0;
+        this.phi = -1;
+    }
+    insertRows(items, before) {
+        const frag = document.createDocumentFragment();
+        const nodes = [];
+        for (const [idx, data] of items){
+            const node = this.makeRow(idx, data);
+            frag.appendChild(node);
+            nodes.push(node);
+        }
+        this.container.insertBefore(frag, before);
+        return nodes;
+    }
+    replaceBlock(items, req) {
+        this.clearBlock();
+        const rows = items.filter(([, d])=>d != null);
+        const nodes = this.insertRows(rows, this.rowsEnd);
+        this.order = rows.map(([idx])=>idx);
+        if (this.order.length) {
+            this.plo = this.seqPos(this.order[0]);
+            this.phi = this.seqPos(this.order[this.order.length - 1]);
+        }
+        this.adoptRows(nodes);
+        this.placeView(req);
+        this.markReady();
+    }
+    prependItems(items) {
+        const rows = items.filter(([idx, d])=>d != null && !this.cache.has(idx));
+        if (rows.length === 0) return;
+        if (this.seqPos(rows[rows.length - 1][0]) !== this.plo - 1) return;
+        const c = this.container;
+        const before = c.scrollHeight;
+        const top = c.scrollTop;
+        const first = this.cache.get(this.order[0]) || this.rowsEnd;
+        const nodes = this.insertRows(rows, first);
+        this.order = rows.map(([idx])=>idx).concat(this.order);
+        this.plo = this.seqPos(rows[0][0]);
+        this.adoptRows(nodes);
+        const grown = c.scrollHeight - before;
+        if (grown !== 0 && !this.railDrag) {
+            c.scrollTop = top + grown;
+            this.prevScrollTop = c.scrollTop;
+        }
+    }
+    appendItems(items) {
+        const rows = items.filter(([idx, d])=>d != null && !this.cache.has(idx));
+        if (rows.length === 0) return;
+        if (this.seqPos(rows[0][0]) !== this.phi + 1) return;
+        const nodes = this.insertRows(rows, this.rowsEnd);
+        this.order = this.order.concat(rows.map(([idx])=>idx));
+        this.phi = this.seqPos(rows[rows.length - 1][0]);
+        this.adoptRows(nodes);
+        if (this.followMode) this.queueScrollToBottom();
+    }
+    placeView(req) {
+        const c = this.container;
+        const kind = req.kind || 'tail';
+        if (kind === 'tail') {
+            this.setFollowMode(true);
+            c.scrollTop = c.scrollHeight;
+        } else if (kind === 'lens') {
+            this.setFollowMode(false);
+            c.scrollTop = 0;
+        } else if (kind === 'restore') {
+            this.setFollowMode(false);
+            this.restoreAnchor({
+                idx: req.idx,
+                off: req.off
+            });
+        } else if (kind === 'jump') {
+            this.setFollowMode(false);
+            const node = this.cache.get(this.seqIndex(req.target));
+            if (node && node.offsetParent !== null) {
+                c.scrollTop = Math.max(0, node.offsetTop - (req.offset ?? 8));
+            }
+            if (req.flashId) this.flash(req.flashId);
+        }
+        this.prevScrollTop = c.scrollTop;
+        this.updateScrollAffordance(this.atBottom());
+    }
+    ensureWindow() {
+        if (this.destroyed) return;
+        const c = this.container;
+        if (!this.paneVisible || this.railDrag || c.clientHeight === 0) {
+            this.updateRail();
+            return;
+        }
+        const len = this.seqLength();
+        if (this.pending.block || len === 0) {
+            this.updateRail();
+            return;
+        }
+        if (this.blockEmpty()) {
+            this.loadTail();
+            return;
+        }
+        const margin = Math.max(800, 2 * c.clientHeight);
+        if (this.plo > 0 && !this.pending.older && c.scrollTop < margin) {
+            this.request('older', Math.max(0, this.plo - this.CHUNK), this.plo - 1);
+        }
+        if (this.phi < len - 1 && !this.pending.newer && c.scrollHeight - c.scrollTop - c.clientHeight < margin) {
+            this.request('newer', this.phi + 1, Math.min(len - 1, this.phi + this.CHUNK));
+        }
+        this.trimBlock();
+        this.updateRail();
+    }
+    visibleSpan() {
+        const st = this.container.scrollTop;
+        const sb = st + this.container.clientHeight;
+        let first = -1, last = -1;
+        for(let i = 0; i < this.order.length; i++){
+            const node = this.cache.get(this.order[i]);
+            if (!node || node.offsetParent === null) continue;
+            const top = node.offsetTop;
+            if (top + node.offsetHeight <= st + 1) continue;
+            if (top >= sb) break;
+            if (first < 0) first = i;
+            last = i;
+        }
+        return [
+            first,
+            last
+        ];
+    }
+    trimBlock() {
+        const n = this.order.length;
+        if (n <= this.MAX_WINDOW) return;
+        const [first, last] = this.visibleSpan();
+        if (first < 0) return;
+        const c = this.container;
+        const excess = n - (this.MAX_WINDOW - this.CHUNK);
+        const keepBeyond = Math.floor(this.CHUNK / 2);
+        const above = first, below = n - 1 - last;
+        const holds = (ids)=>ids.some((idx)=>this.holdsFullscreen(this.cache.get(idx)));
+        if (above >= below) {
+            const d = Math.min(excess, above - keepBeyond);
+            if (d <= 0 || holds(this.order.slice(0, d))) return;
+            const before = c.scrollHeight;
+            const top = c.scrollTop;
+            for (const idx of this.order.splice(0, d))this.removeRow(idx);
+            this.plo = this.seqPos(this.order[0]);
+            const shrunk = before - c.scrollHeight;
+            if (shrunk !== 0) {
+                c.scrollTop = top - shrunk;
+                this.prevScrollTop = c.scrollTop;
+            }
+        } else {
+            const d = Math.min(excess, below - keepBeyond);
+            if (d <= 0 || holds(this.order.slice(n - d))) return;
+            for (const idx of this.order.splice(n - d))this.removeRow(idx);
+            this.phi = this.seqPos(this.order[this.order.length - 1]);
+        }
+    }
+    jumpToPosition(p, { flashId =null , offset =8  } = {}) {
+        const len = this.seqLength();
+        if (len === 0) return;
+        p = Math.max(0, Math.min(len - 1, p));
+        if (p === len - 1) {
+            this.setFollowMode(true);
+            this.scrollToBottom();
+            if (flashId) this.flash(flashId);
+            return;
+        }
+        this.setFollowMode(false);
+        const node = this.cache.get(this.seqIndex(p));
+        if (node && p >= this.plo && p <= this.phi && node.offsetParent !== null) {
+            this.container.scrollTop = Math.max(0, node.offsetTop - offset);
+            this.prevScrollTop = this.container.scrollTop;
+            if (flashId) this.flash(flashId);
+            this.ensureWindow();
+            return;
+        }
+        const back = Math.floor(this.CHUNK / 2);
+        this.requestBlock(Math.max(0, p - back), Math.min(len - 1, p + this.CHUNK), {
+            kind: 'jump',
+            target: p,
+            offset,
+            flashId
+        });
+    }
+    flash(id) {
+        const node = this.nodeById.get(id);
+        if (!node) return;
+        node.classList.remove('bt-jump-flash');
+        void node.offsetWidth;
+        node.classList.add('bt-jump-flash');
+        setTimeout(()=>node.classList.remove('bt-jump-flash'), 1800);
+    }
+    markReady() {
+        if (this.ready) return;
+        this.ready = true;
+        this.paneEl = this.container.closest('.bt-chatpane');
+        if (this.paneEl) this.paneEl.dataset.btSettled = '1';
         this.announceSettle('bt-chat-settled');
     }
     announceSettle(name) {
@@ -691,325 +1584,308 @@ class BonitoChat {
             detail: pid
         }));
     }
-    startPrefetch() {
-        if (this.prefetchStarted) return;
-        this.prefetchStarted = true;
-        this.prefetchTimer = setTimeout(()=>this.prefetchTick(), 600);
-    }
-    prefetchTick() {
-        if (this.destroyed) return;
-        if (this.prefetchPaused) return;
-        let e = -1;
-        for(let i = Math.min(this.prefetchCursor ?? Infinity, this.totalCount - 1); i >= 0; i--){
-            if (!this.cache.has(i)) {
-                e = i;
-                break;
-            }
-        }
-        if (e < 0) return;
-        let s = e;
-        while(s > 0 && !this.cache.has(s - 1) && e - s < 63)s--;
-        this.prefetchCursor = s - 1;
-        this.prefetchPending = [
-            s,
-            e
-        ];
-        this.comm.notify({
-            type: 'msgs.request',
-            range: [
-                s,
-                e
-            ],
-            epoch: this.epoch
-        });
-        clearTimeout(this.prefetchTimer);
-        this.prefetchTimer = setTimeout(()=>this.prefetchTick(), 2000);
-    }
-    visibleRange() {
-        if (this.totalCount === 0) return [
-            0,
-            -1
-        ];
-        const { scrollTop , clientHeight  } = this.container;
-        const over = this.OVERSCAN * this.EST_HEIGHT;
-        const s = this.indexAt(Math.max(0, scrollTop - over));
-        const e = this.indexAt(scrollTop + clientHeight + over);
-        return [
-            s,
-            Math.min(this.totalCount - 1, e)
-        ];
-    }
-    effHeight(i) {
-        if (this.lensActive && !this.lensVisible.has(i)) return 0;
-        if (this.hiddenTypes.has(this.keyByIdx.get(i))) return 0;
-        return (this.heights.get(i) ?? this.EST_HEIGHT) + this.ITEM_GAP;
-    }
-    lensHides(i) {
-        return this.lensActive && !this.lensVisible.has(i);
-    }
     applyVisibility(idx, node = this.cache.get(idx)) {
         if (!node) return;
-        const hidden = this.parked.has(idx) || this.lensHides(idx) || this.hiddenTypes.has(this.keyByIdx.get(idx));
-        node.style.display = hidden ? 'none' : '';
-    }
-    indexAt(offset) {
-        let h = 0;
-        for(let i = 0; i < this.totalCount; i++){
-            h += this.effHeight(i);
-            if (h > offset) return i;
-        }
-        return Math.max(0, this.totalCount - 1);
-    }
-    cumHeight(from, to) {
-        let h = 0;
-        for(let i = from; i < to; i++)h += this.effHeight(i);
-        return h;
-    }
-    refresh() {
-        if (this.totalCount === 0) return;
-        const wasAtBottom = this.atBottom();
-        const preHeight = this.container.scrollHeight;
-        const [s, e] = this.visibleRange();
-        if (!this.scrollbarDrag) {
-            const now = performance.now();
-            const missing = [];
-            for(let i = s; i <= e; i++){
-                if (this.cache.has(i)) continue;
-                const t = this.requestedAt.get(i);
-                if (t !== undefined && now - t < 2000) continue;
-                missing.push(i);
-            }
-            if (missing.length > 0) {
-                for (const i of missing)this.requestedAt.set(i, now);
-                this.comm.notify({
-                    type: 'msgs.request',
-                    range: [
-                        missing[0],
-                        missing[missing.length - 1]
-                    ],
-                    epoch: this.epoch
-                });
-            }
-        }
-        this.updateDOM(s, e);
-        const userDriving = this.scrollbarDrag || this.pendingUserScroll || performance.now() - this.lastUserInputT < 400;
-        if (this.followMode && wasAtBottom && !userDriving && this.container.scrollHeight !== preHeight) {
-            this.container.scrollTop = this.container.scrollHeight;
-            this.prevScrollTop = this.container.scrollTop;
-        }
-    }
-    onRange({ start , msgs , epoch  }) {
-        if (epoch !== undefined && epoch !== null && epoch !== this.epoch) return;
-        const messages = msgs ?? [];
-        const fresh = [];
-        messages.forEach((data, i)=>{
-            const idx = start + i;
-            this.requestedAt.delete(idx);
-            if (this.cache.has(idx)) return;
-            const node = this.createNode(data);
-            this.cache.set(idx, node);
-            node.__btIdx = idx;
-            this.keyByIdx.set(idx, filterKey(data));
-            if (data.id) this.nodeById.set(data.id, node);
-            fresh.push([
-                idx,
-                node
-            ]);
-        });
-        this.measureNodes(fresh);
-        if (this.prefetchStarted && !this.prefetchPaused) {
-            clearTimeout(this.prefetchTimer);
-            this.prefetchTimer = setTimeout(()=>this.prefetchTick(), 30);
-        }
-        const pf = this.prefetchPending;
-        if (pf && start === pf[0]) {
-            this.prefetchPending = null;
-            const [vs, ve] = this.visibleRange();
-            const end = start + messages.length - 1;
-            if (end >= vs && start <= ve && !this.scrollbarDrag) {
-                this.updateDOM(vs, ve);
-            }
-            return;
-        }
-        if (this.scrollbarDrag) return;
-        this.updateDOM(...this.visibleRange());
-        if (this.initialLoad) this.runInitialMountCascade();
-        else if (this.followMode) this.queueScrollToBottom();
-    }
-    runInitialMountCascade() {
-        this.setFollowMode(true);
-        this.scrollToBottom();
-        requestAnimationFrame(()=>{
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        });
-        setTimeout(()=>{
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-        }, 100);
-        setTimeout(()=>{
-            if (!this.destroyed && this.followMode) this.scrollToBottom();
-            this.initialLoad = false;
-        }, 300);
-    }
-    rangeMissing() {
-        const [s, e] = this.visibleRange();
-        for(let i = s; i <= e; i++)if (!this.cache.has(i)) return true;
-        return false;
-    }
-    heightIsFinal(node) {
-        if (!node || !node.querySelector) return true;
-        if (node.classList.contains('bt-tool-live')) return false;
-        if (node.dataset.btAutoExpand || node.dataset.btAutoMount) return false;
-        if (node.querySelector('.bt-collapsable-loading')) return false;
-        for (const m of node.querySelectorAll('img, video')){
-            if (m.tagName === 'IMG' && !m.complete) return false;
-            if (m.offsetHeight === 0) return false;
-        }
-        return true;
-    }
-    measureNodes(pairs) {
-        if (!this.measureEl || pairs.length === 0) return;
-        const cs = getComputedStyle(this.container);
-        const w = this.container.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
-        if (w <= 0) return;
-        this.measureEl.style.width = w + 'px';
-        const toMeasure = pairs.filter(([idx, node])=>!node.isConnected && !this.heights.has(idx));
-        for (const [, node] of toMeasure)this.measureEl.appendChild(node);
-        for (const [idx, node] of toMeasure){
-            const h = node.offsetHeight;
-            if (h > 0) {
-                if (this.heightIsFinal(node)) this.heights.set(idx, h);
-                this.measuredHeightSum += h;
-                this.measuredHeightCount++;
-            }
-        }
-        for (const [, node] of toMeasure){
-            if (node.parentNode === this.measureEl) this.measureEl.removeChild(node);
-        }
-        if (this.measuredHeightCount >= 20) {
-            this.EST_HEIGHT = Math.min(400, Math.max(24, this.measuredHeightSum / this.measuredHeightCount));
-        }
-    }
-    observe(idx, node) {
-        node.__btIdx = idx;
-        this.observed.add(idx);
-        this.messageHeightObserver.observe(node);
-    }
-    queueRefresh() {
-        if (this.refreshQueued || this.destroyed) return;
-        this.refreshQueued = true;
-        requestAnimationFrame(()=>{
-            this.refreshQueued = false;
-            if (!this.destroyed) this.refresh();
-        });
+        node.style.display = this.hiddenTypes.has(this.keyByIdx.get(idx)) ? 'none' : '';
     }
     captureAnchor(excludeKey = null) {
         const st = this.container.scrollTop;
-        for (const i of [
-            ...this.rendered
-        ].sort((a, b)=>a - b)){
-            const n = this.cache.get(i);
-            if (!n || !n.isConnected || n.style.display === 'none') continue;
+        for (const idx of this.order){
+            const n = this.cache.get(idx);
+            if (!n || n.offsetParent === null) continue;
             if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st + 4) {
-                this.anchorDebugGeneric = {
-                    st,
-                    idx: i,
-                    off: n.offsetTop - st
-                };
-                return {
-                    idx: i,
-                    off: n.offsetTop - st
-                };
-            }
+            if (n.offsetTop + n.offsetHeight > st + 4) return {
+                idx,
+                off: n.offsetTop - st
+            };
         }
-        this.anchorDebugGeneric = {
-            st,
-            idx: -1,
-            off: 0
-        };
         return null;
     }
     restoreAnchor(a) {
         if (!a) return;
-        const cached = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
-        const n = cached && cached.offsetParent !== null ? cached : null;
-        let want;
-        if (n && n.isConnected) {
-            want = n.offsetTop - a.off;
-            this.pendingAnchor = null;
-        } else {
-            want = this.cumHeight(0, a.idx) + this.PAD_TOP + this.ITEM_GAP - a.off;
-            this.pendingAnchor = a;
-            this.queueRefresh();
-        }
+        const n = this.cache.get(a.idx);
+        if (!n || n.offsetParent === null) return;
+        const want = Math.max(0, n.offsetTop - a.off);
         if (Math.abs(this.container.scrollTop - want) > 1) {
             this.container.scrollTop = want;
             this.prevScrollTop = this.container.scrollTop;
         }
     }
-    captureKeyAnchor(excludeKey) {
-        const st = this.container.scrollTop;
-        let vi = this.indexAt(st);
-        while(vi < this.totalCount && (this.keyByIdx.get(vi) === excludeKey || this.effHeight(vi) === 0))vi++;
-        if (vi >= this.totalCount) return null;
-        let di = -1, doff = 0;
-        for (const i of [
-            ...this.rendered
-        ].sort((a, b)=>a - b)){
-            const n = this.cache.get(i);
-            if (!n || !n.isConnected || n.style.display === 'none') continue;
-            if (this.keyByIdx.get(i) === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st + 4) {
-                di = i;
-                doff = n.offsetTop - st;
-                break;
-            }
+    syncRowHeights() {
+        for (const idx of this.order){
+            const node = this.cache.get(idx);
+            if (node) node.__btH = node.getBoundingClientRect().height;
         }
-        this.anchorDebug = {
-            st,
-            vi,
-            di,
-            doff,
-            pickedDom: di >= 0 && di <= vi
-        };
-        if (di >= 0 && di <= vi) {
-            return {
-                idx: di,
-                off: doff,
-                dom: true
+    }
+    bodyReserve(node) {
+        if (!node.collapsable) return null;
+        const map = node.__btBodyH;
+        const sizes = map ? Object.entries(map) : [];
+        if (sizes.length) {
+            const w = this.bodyWidth();
+            for (const [k, h] of sizes)if (Math.abs(+k - w) <= 2) return {
+                height: h + 'px'
             };
         }
-        return {
-            idx: vi,
-            dom: false,
-            off: this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, vi) - st
+        const m = node.__btMedia;
+        if (m && m[0] > 0 && m[1] > 0) return {
+            boxSizing: 'content-box',
+            padding: (node.__btMediaExtra || 0) + 'px 0 0',
+            width: m[0] + 'px',
+            maxWidth: '100%',
+            aspectRatio: m[0] + ' / ' + m[1],
+            overflow: 'hidden'
         };
+        return null;
     }
-    restoreKeyAnchor(a) {
-        if (!a) return;
-        let want;
-        const n = this.rendered.has(a.idx) ? this.cache.get(a.idx) : null;
-        if (a.dom && n && n.isConnected && n.style.display !== 'none') {
-            want = n.offsetTop - a.off;
-        } else if (a.dom) {
-            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+    bodyWidth() {
+        return Math.round(this.container.clientWidth);
+    }
+    scheduleBodyReport(node) {
+        clearTimeout(node.__btBodyTimer);
+        node.__btBodyTimer = setTimeout(()=>this.reportBody(node), 800);
+    }
+    reportBody(node) {
+        node.__btBodyTimer = null;
+        if (this.destroyed || !this.paneVisible || !node.isConnected || this.container.clientHeight === 0) return;
+        const body = node.collapsable?.body;
+        const id = node.dataset.msgId;
+        if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
+        if (body.querySelector(':scope > .bt-collapsable-loading')) return;
+        const content = this.bodyContentHeight(body);
+        const h = Math.round(content);
+        const w = this.bodyWidth();
+        if (w < 1 || h < 1) return;
+        const map = node.__btBodyH || {};
+        for (const k of Object.keys(map)){
+            if (Math.abs(+k - w) > 2) continue;
+            if (Math.abs(map[k] - h) <= 1) return;
+            delete map[k];
+        }
+        map[w] = h;
+        node.__btBodyH = map;
+        const pics = body.querySelectorAll('.bt-media-wrap');
+        const extra = pics.length === 1 ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
+        node.__btMediaExtra = extra;
+        this.comm.notify({
+            type: 'tool.size',
+            id,
+            w,
+            h,
+            extra
+        });
+    }
+    bodyContentHeight(body) {
+        const cs = getComputedStyle(body);
+        return body.getBoundingClientRect().height - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - parseFloat(cs.borderTopWidth) - parseFloat(cs.borderBottomWidth);
+    }
+    freeBody(node) {
+        if (!this.paneVisible) return;
+        if (!node.isConnected || node.dataset.btFreed || node.dataset.btApp) return;
+        if (node.classList.contains('bt-tool-live') || this.holdsFullscreen(node)) return;
+        const c = node.collapsable;
+        const body = c?.body;
+        if (!body || !c.loaded || body.offsetParent === null || body.childElementCount === 0) return;
+        if (body.querySelector(':scope > .bt-collapsable-loading')) return;
+        if (body.querySelector('img, video, audio')) return;
+        const weight = body.getElementsByTagName('*').length - body.querySelectorAll('.bt-l span').length;
+        if (!body.querySelector('.monaco-editor') && weight < 300) return;
+        const h = this.bodyContentHeight(body);
+        node.dataset.btFreed = '1';
+        CODE_OBSERVERS.get(this.container)?.forget(body);
+        body.innerHTML = '<div class="bt-collapsable-loading bt-body-freed">loading…</div>';
+        const ph = body.firstElementChild;
+        ph.style.boxSizing = 'border-box';
+        ph.style.height = h + 'px';
+    }
+    unfreeBody(node) {
+        delete node.dataset.btFreed;
+        this.comm.notify({
+            type: 'tool.render',
+            id: node.dataset.msgId
+        });
+    }
+    onBodyMounted(node) {
+        this.freeObserver.unobserve(node);
+        this.freeObserver.observe(node);
+    }
+    setupRail() {
+        const wrap = this.container.parentElement;
+        if (!wrap) return;
+        const rail = document.createElement('div');
+        rail.className = 'bt-rail bt-rail-hidden';
+        const thumb = document.createElement('div');
+        thumb.className = 'bt-rail-thumb';
+        const label = document.createElement('div');
+        label.className = 'bt-rail-label';
+        rail.append(thumb, label);
+        wrap.appendChild(rail);
+        this.railEl = rail;
+        this.railThumb = thumb;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
+        this.railLabel = label;
+        const fracAt = (clientY)=>{
+            const r = rail.getBoundingClientRect();
+            const th = thumb.offsetHeight;
+            return Math.min(1, Math.max(0, (clientY - r.top - th / 2) / Math.max(1, r.height - th)));
+        };
+        this.onRailDown = (e)=>{
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            rail.setPointerCapture(e.pointerId);
+            this.markUserInput();
+            this.cancelMomentum();
+            const tr = thumb.getBoundingClientRect();
+            const grab = e.target === thumb ? e.clientY - (tr.top + tr.height / 2) : 0;
+            this.railDrag = {
+                pointerId: e.pointerId,
+                grab,
+                pos: null,
+                timer: null
+            };
+            this.scrollbarDrag = true;
+            rail.classList.add('bt-rail-active');
+            this.railMove(fracAt(e.clientY - grab));
+        };
+        this.onRailMove = (e)=>{
+            const d = this.railDrag;
+            if (!d || e.pointerId !== d.pointerId) return;
+            e.preventDefault();
+            this.railMove(fracAt(e.clientY - d.grab));
+        };
+        this.onRailUp = (e)=>{
+            const d = this.railDrag;
+            if (!d || e.pointerId !== d.pointerId) return;
+            if (rail.hasPointerCapture(e.pointerId)) rail.releasePointerCapture(e.pointerId);
+            clearTimeout(d.timer);
+            this.railDrag = null;
+            this.scrollbarDrag = false;
+            rail.classList.remove('bt-rail-active');
+            if (d.pos !== null && d.pos !== d.jumped) this.jumpToPosition(d.pos);
+            this.updateRail();
+        };
+        this.onRailWheel = (e)=>{
+            e.preventDefault();
+            this.markUserInput();
+            const line = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.container.clientHeight : 1;
+            this.container.scrollTop += e.deltaY * line;
+        };
+        rail.addEventListener('pointerdown', this.onRailDown);
+        rail.addEventListener('pointermove', this.onRailMove);
+        rail.addEventListener('pointerup', this.onRailUp);
+        rail.addEventListener('pointercancel', this.onRailUp);
+        rail.addEventListener('wheel', this.onRailWheel, {
+            passive: false
+        });
+        this.keyScope = false;
+        this.onScopePointer = (e)=>{
+            this.keyScope = wrap.contains(e.target);
+        };
+        this.onEndsKey = (e)=>{
+            const findKey = e.key === 'F3' || (e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'g');
+            if (!findKey && e.key !== 'Home' && e.key !== 'End') return;
+            if (this.destroyed || !this.paneVisible || this.container.clientHeight === 0) return;
+            if (findKey && !e.defaultPrevented && !e.target.closest?.('.monaco-editor')) {
+                this.markUserInput();
+                this.setFollowMode(false);
+                return;
+            }
+            if (e.key !== 'Home' && e.key !== 'End') return;
+            if (e.altKey || e.metaKey || e.shiftKey || e.defaultPrevented) return;
+            const t = e.target;
+            const page = t === document.body || t === document.documentElement;
+            if (!(wrap.contains(t) || page && this.keyScope)) return;
+            if (t.isContentEditable || t.closest && t.closest('input, textarea, select, .monaco-editor')) return;
+            const len = this.seqLength();
+            if (len === 0) return;
+            e.preventDefault();
+            this.markUserInput();
+            if (e.key === 'Home') this.jumpToPosition(0, {
+                offset: Infinity
+            });
+            else this.jumpToPosition(len - 1);
+        };
+        document.addEventListener('pointerdown', this.onScopePointer, true);
+        document.addEventListener('keydown', this.onEndsKey);
+    }
+    teardownRail() {
+        if (this.railDrag) clearTimeout(this.railDrag.timer);
+        document.removeEventListener('pointerdown', this.onScopePointer, true);
+        document.removeEventListener('keydown', this.onEndsKey);
+        this.railEl?.remove();
+        this.railEl = null;
+        this.thumbMoves = null;
+        this.thumbRange = -1;
+    }
+    railMove(f) {
+        const d = this.railDrag;
+        const len = this.seqLength();
+        if (!d || len === 0) return;
+        const p = Math.round(f * (len - 1));
+        this.placeThumb(f);
+        this.railLabel.textContent = `${this.lensActive ? 'Match' : 'Message'} ${p + 1} of ${len}`;
+        if (p === d.pos) return;
+        d.pos = p;
+        clearTimeout(d.timer);
+        d.timer = setTimeout(()=>{
+            if (this.railDrag !== d) return;
+            d.jumped = p;
+            this.jumpToPosition(p);
+        }, 150);
+    }
+    placeThumb(f) {
+        const range = Math.max(0, this.railEl.clientHeight - this.railThumb.offsetHeight);
+        if (this.thumbRange !== range) {
+            this.thumbRange = range;
+            for (const a of this.thumbMoves ?? [])a.cancel();
+            this.thumbMoves = [
+                this.railThumb,
+                this.railLabel
+            ].map((el)=>{
+                const a = el.animate([
+                    {
+                        transform: 'translateY(0px)'
+                    },
+                    {
+                        transform: `translateY(${range}px)`
+                    }
+                ], {
+                    duration: 1000,
+                    fill: 'both',
+                    easing: 'linear'
+                });
+                a.pause();
+                return a;
+            });
+        }
+        const t = range > 0 ? Math.round(f * range) / range * 1000 : 0;
+        for (const a of this.thumbMoves)a.currentTime = t;
+    }
+    updateRail() {
+        if (!this.paneVisible) return;
+        const rail = this.railEl;
+        if (!rail || this.railDrag) return;
+        const c = this.container;
+        const len = this.seqLength();
+        const fits = len === 0 || this.plo <= 0 && this.atTail() && c.scrollHeight <= c.clientHeight + 1;
+        rail.classList.toggle('bt-rail-hidden', fits);
+        if (fits) return;
+        let f;
+        if (this.atTail() && this.atBottom()) {
+            f = 1;
+        } else if (this.plo <= 0 && c.scrollTop <= 1) {
+            f = 0;
         } else {
-            want = this.PAD_TOP + this.ITEM_GAP + this.cumHeight(0, a.idx) - a.off;
+            const [first] = this.visibleSpan();
+            if (first < 0) return;
+            const idx = this.order[first];
+            const node = this.cache.get(idx);
+            const into = node.offsetHeight > 0 ? Math.min(1, Math.max(0, (c.scrollTop - node.offsetTop) / node.offsetHeight)) : 0;
+            f = Math.min(1, (this.seqPos(idx) + into) / Math.max(1, len - 1));
         }
-        want = Math.max(0, want);
-        if (Math.abs(this.container.scrollTop - want) > 1) {
-            this.container.scrollTop = want;
-            this.prevScrollTop = this.container.scrollTop;
-        }
-    }
-    activeKeyAnchor() {
-        const a = this.keyAnchor;
-        if (!a) return null;
-        if (performance.now() > a.until || this.lastUserInputT > a.setAt) {
-            this.keyAnchor = null;
-            return null;
-        }
-        return a;
+        this.placeThumb(f);
     }
     holdsFullscreen(node) {
         if (!node) return false;
@@ -1023,96 +1899,53 @@ class BonitoChat {
     fullscreenActive() {
         return this.holdsFullscreen(this.container) || !!(document.fullscreenElement || document.webkitFullscreenElement);
     }
-    updateDOM(s, e) {
-        if (s > e) return;
-        const sticky = this.activeKeyAnchor();
-        const anchor = this.initialLoad || sticky ? null : this.pendingAnchor || this.captureAnchor();
-        for (const idx of [
-            ...this.rendered
-        ]){
-            if (idx < s || idx > e) {
-                const node = this.cache.get(idx);
-                if (node && node.dataset && node.dataset.btApp && !node.dataset.btSpilled) {
-                    if (!this.parked.has(idx)) {
-                        this.parked.add(idx);
-                        this.applyVisibility(idx, node);
-                        this.touchApp(idx);
-                    }
-                } else if (this.holdsFullscreen(node)) {} else {
-                    if (this.observed.delete(idx) && node) this.messageHeightObserver.unobserve(node);
-                    node?.remove();
-                    this.rendered.delete(idx);
-                    this.parked.delete(idx);
-                }
-            }
-        }
-        for(let i = s; i <= e; i++){
-            if (this.parked.has(i)) {
-                const node = this.cache.get(i);
-                this.parked.delete(i);
-                this.applyVisibility(i, node);
-                this.touchApp(i);
-            } else if (this.cache.has(i) && !this.rendered.has(i)) {
-                const node = this.cache.get(i);
-                this.insertSorted(i, node);
-                this.rendered.add(i);
-                if (!this.observed.has(i)) this.observe(i, node);
-                this.applyVisibility(i, node);
-                if (node?.dataset?.btApp) this.touchApp(i);
-            }
-        }
-        this.enforceAppLru();
-        const topH = this.cumHeight(0, s);
-        const botH = this.cumHeight(e + 1, this.totalCount);
-        if (topH !== this.spacerTopHeight) {
-            this.spacerTop.style.height = topH + 'px';
-            this.spacerTopHeight = topH;
-        }
-        if (botH !== this.spacerBottomHeight) {
-            this.spacerBottom.style.height = botH + 'px';
-            this.spacerBottomHeight = botH;
-        }
-        if (sticky) this.restoreKeyAnchor(sticky);
-        else this.restoreAnchor(anchor);
-    }
     touchApp(idx) {
+        const node = this.cache.get(idx);
+        if (!node || node.dataset.btSpilled) return;
         const i = this.appLru.indexOf(idx);
         if (i !== -1) this.appLru.splice(i, 1);
         this.appLru.push(idx);
     }
     enforceAppLru() {
-        if (this.parked.size <= this.APP_KEEPALIVE) return;
-        for (const idx of [
-            ...this.appLru
-        ]){
-            if (this.parked.size <= this.APP_KEEPALIVE) break;
-            if (!this.parked.has(idx)) continue;
-            this.spillApp(idx, this.cache.get(idx));
+        const offscreen = this.appLru.filter((idx)=>!this.visibleApps.has(idx));
+        let extra = offscreen.length - this.APP_KEEPALIVE;
+        for (const idx of offscreen){
+            if (extra <= 0) break;
+            const node = this.cache.get(idx);
+            if (!node || this.holdsFullscreen(node)) continue;
+            this.spillApp(idx, node);
+            extra--;
         }
     }
     spillApp(idx, node) {
-        if (!node) {
-            this.parked.delete(idx);
+        const slot = node.querySelector('.bt-slot') || node.querySelector('.bt-tool-body');
+        const li0 = this.appLru.indexOf(idx);
+        if (!slot || slot.childElementCount === 0) {
+            if (li0 !== -1) this.appLru.splice(li0, 1);
             return;
         }
-        const slot = node.querySelector('.bt-slot') || node.querySelector('.bt-tool-body');
         const canvas = node.querySelector('canvas');
         let dataUrl = null;
         if (canvas) {
             try {
                 dataUrl = canvas.toDataURL('image/png');
-            } catch (_) {}
+            } catch (error) {
+                if (error.name !== 'SecurityError') throw error;
+                console.warn('app snapshot refused:', error.message);
+            }
         }
         if (slot) {
+            const h = Math.max(40, slot.offsetHeight);
+            const cssW = canvas ? canvas.clientWidth : 0, cssH = canvas ? canvas.clientHeight : 0;
             slot.innerHTML = '';
             const wrap = document.createElement('div');
             wrap.className = 'bt-app-snapshot';
-            wrap.style.cssText = 'position:relative;display:inline-block;max-width:100%';
+            wrap.style.cssText = `position:relative;max-width:100%;height:${h}px;overflow:hidden`;
             if (dataUrl) {
                 const img = document.createElement('img');
                 img.src = dataUrl;
                 img.alt = 'app snapshot';
-                img.style.cssText = 'max-width:100%;display:block;border-radius:6px;filter:saturate(.85) brightness(.97)';
+                img.style.cssText = `width:${cssW}px;height:${cssH}px;max-width:100%;object-fit:contain;display:block;` + 'border-radius:6px;filter:saturate(.85) brightness(.97)';
                 wrap.appendChild(img);
             }
             const btn = document.createElement('button');
@@ -1128,59 +1961,80 @@ class BonitoChat {
             slot.appendChild(wrap);
         }
         node.dataset.btSpilled = '1';
-        node.remove();
-        this.rendered.delete(idx);
-        this.parked.delete(idx);
-        this.applyVisibility(idx, node);
         const li = this.appLru.indexOf(idx);
         if (li !== -1) this.appLru.splice(li, 1);
     }
     reloadApp(node) {
         delete node.dataset.btSpilled;
+        this.touchApp(node.__btIdx);
         const id = node.dataset.msgId;
         const body = node.querySelector('.bt-tool-body');
-        if (body) body.innerHTML = '<div class="bt-collapsable-loading">loading…</div>';
+        if (body) {
+            showLoading(body, {
+                height: body.offsetHeight + 'px'
+            });
+        }
         if (id) this.comm.notify({
             type: 'tool.render',
             id
         });
     }
-    insertSorted(idx, node) {
-        const sorted = [
-            ...this.rendered
-        ].filter((i)=>i > idx).sort((a, b)=>a - b);
-        const before = sorted.length ? this.cache.get(sorted[0]) : this.spacerBottom;
-        this.container.insertBefore(node, before);
-        if (node.dataset && node.dataset.btAutoExpand && !this.scrollbarDrag) {
+    bodyDied(row) {
+        if (this.destroyed || row.dataset.btSpilled || row.dataset.btFreed) return;
+        row.dataset.btRemount = '1';
+        if (row.isConnected) queueMicrotask(()=>this.mountDeferred(row));
+    }
+    requestBody(node) {
+        node.dataset.btWantsBody = '1';
+        this.mountObserver.unobserve(node);
+        this.mountObserver.observe(node);
+    }
+    mountDeferred(node) {
+        if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
-            node.collapsable?.setExpanded(true);
+            const c = node.collapsable;
+            c?.setExpanded(true);
+            if (c && c.lazy && !c.loaded) {
+                c.loaded = true;
+                c.showPlaceholder();
+                this.requestBody(node);
+            }
         }
-        if (node.dataset && node.dataset.btAutoMount && !this.scrollbarDrag) {
+        if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
             if (node.collapsable && !node.collapsable.loaded) {
                 node.collapsable.loaded = true;
-                this.comm.notify({
-                    type: 'tool.render',
-                    id: node.dataset.msgId
-                });
+                const body = node.collapsable.body;
+                if (body.childElementCount === 0 && this.bodyReserve(node)) node.collapsable.showPlaceholder();
+                this.requestBody(node);
             }
+        }
+        if (node.dataset.btRemount) {
+            delete node.dataset.btRemount;
+            this.requestBody(node);
         }
     }
     appendNewMessage(msg) {
         const idx = this.totalCount - 1;
         if (!this.cache.has(idx)) {
-            const node = this.createNode(msg);
-            this.cache.set(idx, node);
-            node.__btIdx = idx;
-            this.keyByIdx.set(idx, filterKey(msg));
-            if (msg.id) this.nodeById.set(msg.id, node);
-            this.observe(idx, node);
-            if (this.lensActive) this.lensVisible.add(idx);
+            if (this.seq) this.seq.push(idx);
+            if (this.seqPos(idx) === this.phi + 1) {
+                const nodes = this.insertRows([
+                    [
+                        idx,
+                        msg
+                    ]
+                ], this.rowsEnd);
+                this.order.push(idx);
+                this.phi += 1;
+                this.adoptRows(nodes);
+            }
         }
         if (this.followMode) {
             this.scrollToBottom();
         } else {
             this.registerUnread();
+            this.updateRail();
         }
     }
     appendChunk(msg) {
@@ -1241,7 +2095,7 @@ class BonitoChat {
             return;
         }
         let tgt = msg.id ? this.container.querySelector(`.bt-agent-msg[data-msg-id="${CSS.escape(msg.id)}"]`) : null;
-        if (!tgt) {
+        if (!tgt && this.atTail()) {
             const nodes = this.container.querySelectorAll('.bt-agent-msg');
             tgt = nodes[nodes.length - 1];
         }
@@ -1267,6 +2121,20 @@ class BonitoChat {
         if (this.busyEl) this.busyEl.classList.toggle('bt-busy-suppressed', !!active);
         if (this.thinkingCountEl) this.thinkingCountEl.textContent = active && msg.count ? `${msg.count} token chunks` : '';
         if (active && this.followMode) this.queueScrollToBottom();
+    }
+    onThinkingTokens(n) {
+        if (!this.thinkingEl || !Number.isFinite(n)) return;
+        this.thinkingEstimate = true;
+        this.thinkingEl.classList.add('bt-thinking-active');
+        this.busyEl?.classList.add('bt-busy-suppressed');
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = `${formatTokens(n)} tokens`;
+        if (this.followMode) this.queueScrollToBottom();
+    }
+    endThinkingEstimate() {
+        this.thinkingEstimate = false;
+        this.thinkingEl?.classList.remove('bt-thinking-active');
+        this.busyEl?.classList.remove('bt-busy-suppressed');
+        if (this.thinkingCountEl) this.thinkingCountEl.textContent = '';
     }
     onPermission(msg) {
         if (!msg.key || !Array.isArray(msg.options)) return;
@@ -1429,6 +2297,7 @@ class BonitoChat {
         if (this.followMode) this.queueScrollToBottom();
     }
     onSessionReset() {
+        this.setCancelling(false);
         this.thinkingEl?.classList.remove('bt-thinking-active');
         this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
@@ -1440,8 +2309,6 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
-        const bodyWillChange = (msg.expand || msg.expand_full) && !node.collapsable?.expanded || msg.show_mime && msg.show_mime !== node.dataset.showMime;
-        if (bodyWillChange && this.heights.delete(node.__btIdx)) this.queueRefresh();
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) {
@@ -1451,6 +2318,12 @@ class BonitoChat {
             const live = !(msg.status === 'completed' || msg.status === 'failed');
             node.classList.toggle('bt-tool-live', live);
             if (live) this.ensureElapsedTicker();
+        }
+        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading')) this.requestBody(node);
+        if (msg.reopen) {
+            delete node.dataset.toolFinished;
+            node.classList.add('bt-tool-live');
+            this.ensureElapsedTicker();
         }
         if (msg.finished_at != null) {
             node.dataset.toolFinished = String(msg.finished_at);
@@ -1496,10 +2369,7 @@ class BonitoChat {
                 if (node.isConnected) {
                     if (!node.collapsable.loaded) {
                         node.collapsable.loaded = true;
-                        this.comm.notify({
-                            type: 'tool.render',
-                            id: msg.id
-                        });
+                        this.requestBody(node);
                     }
                     if (node.collapsable.hideBodyOnCollapse) node.collapsable.setExpanded(true);
                 } else {
@@ -1516,10 +2386,7 @@ class BonitoChat {
             if (node.isConnected) {
                 if (!node.collapsable.loaded) {
                     node.collapsable.loaded = true;
-                    this.comm.notify({
-                        type: 'tool.render',
-                        id: msg.id
-                    });
+                    this.requestBody(node);
                 }
                 node.collapsable.setExpanded(true);
             } else {
@@ -1547,11 +2414,18 @@ class BonitoChat {
             const title = headerEl.querySelector('.bt-tool-title');
             headerEl.insertBefore(wb, title ? title.nextSibling : null);
         }
+        if (Array.isArray(msg.jumps) && headerEl) {
+            headerEl.querySelectorAll('.bt-tool-jump').forEach((b)=>b.remove());
+            const anchor = headerEl.querySelector('.bt-tool-summary');
+            anchor?.insertAdjacentHTML('beforebegin', jumpChipsHTML(msg.jumps));
+        }
         if (msg.stoppable && headerEl && !headerEl.querySelector('.bt-tool-stop')) {
             const sb = document.createElement('button');
             sb.type = 'button';
-            sb.className = 'bt-tool-stop bt-stop-mini';
-            sb.title = 'Stop';
+            sb.className = 'bt-tool-stop bt-stop-mini' + (msg.dismiss_only ? ' bt-task-dismiss' : '');
+            sb.title = msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop';
+            sb.setAttribute('aria-label', msg.dismiss_only ? 'Dismiss task entry' : 'Stop');
+            if (msg.dismiss_only) sb.textContent = '×';
             sb.addEventListener('click', (e)=>{
                 e.stopPropagation();
                 this.comm.notify({
@@ -1562,7 +2436,12 @@ class BonitoChat {
             headerEl.insertBefore(sb, headerEl.querySelector('.bt-tool-fullwidth') || null);
         }
         if (msg.live_embed) {
+            const became = !node.dataset.btApp;
             node.dataset.btApp = '1';
+            if (became && node.__btIdx !== undefined && this.cache.get(node.__btIdx) === node) {
+                this.appObserver.observe(node);
+                this.touchApp(node.__btIdx);
+            }
             if (headerEl && !headerEl.querySelector('.bt-tool-detach')) {
                 const db = document.createElement('button');
                 db.type = 'button';
@@ -1584,6 +2463,7 @@ class BonitoChat {
             if (t) {
                 t.classList.add('bt-path-link');
                 t.dataset.path = msg.edit_path;
+                t.title = msg.edit_path;
             }
         }
     }
@@ -1668,26 +2548,19 @@ class BonitoChat {
             if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
             on ? this.applyNative(node) : this.removeNative(node);
         }
-        this.refresh();
+        this.ensureWindow();
     }
     setKeyHidden(key, hidden) {
-        this.pendingAnchor = null;
-        const anchor = this.followMode ? null : this.captureKeyAnchor(key);
+        const anchor = this.followMode ? null : this.captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
         for (const [idx, node] of this.cache){
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         if (key === 'agent') this.updateWaiting();
-        if (anchor) {
-            this.keyAnchor = {
-                ...anchor,
-                setAt: performance.now(),
-                until: performance.now() + 1500
-            };
-        }
-        this.refresh();
         if (this.followMode) this.queueScrollToBottom();
-        else if (anchor) this.restoreKeyAnchor(anchor);
+        else this.restoreAnchor(anchor);
+        this.syncRowHeights();
+        this.ensureWindow();
     }
     updateWaiting() {
         if (!this.waitingEl) return;
@@ -1712,13 +2585,28 @@ class BonitoChat {
                     const gallery = document.createElement('div');
                     gallery.className = 'bt-user-attachments';
                     for (const a of msg.attachments){
+                        if (a.kind === 'file') {
+                            const link = document.createElement('a');
+                            link.className = 'bt-user-att-file';
+                            link.href = a.url;
+                            link.target = '_blank';
+                            link.rel = 'noopener';
+                            link.textContent = a.name.replace(/^\d{4}-\d{2}-\d{2}_\d{6}_[0-9a-f]{8}_/, '');
+                            link.title = a.name;
+                            link.addEventListener('click', (e)=>e.stopPropagation());
+                            gallery.appendChild(link);
+                            continue;
+                        }
                         const img = document.createElement('img');
                         img.className = 'bt-user-att-img';
                         img.src = a.url;
                         img.alt = a.name || 'attachment';
                         img.dataset.attachmentName = a.name;
                         img.loading = 'lazy';
-                        img.addEventListener('click', ()=>openLightbox(img));
+                        img.addEventListener('click', (e)=>{
+                            e.stopPropagation();
+                            openLightbox(img);
+                        });
                         img.addEventListener('error', ()=>{
                             const miss = document.createElement('span');
                             miss.className = 'bt-user-att-missing';
@@ -1727,7 +2615,29 @@ class BonitoChat {
                         }, {
                             once: true
                         });
-                        gallery.appendChild(img);
+                        const wrap = document.createElement('div');
+                        wrap.className = 'bt-media-wrap';
+                        wrap.appendChild(img);
+                        const actions = document.createElement('div');
+                        actions.className = 'bt-media-actions';
+                        const enlarge = document.createElement('button');
+                        enlarge.type = 'button';
+                        enlarge.className = 'bt-media-action bt-media-enlarge';
+                        enlarge.title = 'Enlarge';
+                        enlarge.textContent = '⤢';
+                        enlarge.addEventListener('click', (e)=>{
+                            e.stopPropagation();
+                            openLightbox(img);
+                        });
+                        const choose = document.createElement('button');
+                        choose.type = 'button';
+                        choose.className = 'bt-media-action bt-media-chat-icon';
+                        choose.title = 'Set as chat icon';
+                        choose.textContent = '▣';
+                        choose.setAttribute('aria-label', choose.title);
+                        actions.append(enlarge, choose);
+                        wrap.appendChild(actions);
+                        gallery.appendChild(wrap);
                     }
                     div.appendChild(gallery);
                 }
@@ -1778,16 +2688,19 @@ class BonitoChat {
                     const id = msg.id;
                     const compactBody = msg.kind === 'edit' || msg.compact_body === true;
                     if (msg.compact_body === true) div.dataset.compactBody = '1';
+                    div.addEventListener('monaco-editor-disposed', ()=>this.bodyDied(div));
+                    div.__btBodyH = msg.body_h || null;
+                    div.__btMedia = msg.media || null;
+                    div.__btMediaExtra = msg.media_extra || 0;
                     div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
                         toggleEl: div.querySelector('.bt-tool-toggle'),
                         editMode: compactBody,
                         hideBodyOnCollapse: msg.compact_body === true,
                         fetchEachExpand: !compactBody,
                         discardOnCollapse: !compactBody,
-                        onExpand: ()=>this.comm.notify({
-                                type: 'tool.render',
-                                id
-                            })
+                        reserve: ()=>this.bodyReserve(div),
+                        onToggle: (expanded)=>this.expandState.set(id, expanded),
+                        onExpand: ()=>this.requestBody(div)
                     });
                     if (Array.isArray(msg.task_feed) && msg.task_feed.length) {
                         const feed = this.ensureTaskFeed(div);
@@ -1827,6 +2740,13 @@ class BonitoChat {
                         } else {
                             div.dataset.btAutoExpand = '1';
                         }
+                    }
+                    const mine = this.expandState.get(id);
+                    if (mine === true) {
+                        if (div.collapsable.editMode) div.dataset.btAutoMount = '1';
+                        div.dataset.btAutoExpand = '1';
+                    } else if (mine === false) {
+                        delete div.dataset.btAutoExpand;
                     }
                     break;
                 }
@@ -1885,6 +2805,7 @@ class BonitoChat {
                 return;
             }
         }
+        if (!this.atTail()) return;
         const nodes = this.container.querySelectorAll('.bt-summary-msg .bt-summary-body');
         const tgt = nodes[nodes.length - 1];
         if (tgt) tgt.innerHTML = msg.html || '';
@@ -1901,9 +2822,11 @@ class BonitoChat {
         const server = msg.server ? `<span class="bt-tool-server">${escapeHTML(msg.server)}</span>` : '';
         const timeoutBadge = msg.timeout_s ? `<span class="bt-tool-timeout" title="Soft eval timeout — the call checkpoints with partial output at this cadence">⏱ ${escapeHTML(String(msg.timeout_s))}</span>` : '';
         const workerBadge = msg.worker ? `<span class="bt-tool-worker" title="This runs on another worker">⇢ ${escapeHTML(String(msg.worker))}</span>` : '';
-        const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini" type="button"
-                     title="Stop"></button>` : '';
-        const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}` : '';
+        const jumpChips = jumpChipsHTML(msg.jumps);
+        const stopBtn = msg.stoppable ? `<button class="bt-tool-stop bt-stop-mini${msg.dismiss_only ? ' bt-task-dismiss' : ''}" type="button"
+                     title="${msg.dismiss_only ? 'Dismiss task entry (does not stop the agent)' : 'Stop'}"
+                     aria-label="${msg.dismiss_only ? 'Dismiss task entry' : 'Stop'}">${msg.dismiss_only ? '×' : ''}</button>` : '';
+        const titleLink = msg.edit_path ? ` bt-path-link" data-path="${escapeAttr(msg.edit_path)}" title="${escapeAttr(msg.edit_path)}` : '';
         !(msg.status === 'completed' || msg.status === 'failed') && msg.finished_at == null;
         const cmdPreview = msg.command ? `
             <div class="bt-cmd-preview"><pre>${escapeHTML(msg.command)}</pre></div>` : '';
@@ -1914,6 +2837,7 @@ class BonitoChat {
                 ${server}
                 <span class="bt-tool-title${titleLink}">${escapeHTML(msg.title || '')}</span>
                 ${workerBadge}
+                ${jumpChips}
                 <span class="bt-tool-summary">${escapeHTML(msg.summary || '')}</span>
                 ${timeoutBadge}
                 <span class="bt-tool-timer"></span>
@@ -1945,29 +2869,37 @@ class BonitoChat {
     setupLiveTicker() {
         this.taskbarEl = (this.app || this.container.closest('.bt-app') || this.container.parentElement).querySelector('.bt-taskbar');
         if (this.taskbarEl) {
-            const storedTodo = localStorage.getItem('bt-todo-collapsed');
+            const storedTodo = storage.get('bt-todo-collapsed');
             const paneW = this.container.closest('.bt-chatpane')?.clientWidth ?? window.innerWidth;
             this.taskbarEl.classList.toggle('bt-todo-collapsed', storedTodo != null ? storedTodo === '1' : paneW < 660);
             this.onTaskbarClick = (ev)=>{
                 if (ev.target.closest('.bt-taskbar-todo-toggle')) {
                     const c = this.taskbarEl.classList.toggle('bt-todo-collapsed');
-                    localStorage.setItem('bt-todo-collapsed', c ? '1' : '0');
+                    storage.set('bt-todo-collapsed', c ? '1' : '0');
                     return;
                 }
                 if (ev.target.closest('.bt-taskbar-slot-stop')) return;
                 const slot = ev.target.closest('.bt-taskbar-slot');
                 if (!slot) return;
-                const idx = parseInt(slot.dataset.msgIndex ?? '-1', 10);
-                if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
-                const jump = ()=>{
-                    this.container.scrollTop = Math.max(0, this.cumHeight(0, idx) - 60);
-                };
-                this.followMode = false;
-                jump();
-                requestAnimationFrame(()=>requestAnimationFrame(jump));
+                this.jumpToMessage(parseInt(slot.dataset.msgIndex ?? '-1', 10), slot.dataset.taskId);
             };
             this.taskbarEl.addEventListener('click', this.onTaskbarClick);
         }
+    }
+    jumpToMessage(idx, id) {
+        if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+        if (this.seqPos(idx) < 0) {
+            this.lensClearAll();
+            this.pendingJump = {
+                idx,
+                id
+            };
+            return;
+        }
+        this.jumpToPosition(this.seqPos(idx), {
+            flashId: id || null,
+            offset: 60
+        });
     }
     ensureElapsedTicker() {
         if (this.elapsedTimer) return;
@@ -2337,14 +3269,14 @@ class BonitoChat {
     }
     onLensResult(msg) {
         if (msg.q !== this.lensQuery) return;
-        const holdAnchor = this.lensActive && !msg.active && !this.followMode ? this.captureAnchor() : null;
+        const anchor = this.lensActive && !msg.active && !this.followMode ? this.captureAnchor() : null;
         if (!msg.active) {
             this.lensActive = false;
-            this.lensVisible = null;
+            this.seq = null;
             this.lensActions = null;
         } else {
             this.lensActive = true;
-            this.lensVisible = new Set(msg.visible || []);
+            this.seq = (msg.visible || []).slice().sort((a, b)=>a - b);
             this.lensActions = new Map(Object.entries(msg.actions || {}).map(([k, v])=>[
                     +k,
                     v
@@ -2352,24 +3284,36 @@ class BonitoChat {
         }
         if (this.lensClearBtn) this.lensClearBtn.hidden = !this.lensActive;
         this.lensBarEl?.classList.toggle('bt-lens-on', this.lensActive);
-        for (const [idx, node] of this.cache){
-            if (this.rendered.has(idx)) this.applyVisibility(idx, node);
-        }
-        this.refresh();
-        if (this.lensActions) {
-            for (const [idx, action] of this.lensActions){
-                const node = this.cache.get(idx);
-                if (!node) continue;
-                if (action === 'expand') node.collapsable?.setExpanded(true);
-                else if (action === 'collapse') node.collapsable?.setExpanded(false);
+        const len = this.seqLength();
+        const jump = this.pendingJump;
+        this.pendingJump = null;
+        if (jump && this.seqPos(jump.idx) >= 0) {
+            this.clearBlock();
+            this.jumpToPosition(this.seqPos(jump.idx), {
+                flashId: jump.id || null,
+                offset: 60
+            });
+        } else if (this.lensActive) {
+            this.clearBlock();
+            if (len === 0) {
+                this.updateRail();
+                return;
             }
+            this.requestBlock(0, Math.min(len - 1, this.CHUNK - 1), {
+                kind: 'lens'
+            });
+        } else if (anchor && this.seqPos(anchor.idx) >= 0) {
+            const p = anchor.idx;
+            this.clearBlock();
+            this.requestBlock(Math.max(0, p - this.CHUNK), Math.min(len - 1, p + this.CHUNK), {
+                kind: 'restore',
+                idx: anchor.idx,
+                off: anchor.off
+            });
+        } else {
+            this.clearBlock();
+            this.loadTail();
         }
-        if (this.lensActive) {
-            this.followMode = false;
-            this.container.scrollTop = 0;
-            this.prevScrollTop = 0;
-            this.refresh();
-        } else if (holdAnchor) this.restoreAnchor(holdAnchor);
     }
     onLensSaved(msg) {
         this.savedLenses = msg.lenses || [];
@@ -2403,10 +3347,12 @@ class BonitoChat {
         this.tailEl.style.height = '50px';
     }
     atBottom() {
+        if (!this.paneVisible) return false;
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         return scrollHeight - scrollTop - clientHeight < this.AT_BOTTOM_PX;
     }
     lastMessageFullyOutOfView() {
+        if (!this.paneVisible) return true;
         if (this.totalCount === 0) return false;
         const node = this.cache.get(this.totalCount - 1);
         if (!node || !node.isConnected || node.offsetParent === null) return true;
@@ -2414,7 +3360,7 @@ class BonitoChat {
     }
     queueScrollToBottom() {
         if (this.scrollbarDrag) return;
-        if (this.scrollQueued || this.destroyed) return;
+        if (this.scrollQueued || this.destroyed || !this.paneVisible) return;
         this.scrollQueued = true;
         this.scrollRafId = requestAnimationFrame(()=>{
             this.scrollQueued = false;
@@ -2446,7 +3392,7 @@ class BonitoChat {
         });
     }
     restoreAfterMove() {
-        if (this.container.clientHeight === 0) return;
+        if (!this.paneVisible || this.container.clientHeight === 0) return;
         if (this.container.scrollTop > 1) return;
         if (this.followMode) {
             if (!this.atBottom()) this.scrollToBottom();
@@ -2459,57 +3405,76 @@ class BonitoChat {
         }
     }
     scrollToBottom() {
-        if (this.scrollbarDrag) return;
-        this.container.scrollTop = this.container.scrollHeight;
-        const anchor = this.tailEl || this.spacerBottom;
-        if (anchor) {
-            anchor.scrollIntoView({
-                block: 'end',
-                behavior: 'auto'
-            });
+        if (this.destroyed || !this.paneVisible || this.scrollbarDrag) return;
+        if (this.blockEmpty() || !this.atTail()) {
+            if (this.pending.block?.kind !== 'tail') this.loadTail();
+            return;
         }
+        this.container.scrollTop = this.container.scrollHeight;
         this.prevScrollTop = this.container.scrollTop;
-        this.refresh();
+        this.ensureWindow();
     }
     onHidden() {
+        this.projectVisible = false;
+        this.updateVisibility();
+    }
+    onShown() {
+        this.projectVisible = true;
+        this.updateVisibility(true);
+    }
+    updateVisibility(restore = false) {
+        const visible = this.projectVisible && this.workspaceVisible;
+        if (visible && (restore || !this.paneVisible)) this.showPane();
+        else if (!visible && this.paneVisible) this.hidePane();
+    }
+    hidePane() {
+        if (!this.paneVisible) return;
+        this.cancelShowRestore();
         if (this.cancelMomentum) this.cancelMomentum();
         this.cancelPendingScroll();
         if (this.setOverscroll) this.setOverscroll(0);
         this.savedScrollTop = this.container.scrollTop;
         this.savedFollowMode = this.followMode;
         this.savedAnchor = this.captureAnchor();
-        this.prefetchPaused = true;
-        clearTimeout(this.prefetchTimer);
+        this.paneVisible = false;
     }
-    onShown() {
+    cancelShowRestore() {
+        cancelAnimationFrame(this.showRestoreRaf);
+        this.showRestoreRaf = 0;
+        for (const timer of this.showRestoreTimers)clearTimeout(timer);
+        this.showRestoreTimers = [];
+    }
+    showPane() {
+        this.cancelShowRestore();
+        this.paneVisible = true;
         const followNow = !!this.followMode;
         const followThen = !!this.savedFollowMode;
         const wantBottom = followNow || followThen;
         const savedTop = this.savedScrollTop;
         const anchor = this.savedAnchor;
-        this.prefetchPaused = false;
-        if (this.prefetchStarted) {
-            clearTimeout(this.prefetchTimer);
-            this.prefetchTimer = setTimeout(()=>this.prefetchTick(), 600);
-        }
         const apply = ()=>{
-            if (this.destroyed) return;
+            if (this.destroyed || !this.paneVisible) return;
             if (wantBottom) {
                 if (this.followMode) this.scrollToBottom();
+                this.updateScrollAffordance(this.atBottom());
                 return;
             }
-            const n = anchor && this.rendered.has(anchor.idx) ? this.cache.get(anchor.idx) : null;
-            if (n && n.isConnected) {
+            const n = anchor ? this.cache.get(anchor.idx) : null;
+            if (n && n.isConnected && n.offsetParent !== null) {
                 this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
                 this.container.scrollTop = savedTop;
             }
             this.prevScrollTop = this.container.scrollTop;
+            this.ensureWindow();
+            this.updateScrollAffordance(this.atBottom());
         };
         apply();
-        requestAnimationFrame(apply);
-        setTimeout(apply, 50);
-        setTimeout(apply, 200);
+        this.showRestoreRaf = requestAnimationFrame(apply);
+        this.showRestoreTimers = [
+            setTimeout(apply, 50),
+            setTimeout(apply, 200)
+        ];
     }
     setupInputs() {
         if (this.destroyed) return;
@@ -2519,27 +3484,67 @@ class BonitoChat {
         this.inputArea = app.querySelector('.bt-input-area');
         this.textInput = app.querySelector('.bt-text-input');
         if (!this.inputArea || !this.textInput) return;
+        if (!CSS.supports('field-sizing', 'content')) {
+            this.textInput.dataset.btSizingFallback = '';
+            const mirror = document.createElement('textarea');
+            mirror.className = 'bt-input-measure';
+            mirror.tabIndex = -1;
+            mirror.setAttribute('aria-hidden', 'true');
+            this.inputArea.appendChild(mirror);
+            this.inputMeasure = mirror;
+            this.onInputResize = ()=>{
+                if (this.inputResizeFrame) return;
+                this.inputResizeFrame = requestAnimationFrame(()=>{
+                    this.inputResizeFrame = null;
+                    if (this.destroyed || !this.textInput.clientWidth) return;
+                    mirror.style.width = this.textInput.clientWidth + 'px';
+                    mirror.value = this.textInput.value;
+                    const height = mirror.scrollHeight + 2 + 'px';
+                    if (this.textInput.style.height !== height) this.textInput.style.height = height;
+                });
+            };
+            this.textInput.addEventListener('input', this.onInputResize);
+            this.textInput.addEventListener('bt-composer-resize', this.onInputResize);
+            let width = 0;
+            this.inputWidthObserver = new ResizeObserver((entries)=>{
+                const next = entries[0].contentRect.width;
+                if (width === next) return;
+                width = next;
+                this.onInputResize();
+            });
+            this.inputWidthObserver.observe(this.textInput);
+            this.onInputResize();
+        }
         this.attachBar = document.createElement('div');
         this.attachBar.className = 'bt-attachments';
         this.inputArea.insertBefore(this.attachBar, this.inputArea.firstChild);
         this.attachments = new Map();
         this.attachIdCounter = 0;
         this.ATTACH_MAX_BYTES = 5 * 1024 * 1024;
+        this.INLINE_IMAGE_TYPES = new Set([
+            'image/png',
+            'image/jpeg',
+            'image/jpg',
+            'image/gif',
+            'image/webp',
+            'image/svg+xml'
+        ]);
+        this.FILE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+        this.UPLOAD_CHUNK_BYTES = 512 * 1024;
         this.ATTACH_MAX_COUNT = 10;
         this.attachPending = 0;
         this.onPaste = (e)=>{
             const items = e.clipboardData?.items;
             if (!items) return;
             for (const it of items){
-                if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
-                    const blob = it.getAsFile();
-                    if (blob) this.attachAddBlob(blob, blob.type || it.type, blob.name || `pasted-${Date.now()}.png`);
-                }
+                if (it.kind !== 'file') continue;
+                const blob = it.getAsFile();
+                if (blob) this.attachAdd(blob, `pasted-${Date.now()}`);
             }
         };
         this.textInput.addEventListener('paste', this.onPaste);
         this.onDragOver = (e)=>{
-            if (!this.dragHasImage(e)) return;
+            if (!this.dragHasFiles(e)) return;
             e.preventDefault();
             this.app.classList.add('bt-drag-over');
         };
@@ -2552,18 +3557,49 @@ class BonitoChat {
             this.app.classList.remove('bt-drag-over');
             const files = e.dataTransfer?.files;
             if (!files) return;
-            for (const f of files){
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `dropped-${Date.now()}.png`);
-                }
-            }
+            for (const f of files)this.attachAdd(f, `dropped-${Date.now()}`);
         };
         this.app.addEventListener('dragover', this.onDragOver);
         this.app.addEventListener('dragleave', this.onDragLeave);
         this.app.addEventListener('drop', this.onDrop);
         this.onAppClickCapture = (e)=>{
             if (this.destroyed) return;
-            if (e.target.closest('.bt-send-btn')) {
+            const modeOption = e.target.closest('.bt-send-mode-option');
+            const queueAction = e.target.closest('[data-queue-action]');
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !e.target.closest('.bt-send-mode')) {
+                modeMenu.hidden = true;
+                this.app.querySelector('.bt-send-mode-trigger')?.setAttribute('aria-expanded', 'false');
+            }
+            if (modeOption) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.sendMode = modeOption.dataset.sendMode;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.querySelector('.bt-send-mode-label').textContent = ({
+                    done: 'Queue when done',
+                    next: 'Queue after message',
+                    interrupt: 'Interrupt + send'
+                })[this.sendMode];
+                trigger.title = modeOption.textContent;
+                trigger.setAttribute('aria-label', trigger.title);
+                trigger.setAttribute('aria-expanded', 'false');
+                modeMenu.hidden = true;
+                for (const option of modeMenu.children)option.setAttribute('aria-checked', String(option === modeOption));
+            } else if (e.target.closest('.bt-send-mode-trigger')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                modeMenu.hidden = !modeMenu.hidden;
+                e.target.closest('button').setAttribute('aria-expanded', String(!modeMenu.hidden));
+            } else if (queueAction) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.comm.notify({
+                    type: 'queue.action',
+                    id: queueAction.dataset.queueId,
+                    action: queueAction.dataset.queueAction
+                });
+            } else if (e.target.closest('.bt-send-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.submit();
@@ -2571,6 +3607,10 @@ class BonitoChat {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 this.cancel();
+            } else if (e.target.closest('.bt-force-stop-btn')) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                this.cancel(true);
             } else if (e.target.closest('.bt-attach-btn')) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
@@ -2582,20 +3622,58 @@ class BonitoChat {
             if (this.destroyed) return;
             const input = e.target.closest('.bt-attach-input');
             if (!input || !input.files) return;
-            for (const f of input.files){
-                if (f.type && f.type.startsWith('image/')) {
-                    this.attachAddBlob(f, f.type, f.name || `picked-${Date.now()}.png`);
-                } else {
-                    this.showAttachError(`${f.name || 'That file'} is not an image; only images can be attached`);
-                }
-            }
+            for (const f of input.files)this.attachAdd(f, `picked-${Date.now()}`);
             input.value = '';
             this.textInput?.focus();
         };
         this.app.addEventListener('change', this.onAppChange);
+        const pid = app.closest('.bt-chatpane')?.dataset.panePid;
+        if (pid) {
+            const key = 'bt-draft:' + pid;
+            const yolo = ()=>this.textInput.classList.contains('bt-text-input-yolo');
+            const saved = storage.get(key);
+            if (saved && !this.textInput.value && !yolo()) {
+                this.textInput.value = saved;
+                this.textInput.dispatchEvent(new Event('input', {
+                    bubbles: true
+                }));
+            }
+            this.flushDraft = ()=>{
+                clearTimeout(this.draftTimer);
+                if (this.pendingDraft === undefined) return;
+                const text = this.pendingDraft;
+                this.pendingDraft = undefined;
+                text.trim() ? storage.set(key, text) : storage.remove(key);
+            };
+            this.onDraftInput = ()=>{
+                if (yolo()) return;
+                this.pendingDraft = this.textInput.value;
+                clearTimeout(this.draftTimer);
+                if (!this.pendingDraft.trim()) this.flushDraft();
+                else this.draftTimer = setTimeout(this.flushDraft, 250);
+            };
+            this.onDraftVisibility = ()=>{
+                if (document.visibilityState === 'hidden') this.flushDraft();
+            };
+            this.textInput.addEventListener('input', this.onDraftInput);
+            this.textInput.addEventListener('blur', this.flushDraft);
+            window.addEventListener('pagehide', this.flushDraft);
+            document.addEventListener('visibilitychange', this.onDraftVisibility);
+        }
+        this.onCompositionStart = ()=>{
+            this.inputComposing = true;
+        };
+        this.onCompositionEnd = ()=>{
+            this.inputComposing = false;
+        };
+        this.textInput.addEventListener('compositionstart', this.onCompositionStart);
+        this.textInput.addEventListener('compositionend', this.onCompositionEnd);
         this.onTextInputKeyCapture = (e)=>{
+            if (e.isComposing || this.inputComposing || e.keyCode === 229) return;
+            const mobile = matchMedia('(pointer: coarse)').matches || navigator.userAgentData?.mobile || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (e.key === 'Enter' && (mobile || e.shiftKey)) return;
             if (this.cmdAcHandleKey(e)) return;
-            if (e.key !== 'Enter' || e.shiftKey) return;
+            if (e.key !== 'Enter') return;
             e.preventDefault();
             e.stopImmediatePropagation();
             this.submit();
@@ -2614,6 +3692,9 @@ class BonitoChat {
         const acAccept = (cmd)=>{
             this.textInput.value = '/' + cmd.name + ' ';
             this.textInput.focus();
+            this.textInput.dispatchEvent(new Event('input', {
+                bubbles: true
+            }));
             acClose();
         };
         const acRender = ()=>{
@@ -2680,12 +3761,22 @@ class BonitoChat {
         this.textInput.addEventListener('input', this.onCmdInput);
         this.textInput.addEventListener('blur', this.onCmdBlur);
         this.onEscapeKey = (e)=>{
-            if (e.key !== 'Escape' || e.repeat) return;
+            if (e.key !== 'Escape' || e.repeat || e.isComposing || this.inputComposing || e.keyCode === 229) return;
             if (!this.container.isConnected) {
                 this.lazyDestroy();
                 return;
             }
-            if (this.container.offsetParent === null) return;
+            if (!this.paneVisible || this.container.offsetParent === null) return;
+            if (document.querySelector('.bt-lightbox-overlay')) return;
+            const modeMenu = this.app.querySelector('.bt-send-mode-menu');
+            if (modeMenu && !modeMenu.hidden) {
+                e.preventDefault();
+                modeMenu.hidden = true;
+                const trigger = this.app.querySelector('.bt-send-mode-trigger');
+                trigger.setAttribute('aria-expanded', 'false');
+                trigger.focus();
+                return;
+            }
             if (this.cmdAcItems && this.cmdAcItems.length) {
                 e.preventDefault();
                 this.cmdAcClose();
@@ -2698,19 +3789,98 @@ class BonitoChat {
         };
         document.addEventListener('keydown', this.onEscapeKey, true);
     }
-    cancel() {
+    cancel(force = false) {
         this.comm.notify({
             type: 'cancel',
-            seq: this.turnSeq ?? -1
+            seq: this.turnSeq ?? -1,
+            force
         });
     }
-    dragHasImage(e) {
+    setCancelling(stopping) {
+        this.cancelling = stopping;
+        const status = this.app.querySelector('.bt-cancel-status');
+        if (status) status.hidden = !stopping;
+        const stop = this.app.querySelector('.bt-stop-btn');
+        if (stop) stop.title = stopping ? 'Stopping the agent. Use Force stop if it does not respond.' : 'Stop generation and pause queued messages';
+    }
+    dragHasFiles(e) {
         const dt = e.dataTransfer;
         if (!dt) return false;
         if (dt.types) {
             for (const t of dt.types)if (t === 'Files') return true;
         }
         return false;
+    }
+    attachAdd(file, fallbackName) {
+        const mime = file.type || '';
+        if (this.INLINE_IMAGE_TYPES.has(mime) && file.size <= this.ATTACH_MAX_BYTES) {
+            this.attachAddBlob(file, mime, file.name || `${fallbackName}.png`);
+        } else {
+            this.attachAddFile(file, file.name || fallbackName);
+        }
+    }
+    attachAddFile(file, filename) {
+        if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
+            this.showAttachError(`At most ${this.ATTACH_MAX_COUNT} attachments per message`);
+            return;
+        }
+        if (file.size > this.FILE_MAX_BYTES) {
+            this.showAttachError(`${filename} is too large (${formatBytes(file.size)}, ` + `at most ${formatBytes(this.FILE_MAX_BYTES)})`);
+            return;
+        }
+        const pid = this.app.closest('.bt-chatpane')?.dataset.panePid;
+        if (!pid) {
+            this.showAttachError('Files can only be attached in a chat');
+            return;
+        }
+        const id = `att-${++this.attachIdCounter}`;
+        const bytes = crypto.getRandomValues(new Uint8Array(12));
+        const item = {
+            kind: 'file',
+            file,
+            filename,
+            mime: file.type || '',
+            size: file.size,
+            pid,
+            uploadId: Array.from(bytes, (b)=>b.toString(16).padStart(2, '0')).join(''),
+            sent: 0,
+            path: null,
+            onWorker: false,
+            error: null,
+            removed: false
+        };
+        item.done = this.uploadFile(item);
+        this.attachments.set(id, item);
+        this.renderAttachments();
+    }
+    async uploadFile(item) {
+        const url = (offset)=>`/attachment-upload/${encodeURIComponent(item.pid)}` + `?upload=${item.uploadId}&offset=${offset}&total=${item.size}` + `&name=${encodeURIComponent(item.filename)}`;
+        try {
+            let offset = 0;
+            do {
+                if (item.removed) return;
+                const chunk = item.file.slice(offset, offset + this.UPLOAD_CHUNK_BYTES);
+                const resp = await fetch(url(offset), {
+                    method: 'POST',
+                    body: chunk,
+                    headers: {
+                        'X-BT-Upload': '1'
+                    }
+                });
+                if (!resp.ok) throw new Error((await resp.text()).trim() || `HTTP ${resp.status}`);
+                const answer = await resp.json();
+                offset = answer.received;
+                item.sent = offset;
+                if (answer.path) {
+                    item.path = answer.path;
+                    item.onWorker = answer.on_worker;
+                }
+                if (!this.destroyed) this.renderAttachments();
+            }while (offset < item.size)
+        } catch (error) {
+            item.error = `Upload failed: ${error.message}`;
+            if (!this.destroyed) this.renderAttachments();
+        }
     }
     attachAddBlob(blob, mime, filename) {
         if (this.attachments.size + this.attachPending >= this.ATTACH_MAX_COUNT) {
@@ -2742,7 +3912,17 @@ class BonitoChat {
         reader.readAsDataURL(blob);
     }
     attachRemove(id) {
+        const item = this.attachments.get(id);
         this.attachments.delete(id);
+        if (item?.kind === 'file' && !item.path) {
+            item.removed = true;
+            fetch(`/attachment-upload/${encodeURIComponent(item.pid)}?upload=${item.uploadId}`, {
+                method: 'DELETE',
+                headers: {
+                    'X-BT-Upload': '1'
+                }
+            }).catch((e)=>console.warn('could not drop the partial upload', e));
+        }
         this.renderAttachments();
     }
     attachClear() {
@@ -2759,13 +3939,29 @@ class BonitoChat {
             this.attachBar.classList.add('bt-attachments-active');
             for (const [id, item] of this.attachments){
                 const wrap = document.createElement('div');
-                wrap.className = 'bt-attachment-thumb';
                 wrap.dataset.attachId = id;
-                const img = document.createElement('img');
-                img.src = item.dataUrl;
-                img.alt = item.filename || 'image';
-                img.title = item.filename || 'image';
-                wrap.appendChild(img);
+                if (item.kind === 'file') {
+                    wrap.className = 'bt-attachment-file';
+                    wrap.dataset.state = item.error ? 'error' : item.path ? 'done' : 'uploading';
+                    const name = document.createElement('div');
+                    name.className = 'bt-attachment-file-name';
+                    name.textContent = item.filename;
+                    name.title = item.filename;
+                    const status = document.createElement('div');
+                    status.className = 'bt-attachment-file-status';
+                    status.textContent = item.error ? item.error : item.path ? formatBytes(item.size) : `Uploading ${Math.floor(100 * item.sent / Math.max(1, item.size))}% of ${formatBytes(item.size)}`;
+                    const bar = document.createElement('div');
+                    bar.className = 'bt-attachment-file-bar';
+                    bar.style.width = `${item.path ? 100 : Math.floor(100 * item.sent / Math.max(1, item.size))}%`;
+                    wrap.append(name, status, bar);
+                } else {
+                    wrap.className = 'bt-attachment-thumb';
+                    const img = document.createElement('img');
+                    img.src = item.dataUrl;
+                    img.alt = item.filename || 'image';
+                    img.title = item.filename || 'image';
+                    wrap.appendChild(img);
+                }
                 const rm = document.createElement('button');
                 rm.type = 'button';
                 rm.className = 'bt-attachment-remove';
@@ -2800,12 +3996,120 @@ class BonitoChat {
             }
         }, 4500);
     }
+    renderQueue(msg) {
+        const box = this.app.querySelector('.bt-message-queue');
+        if (!box) return;
+        const expanded = new Set([
+            ...box.querySelectorAll('details[open]')
+        ].map((e)=>e.dataset.queueId));
+        box.replaceChildren();
+        const items = msg.items || [];
+        box.hidden = items.length === 0;
+        if (!items.length) return;
+        box.setAttribute('aria-label', `Pending messages (${items.length})`);
+        for (const item of items){
+            const row = document.createElement('details');
+            row.className = 'bt-queue-item';
+            row.open = expanded.has(item.id);
+            row.dataset.queueId = item.id;
+            row.dataset.status = item.status;
+            row.dataset.mode = item.mode;
+            const text = document.createElement('div');
+            text.className = 'bt-queue-text';
+            text.textContent = item.text;
+            const status = document.createElement('div');
+            status.className = 'bt-queue-status';
+            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' : item.status === 'held' ? 'Goes out with your next message' : item.status === 'offline' ? 'Agent not reachable · sends once it is back' : item.status === 'sending' ? 'Connecting · not sent yet' : item.mode === 'interrupt' ? 'Waiting for interruption to finish' : item.mode === 'next' ? 'Waiting for the next message boundary' : 'Waiting until the agent finishes');
+            const summary = document.createElement('summary');
+            summary.className = 'bt-queue-summary';
+            const preview = document.createElement('span');
+            preview.className = 'bt-queue-preview';
+            preview.textContent = item.text;
+            const badge = document.createElement('span');
+            badge.className = 'bt-queue-badge';
+            badge.textContent = item.status === 'paused' ? 'Paused · not sent' : item.status === 'held' ? 'With your next message' : item.status === 'offline' ? 'Agent offline · queued' : item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' : item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
+            summary.title = status.textContent;
+            summary.append(preview, badge);
+            const detail = document.createElement('div');
+            detail.className = 'bt-queue-detail';
+            detail.append(text, status);
+            row.append(summary, detail);
+            const actions = document.createElement('div');
+            actions.className = 'bt-queue-actions';
+            for (const [action, label] of item.status === 'paused' ? [
+                [
+                    'send',
+                    'Queue again'
+                ],
+                [
+                    'remove',
+                    'Remove'
+                ]
+            ] : item.status === 'held' ? [
+                [
+                    'send',
+                    'Send now'
+                ],
+                [
+                    'remove',
+                    'Remove'
+                ]
+            ] : item.status === 'waiting' || item.status === 'offline' ? [
+                [
+                    'remove',
+                    'Remove'
+                ]
+            ] : []){
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.dataset.queueAction = action;
+                button.dataset.queueId = item.id;
+                button.textContent = label;
+                actions.append(button);
+            }
+            detail.append(actions);
+            box.append(row);
+        }
+    }
+    queueDelivered(msg) {
+        const box = this.app.querySelector('.bt-queue-delivery');
+        if (!box) return;
+        box.textContent = 'Sent to agent: ' + msg.text.replace(/\s+/g, ' ').slice(0, 100);
+        box.hidden = false;
+    }
     async submit() {
         const text = this.textInput.value;
         const yoloMode = this.textInput.classList.contains('bt-text-input-yolo');
         if (!yoloMode && text.trim() === '' && this.attachments.size === 0) return;
+        if (this.submitting) return;
+        const files = [
+            ...this.attachments.values()
+        ].filter((item)=>item.kind === 'file');
+        if (files.some((item)=>!item.path && !item.error)) {
+            this.submitting = true;
+            try {
+                await Promise.all(files.map((item)=>item.done));
+            } finally{
+                this.submitting = false;
+            }
+        }
+        const failed = files.find((item)=>item.error);
+        if (failed) {
+            this.showAttachError(`${failed.filename}: ${failed.error}. Remove it to send.`);
+            return;
+        }
         const payload = [];
         for (const item of this.attachments.values()){
+            if (item.kind === 'file') {
+                payload.push({
+                    kind: 'file',
+                    path: item.path,
+                    filename: item.filename,
+                    on_worker: item.onWorker
+                });
+                continue;
+            }
             const buf = await item.blob.arrayBuffer();
             payload.push({
                 mime: item.mime,
@@ -2815,8 +4119,9 @@ class BonitoChat {
         }
         this.comm.notify({
             type: 'send',
-            text,
-            attachments: payload
+            text: this.textInput.value,
+            attachments: payload,
+            mode: this.sendMode || 'done'
         });
         this.textInput.value = '';
         this.textInput.dispatchEvent(new Event('input', {
@@ -2827,21 +4132,18 @@ class BonitoChat {
     onViewportResize() {
         if (this.fullscreenActive()) return;
         const vv = window.visualViewport;
+        if (this.destroyed || !this.paneVisible || !this.container.offsetParent) return;
         const h = Math.round(vv.height);
-        if (this.lastViewportHeight !== h) {
-            this.lastViewportHeight = h;
-            const app = this.app || this.container.closest('.bt-app');
-            if (app) app.style.height = h + 'px';
-        }
+        if (this.lastViewportHeight === h) return;
+        this.lastViewportHeight = h;
+        const app = this.app || this.container.closest('.bt-app');
+        if (app) app.style.height = h + 'px';
         if (this.followMode) this.queueScrollToBottom();
     }
     applyUserScroll(prevTop) {
         const { scrollTop , scrollHeight , clientHeight  } = this.container;
         const atBot = this.atBottom();
-        if (this.followMode && !atBot) {
-            this.setFollowMode(false);
-            this.cancelPendingScroll();
-        }
+        if (this.followMode && !atBot) this.setFollowMode(false);
         if (this.followMode) return;
         if (atBot || scrollTop > prevTop && scrollHeight - scrollTop - clientHeight < clientHeight && !this.lastMessageFullyOutOfView()) {
             this.setFollowMode(true);
@@ -2851,12 +4153,13 @@ class BonitoChat {
         }
     }
     setFollowMode(on) {
-        if (on) this.pendingAnchor = null;
         if (this.followMode === on) return;
         this.followMode = on;
         if (on) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
+        } else {
+            this.cancelPendingScroll();
         }
     }
     cancelPendingScroll() {
@@ -2875,6 +4178,7 @@ class BonitoChat {
         }
     }
     updateScrollAffordance(atBot) {
+        if (!this.paneVisible) return;
         if (atBot) {
             this.unreadCount = 0;
             this.hideNewMessagePill();
@@ -2901,10 +4205,9 @@ class BonitoChat {
     refreshPillContent() {
         if (!this.pillEl) return;
         const hasUnread = this.unreadCount > 0;
-        this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
-        if (this.pillLabelEl) {
-            this.pillLabelEl.textContent = hasUnread ? 'New messages' : 'Move to bottom';
-        }
+        if (this.pillEl.classList.contains('bt-new-msg-pill-glow') !== hasUnread) this.pillEl.classList.toggle('bt-new-msg-pill-glow', hasUnread);
+        const label = hasUnread ? 'New messages' : 'Move to bottom';
+        if (this.pillLabelEl && this.pillLabelEl.textContent !== label) this.pillLabelEl.textContent = label;
     }
     createNewMessagePill() {
         const app = this.container?.closest('.bt-app') || this.container?.parentElement;
@@ -2925,12 +4228,30 @@ class BonitoChat {
             this.setFollowMode(true);
             this.scrollToBottom();
         });
-        app.appendChild(pill);
+        const inputArea = app.querySelector('.bt-input-area');
+        if (!inputArea) return;
+        inputArea.appendChild(pill);
         this.pillEl = pill;
         this.pillLabelEl = label;
     }
 }
 const PATH_RE = /^(~|\.{1,2})?\/?[\w.@+-]+(\/[\w.@+-]+)+(:\d+)?$/;
+function copyText(text) {
+    const legacy = ()=>{
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ? navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}
 function decorateCodeBlocks(rootEl) {
     rootEl.querySelectorAll('pre').forEach((pre)=>{
         if (pre.dataset.btDecorated || pre.closest('.bt-code-wrap')) return;
@@ -2954,31 +4275,13 @@ function decorateCodeBlocks(rootEl) {
             return b;
         };
         const copyBtn = mk('bt-code-copy', '⧉', 'Copy code', (b)=>{
-            const done = ()=>{
-                b.textContent = '✓';
+            const say = (t)=>{
+                b.textContent = t;
                 setTimeout(()=>{
                     b.textContent = '⧉';
                 }, 1200);
             };
-            const fallback = ()=>{
-                const ta = document.createElement('textarea');
-                ta.value = codeText();
-                ta.style.position = 'fixed';
-                ta.style.opacity = '0';
-                document.body.appendChild(ta);
-                ta.select();
-                try {
-                    document.execCommand('copy');
-                    done();
-                } finally{
-                    ta.remove();
-                }
-            };
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(codeText()).then(done, fallback);
-            } else {
-                fallback();
-            }
+            copyText(codeText()).then(()=>say('✓'), ()=>say('✕'));
         });
         const dlBtn = mk('bt-code-download', '⤓', 'Download', ()=>{
             const blob = new Blob([
@@ -3001,35 +4304,37 @@ function decorateCodeBlocks(rootEl) {
         wrap.appendChild(actions);
     });
 }
+function decodePath(text) {
+    try {
+        return decodeURIComponent(text);
+    } catch (error) {
+        if (!(error instanceof URIError)) throw error;
+        return text;
+    }
+}
 function markdownWorkerPath(anchor) {
     const raw = (anchor.getAttribute('href') || '').trim();
     if (!raw || raw.startsWith('#') || raw.startsWith('?')) return null;
     if (/^(mailto|tel|data|blob|javascript):/i.test(raw)) return null;
     let path = raw;
+    let url = null;
     try {
-        const url = new URL(raw, window.location.href);
-        if (url.protocol === 'file:') {
-            path = decodeURIComponent(url.pathname);
-        } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-            if (url.origin !== window.location.origin) return null;
-            path = decodeURIComponent(url.pathname);
-        } else {
-            return null;
-        }
-    } catch (_) {
-        try {
-            path = decodeURIComponent(raw);
-        } catch (_) {
-            path = raw;
-        }
+        url = new URL(raw, window.location.href);
+    } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+    }
+    if (url === null) {
+        path = decodePath(raw);
+    } else if (url.protocol === 'file:') {
+        path = decodePath(url.pathname);
+    } else if (url.protocol === 'http:' || url.protocol === 'https:') {
+        if (url.origin !== window.location.origin) return null;
+        path = decodePath(url.pathname);
+    } else {
+        return null;
     }
     if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(raw)) {
-        const clean = raw.split(/[?#]/, 1)[0];
-        try {
-            path = decodeURIComponent(clean);
-        } catch (_) {
-            path = clean;
-        }
+        path = decodePath(raw.split(/[?#]/, 1)[0]);
     }
     return path || null;
 }
@@ -3050,23 +4355,35 @@ function linkifyPaths(rootEl) {
     });
 }
 function openLightbox(media) {
+    document.querySelector('.bt-lightbox-overlay')?.closeLightbox();
     const overlay = document.createElement('div');
     overlay.className = 'bt-lightbox-overlay';
-    const big = media.cloneNode(true);
-    big.classList.add('bt-lightbox-media');
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Enlarged image');
+    const big = document.createElement('img');
+    big.src = media.currentSrc || media.src;
+    big.alt = media.alt || '';
+    big.className = 'bt-lightbox-media';
     overlay.appendChild(big);
     const close = ()=>{
         overlay.remove();
-        document.removeEventListener('keydown', onkey);
+        document.removeEventListener('keydown', onkey, true);
     };
+    overlay.closeLightbox = close;
     const onkey = (e)=>{
-        if (e.key === 'Escape') close();
+        if (e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        close();
     };
-    overlay.addEventListener('click', (e)=>{
-        if (e.target === overlay) close();
-    });
-    document.addEventListener('keydown', onkey);
+    overlay.addEventListener('click', close);
+    document.addEventListener('keydown', onkey, true);
     document.body.appendChild(overlay);
+}
+function jumpChipsHTML(jumps) {
+    if (!Array.isArray(jumps)) return '';
+    return jumps.map((j)=>`<button type="button" class="bt-tool-jump" data-jump-index="${Number(j.index)}"` + ` data-jump-id="${escapeAttr(String(j.id))}" title="${escapeAttr(String(j.title || ''))}">` + `↑ ${escapeHTML(String(j.label))}</button>`).join('');
 }
 function escapeHTML(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -3153,6 +4470,16 @@ function msearchSelect(itemEl, pickObs, cfgId, value) {
     if (wrap) wrap.classList.remove('bt-msearch-open');
 }
 const CHAT_INSTANCES = new Set();
+function bodyMounted(slot) {
+    const row = slot.closest('.bt-tool-msg');
+    if (!row) return;
+    for (const chat of CHAT_INSTANCES){
+        if (chat.container.contains(row)) {
+            chat.onBodyMounted(row);
+            return;
+        }
+    }
+}
 function toolSlot(id) {
     const direct = document.querySelector(`.bt-tool-body[data-tool-id="${CSS.escape(id)}"]`);
     if (direct) return direct;
@@ -3163,8 +4490,11 @@ function toolSlot(id) {
     }
     return null;
 }
+function flushDrafts() {
+    for (const chat of CHAT_INSTANCES)chat.flushDraft?.();
+}
 function connect(node, comm, init = {}) {
-    const chat = new BonitoChat(node, comm);
+    const chat = new BonitoChat(node, comm, init);
     if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
     node.__bt_chat = chat;
     CHAT_INSTANCES.add(chat);
@@ -3172,11 +4502,9 @@ function connect(node, comm, init = {}) {
     if (parent) {
         const mo = new MutationObserver(()=>{
             if (!node.isConnected) {
-                try {
-                    chat.destroy();
-                } catch (_) {}
-                CHAT_INSTANCES.delete(chat);
                 mo.disconnect();
+                CHAT_INSTANCES.delete(chat);
+                if (!chat.destroyed) chat.destroy();
             }
         });
         mo.observe(parent, {
@@ -3187,9 +4515,13 @@ function connect(node, comm, init = {}) {
 }
 export { BonitoChat as BonitoChat };
 export { Collapsable as Collapsable };
+export { mountCode as mountCode };
+export { openLightbox as openLightbox };
 export { msearchFilter as msearchFilter };
 export { msearchOpen as msearchOpen };
 export { msearchSelect as msearchSelect };
+export { bodyMounted as bodyMounted };
 export { toolSlot as toolSlot };
+export { flushDrafts as flushDrafts };
 export { connect as connect };
 

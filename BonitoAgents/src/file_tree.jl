@@ -283,7 +283,7 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
             isempty(scored) && return DOM.div("no matches"; class = "bt-tree-empty")
             sort!(scored; by = t -> (-t[1], length(t[2]), t[2]))
             n = min(length(scored), FILE_TREE_SEARCH_LIMIT)
-            return DOM.div((tree_search_row(worker_root, scored[i][2]) for i in 1:n)...;
+            return DOM.div((tree_search_row(worker_root, scored[i][2]) for i in 1:n);
                            class = "bt-tree-rows")
         end
         # Tree mode.
@@ -297,7 +297,7 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
             push!(nodes, isdir ? tree_dir_row(path, name, depth, path in expanded) :
                                   tree_file_row(path, name, depth))
         end
-        DOM.div(nodes...; class = "bt-tree-rows")
+        DOM.div(nodes; class = "bt-tree-rows")
     end
 
     search_box = DOM.input(;

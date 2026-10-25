@@ -3,7 +3,7 @@
 # interrupt an in-flight bt_julia_eval WITHOUT cancelling the whole agent
 # turn.
 #
-# Why control lives outside user code: the eval-ws bridge (RemoteProxy) lives in the Malt
+# Why control lives outside user code: the live-render bridge (RemoteProxy) lives in the Malt
 # EVAL worker, the same process that runs the user's code — a busy eval can
 # starve its event loop, so it can't be trusted to deliver an interrupt. THIS
 # process never runs user code (evals are remote_eval'd into the Malt
@@ -12,10 +12,11 @@
 # `notifications/cancelled` path use.
 #
 # Wire: one JSON object per WS message.
-#   server → us:  {"op": "interrupt_eval", "request_id": id, "env_path"?: p}
+#   server → us:  {"op": "interrupt_eval", "request_id": id, "run"?: "r4", "env_path"?: p}
 #                 {"op": "ping", "request_id": id}
 #   us → server:  {"type": "interrupt_result", "request_id": id, "interrupted": n}
 #                 {"type": "pong", "request_id": id}
+#                 {"type": "run_update", "run": "r4", "status": …}   (unsolicited, runs.jl)
 #
 # The channel also runs in the OTHER direction, for the dev tools (`tools/dev.jl`):
 #   us → server:  {"type": "dev_request", "dev_id": n, "op": "...", "args": {…}}
@@ -26,21 +27,43 @@
 # request of ours using that name would be routed into its pending-RPC table and
 # never handled.
 #
-# Current workers supply CONTROL_URL (loopback only) and a chat-scoped
-# CONTROL_TOKEN explicitly in the ACP launch config. The daemon forwards frames
-# on its existing authenticated worker/server connection. No server URL or
-# server secret is needed by this control path.
-#
-# Compatibility with older workers: the direct server dial uses
-# (BONITOAGENTS_SERVER_URL from the worker daemon, BONITOAGENTS_SECRET /
-# BONITOAGENTS_PROJECT_ID injected by the server into the MCP launch env).
-# Standalone BonitoMCP use (no BonitoAgents) has none of them set → no dial,
-# zero overhead.
+# The worker supplies CONTROL_URL (its local relay, loopback only) and two
+# chat-scoped tokens explicitly in the ACP launch config; the relay turns each
+# connection into a channel on its link to the server. No server URL or secret
+# is involved. The process takes them out of its environment at startup
+# (`take_relay_grant!`). Standalone BonitoMCP use (no BonitoAgents) has none set
+# → no dial, zero overhead.
 
 using HTTP.WebSockets: WebSockets
 
+mutable struct AgentWaits
+    lock::ReentrantLock
+    active::Set{Channel{Nothing}}
+end
+AgentWaits() = AgentWaits(ReentrantLock(), Set{Channel{Nothing}}())
+
+function wake_agent_waits!()
+    lock(SERVER.waits.lock) do
+        foreach(close, SERVER.waits.active)
+        empty!(SERVER.waits.active)
+    end
+    return nothing
+end
+
+# The worker relay's address and the two tokens it handed this process: `token`
+# opens the control channel, `eval_token` the eval workers' live-render bridges
+# and value exchanges. `values_addr` is the relay's TCP address for the latter
+# ("" from a worker too old to have one).
+struct RelayGrant
+    url::String
+    token::String
+    eval_token::String
+    values_addr::String
+end
+
 # The MCP process's one control channel to the BonitoAgents server. The live
 # value is `SERVER.control` (see context.jl) — this is just its type.
+#   grant — how to reach the server, `nothing` outside BonitoAgents (`take_relay_grant!`).
 #   task — the dial-loop task; nothing until start_ctrl_dialback! arms it once.
 #   stop — test/embedder hook: production never sets it (the channel's lifetime
 #          IS the process's). Flipping it exits the dial loop at the next
@@ -48,6 +71,7 @@ using HTTP.WebSockets: WebSockets
 #   ws   — the live socket, set only while connected (see ctrl_dial_loop);
 #          nothing when no server is attached (then sends no-op).
 mutable struct ControlChannel
+    grant::Union{RelayGrant,Nothing}
     task::Union{Task,Nothing}
     stop::Bool
     ws::Any
@@ -58,8 +82,8 @@ mutable struct ControlChannel
     pending_lock::ReentrantLock
     next_id::Threads.Atomic{Int}
 end
-ControlChannel(task, stop, ws) =
-    ControlChannel(task, stop, ws, Dict{Int,Channel{Any}}(), ReentrantLock(),
+ControlChannel() =
+    ControlChannel(nothing, nothing, false, nothing, Dict{Int,Channel{Any}}(), ReentrantLock(),
                    Threads.Atomic{Int}(0))
 
 # Best-effort JSON send over the control socket. Returns false (never throws) if
@@ -82,34 +106,48 @@ end
 
 # Forward a live stdout/stderr chunk of a running eval to the chat. `route` keys
 # it to the eval session (see stream_route); the server routes it to the matching
-# eval card's tail (handle_mcp_ctrl_ws → route_eval_chunk!).
+# eval card's tail (serve_mcp_channel → route_eval_chunk!).
 send_eval_stream_chunk(route::AbstractString, chunk::AbstractString) =
     send_ctrl_frame(Dict("type" => "eval_stream_chunk",
                          "route" => String(route), "chunk" => String(chunk)))
 
-function start_ctrl_dialback!()
-    local_url = get(ENV, "BONITOAGENTS_CONTROL_URL", "")
-    if !isempty(local_url)
-        token = get(ENV, "BONITOAGENTS_CONTROL_TOKEN", "")
-        isempty(token) && error("local worker control endpoint has no session token")
-        SERVER.control.task === nothing || return nothing
-        SERVER.control.task = Base.errormonitor(@async ctrl_dial_loop(local_url, token))
-        log_info("control relay armed through the local worker")
-        return nothing
+"""
+    take_relay_grant!(env = ENV) -> Union{RelayGrant,Nothing}
+
+Take this process's relay grant out of `env`, where the worker put it, and keep
+it in `SERVER.control`. Taken rather than read: the eval workers this process
+starts inherit its environment and run user code, which must not find the
+control token there. `nothing` outside BonitoAgents.
+"""
+function take_relay_grant!(env::AbstractDict = ENV)
+    url         = pop!(env, "BONITOAGENTS_CONTROL_URL", "")
+    token       = pop!(env, "BONITOAGENTS_CONTROL_TOKEN", "")
+    eval_token  = pop!(env, "BONITOAGENTS_EVAL_TOKEN", "")
+    values_addr = pop!(env, "BONITOAGENTS_VALUES_ADDR", "")
+    grant = if isempty(url)
+        nothing
+    elseif isempty(token) || isempty(eval_token)
+        error("the local worker relay at $(url) granted no tokens")
+    else
+        RelayGrant(url, token, eval_token, values_addr)
     end
-    server_url = get(ENV, "BONITOAGENTS_SERVER_URL", "")
-    secret     = get(ENV, "BONITOAGENTS_SECRET", "")
-    project_id = get(ENV, "BONITOAGENTS_PROJECT_ID", "")
-    (isempty(server_url) || isempty(secret) || isempty(project_id)) && return nothing
+    SERVER.control.grant = grant
+    return grant
+end
+
+relay_grant() = SERVER.control.grant
+
+function start_ctrl_dialback!()
+    grant = relay_grant()
+    grant === nothing && return nothing
     SERVER.control.task === nothing || return nothing
-    wsurl = replace(rstrip(server_url, '/'), r"^http" => "ws") * "/mcp-ws"
-    SERVER.control.task = Base.errormonitor(@async ctrl_dial_loop(wsurl, "$secret $project_id"))
-    log_info("control dial-back armed → $wsurl")
+    SERVER.control.task = Base.errormonitor(@async ctrl_dial_loop(grant.url, grant.token))
+    log_info("control channel armed through the local worker")
     return nothing
 end
 
-# Tear the control channel down and reset it so a later start_ctrl_dialback! can
-# re-arm (against a DIFFERENT server). Production never calls this — the channel's
+# Tear the control channel down and forget its grant, so a later
+# take_relay_grant! + start_ctrl_dialback! can re-arm (against a DIFFERENT server). Production never calls this — the channel's
 # lifetime is the process's — but a test process stands in for many short-lived
 # MCP servers in one process, so it must re-point between them. Waits for the old
 # dial loop to fully exit BEFORE clearing `stop`, so there's no resurrection race.
@@ -133,9 +171,10 @@ function reset_ctrl_dialback!()
             @debug "reset_ctrl_dialback!: waiting for dial loop failed" exception = e
         end
     end
-    SERVER.control.task = nothing
-    SERVER.control.ws   = nothing
-    SERVER.control.stop = false
+    SERVER.control.task  = nothing
+    SERVER.control.ws    = nothing
+    SERVER.control.grant = nothing
+    SERVER.control.stop  = false
     return nothing
 end
 
@@ -150,8 +189,16 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
         try
             WebSockets.open(wsurl) do ws
                 WebSockets.send(ws, handshake)
+                # The relay says "ok" once the server took the channel; a refusal
+                # closes the socket with the server's reason, and the loop backs off.
+                verdict = WebSockets.receive(ws)
+                verdict == "ok" || error("the worker relay answered $(repr(verdict)) instead of ok")
                 connected = true
                 SERVER.control.ws = ws                       # arm the stream forwarder
+                # The server may be new (restarted) or have missed frames while
+                # we were away: tell it about every run it should still show.
+                announce_open_runs()
+                announce_processes()
                 try
                     for msg in ws
                         # Per-frame guard: one malformed frame must not drop the
@@ -250,13 +297,35 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
         put!(ch, get(msg, "ok", false) ? get(msg, "result", nothing) :
                  ErrorException(String(get(msg, "error", "unknown server error"))))
         return nothing
+    elseif op == "wake_waits"
+        wake_agent_waits!()
     elseif op == "interrupt_eval"
-        env_path = get(msg, "env_path", nothing)
-        env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
-        n = interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing)
-        log_info("ctrl interrupt_eval (env=$(env_path)) → interrupted $n in-flight eval(s)")
-        WebSockets.send(ws, JSON.json(Dict(
-            "type" => "interrupt_result", "request_id" => rid, "interrupted" => n)))
+        # The user's ⊗ on one card: that RUN when the chat knows it, else the
+        # env's eval (a card from before runs). A user's stop reaches background
+        # runs too — only a turn cancel leaves them alone.
+        run = get(msg, "run", nothing)
+        # Always answered, a failure with its error: the server waits on this
+        # reply, and a throw here used to leave it to time out and report the
+        # worker as unreachable.
+        reply = Dict{String,Any}("type" => "interrupt_result", "request_id" => rid)
+        try
+            reply["interrupted"] = if run isa AbstractString && !isempty(run)
+                r = @lock SERVER.runs.lock get(SERVER.runs.runs, String(run), nothing)
+                r !== nothing && interrupt_run!(r) ? 1 : 0
+            else
+                env_path = get(msg, "env_path", nothing)
+                env_path isa AbstractString && isempty(env_path) && (env_path = nothing)
+                interrupt_in_flight!(env_path isa AbstractString ? String(env_path) : nothing;
+                                     background = true)
+            end
+        catch e
+            e isa InterruptException && rethrow()
+            reply["interrupted"] = 0
+            reply["error"] = sprint(showerror, e)
+        end
+        log_info("ctrl interrupt_eval (run=$(run), env=$(get(msg, "env_path", nothing))) → " *
+                 (haskey(reply, "error") ? "failed: $(reply["error"])" : "interrupted $(reply["interrupted"]) eval(s)"))
+        WebSockets.send(ws, JSON.json(reply))
     elseif op == "ping"
         WebSockets.send(ws, JSON.json(Dict("type" => "pong", "request_id" => rid)))
     elseif op in HOST_OPS

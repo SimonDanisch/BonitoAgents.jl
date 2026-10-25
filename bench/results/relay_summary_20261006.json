@@ -1,0 +1,174 @@
+{
+  "date": "2026-10-06",
+  "topology": "Bosgame (wired 192.168.178.59) -> Desktop server (wired 192.168.178.28) -> legion-boi (Wi-Fi 192.168.178.65)",
+  "summary": {
+    "large": {
+      "staged": {
+        "seconds_median": 3.433726937,
+        "seconds_range": [
+          3.290376822,
+          3.604070857
+        ],
+        "allocated_mib_median": 1036.288215637207,
+        "control_pair_p95_seconds": 0.045254676,
+        "control_pair_max_seconds": 0.099775483
+      },
+      "relay": {
+        "seconds_median": 1.991767621,
+        "seconds_range": [
+          1.971284999,
+          2.217167723
+        ],
+        "allocated_mib_median": 533.9811172485352,
+        "control_pair_p95_seconds": 0.066071516,
+        "control_pair_max_seconds": 0.105662242
+      }
+    },
+    "small": {
+      "staged": {
+        "seconds_median": 18.5103026,
+        "seconds_range": [
+          17.40830008,
+          19.995810479
+        ],
+        "allocated_mib_median": 1335.1971740722656,
+        "control_pair_p95_seconds": 0.040001948,
+        "control_pair_max_seconds": 0.109057224
+      },
+      "relay": {
+        "seconds_median": 0.438812433,
+        "seconds_range": [
+          0.390379573,
+          0.455416056
+        ],
+        "allocated_mib_median": 59.22422790527344,
+        "control_pair_p95_seconds": 0.055308686,
+        "control_pair_max_seconds": 0.055308686
+      }
+    },
+    "unchanged-large": {
+      "staged": {
+        "seconds_median": 0.052952308,
+        "seconds_range": [
+          0.016078906,
+          0.056950411
+        ],
+        "allocated_mib_median": 0.05937957763671875,
+        "control_pair_p95_seconds": 0.031248155,
+        "control_pair_max_seconds": 0.031248155
+      },
+      "relay": {
+        "seconds_median": 0.022751058,
+        "seconds_range": [
+          0.020910433,
+          0.079649901
+        ],
+        "allocated_mib_median": 1.0492630004882812,
+        "control_pair_p95_seconds": 0.014726588,
+        "control_pair_max_seconds": 0.014726588
+      }
+    },
+    "unchanged-small": {
+      "staged": {
+        "seconds_median": 0.111971612,
+        "seconds_range": [
+          0.10052535,
+          0.160563246
+        ],
+        "allocated_mib_median": 38.416748046875,
+        "control_pair_p95_seconds": 0.054639575,
+        "control_pair_max_seconds": 0.054639575
+      },
+      "relay": {
+        "seconds_median": 0.056110325,
+        "seconds_range": [
+          0.050852097,
+          0.058510079
+        ],
+        "allocated_mib_median": 2.5097198486328125,
+        "control_pair_p95_seconds": 0.0099268,
+        "control_pair_max_seconds": 0.0099268
+      }
+    },
+    "delta": {
+      "staged": {
+        "seconds_median": 0.544727545,
+        "seconds_range": [
+          0.520339785,
+          0.595929588
+        ],
+        "allocated_mib_median": 19.227066040039062,
+        "control_pair_p95_seconds": 0.1111975,
+        "control_pair_max_seconds": 0.1111975
+      },
+      "relay": {
+        "seconds_median": 0.299358731,
+        "seconds_range": [
+          0.286349526,
+          0.32574509
+        ],
+        "allocated_mib_median": 13.878807067871094,
+        "control_pair_p95_seconds": 0.020121282,
+        "control_pair_max_seconds": 0.020121282
+      }
+    }
+  },
+  "interleaved_headroom": {
+    "direct": {
+      "seconds_median": 1.453685738,
+      "samples": 5
+    },
+    "relay": {
+      "seconds_median": 1.630842777,
+      "samples": 5
+    }
+  },
+  "process_metrics": {
+    "source": {
+      "sample_count": 3756,
+      "sample_interval_target_seconds": 0.1,
+      "start_rss_mib": 682.08984375,
+      "peak_rss_mib": 1661.5859375,
+      "end_rss_mib": 1469.484375,
+      "cpu_seconds": 1617.3700000000001,
+      "elapsed_seconds": 383.9340808391571
+    },
+    "server": {
+      "sample_count": 3772,
+      "sample_interval_target_seconds": 0.1,
+      "start_rss_mib": 2080.66015625,
+      "peak_rss_mib": 2470.2578125,
+      "end_rss_mib": 2292.04296875,
+      "cpu_seconds": 791.05,
+      "elapsed_seconds": 384.854434967041
+    },
+    "destination": {
+      "sample_count": 3701,
+      "sample_interval_target_seconds": 0.1,
+      "start_rss_mib": 681.17578125,
+      "peak_rss_mib": 967.86328125,
+      "end_rss_mib": 889.875,
+      "cpu_seconds": 593.47,
+      "elapsed_seconds": 384.7942478656769
+    }
+  },
+  "verification": {
+    "destination_trees_verified": 54,
+    "direct_download_trees_verified": 4,
+    "algorithm": "SHA256 tree digest over sorted relative names and file SHA256s"
+  },
+  "methodology": {
+    "scope": "Real BonitoAgents server and two real remote BonitoWorker instances. Times cover server-side transfers including transfer-channel setup/completion. Excludes MCP, agent, browser and HTTPS/proxy overhead. Not a whole-tool or UI benchmark.",
+    "baseline": "Old staged architecture and legacy per-file-ACK protocol, running on updated shared transport code. Conservative comparison, not an untouched old binary.",
+    "updated": "Production sync_folder! streaming relay with updated workers.",
+    "warmup": "First repetition (0) of each scenario/mode excluded; three measured repetitions; order alternates.",
+    "payload": "Uncompressed seeded pseudorandom bytes, 64 MiB large file; 2048 distinct 4 KiB files; delta changes 4 KiB at offset 32 MiB and appends one byte.",
+    "incremental_setup": "Each measured unchanged/delta transfer has an untimed baseline copy to its own destination/mirror. Delta uses a prebuilt modified snapshot to simulate the edit with the same basis.",
+    "disk": "OS page cache, no fsync; not a durability benchmark.",
+    "versions": "Julia 1.12.7; server HTTP 2.6.7, both workers HTTP 2.8.0; fixed across compared modes.",
+    "memory": "Whole Julia process RSS sampled every 100 ms, includes warmup, compilation, GC heap retention and verification. Server shares an existing REPL with previously loaded packages. Allocated MiB is cumulative, not peak memory.",
+    "cpu": "Whole-process CPU summed across threads. Aggregate includes setup, warmup, compilation and verification. Per-transfer CPU/RSS unavailable: the original benchmark reused a captured variable for probe time_ns(), overwriting the transfer start timestamp. Raw started fields are invalid and must not be compared to process-sample timestamps. Elapsed transfer seconds (@timed) and control latency use independent durations and remain valid. The helper now uses separate variables.",
+    "responsiveness": "Two sequential empty-directory control RPCs on the same links every 100 ms; measures transport responsiveness, not rendered UI latency.",
+    "headroom": "Five interleaved fresh 64 MiB transfers: direct Desktop->legion versus Bosgame->Desktop->legion; direct source was already cached on desktop."
+  }
+}

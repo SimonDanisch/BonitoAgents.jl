@@ -1,16 +1,44 @@
 # BonitoAgents
 
-BonitoAgents turns an agent conversation into a visual development workspace.
-The agent can run code in a persistent Julia session, return rich values and
-interactive Bonito apps directly into the chat, show the files it creates, and
-put its git diff in front of you for line-level review. Workers keep the agent,
-code and computation together on your own machines; one dashboard gives you
-the live result from your desk or your phone.
+BonitoAgents is a self-hosted web workspace for coding agents. Bring Claude
+Code, Codex, Kimi Code, OpenCode, MiMo or any other agent that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com). Run them on your
+laptop, on the desktop with the big GPU, on the server in the closet, and drive
+all of them from one browser tab, including the one on your phone.
+
+What the agents make shows up as the real thing: plots, videos, Jupyter
+notebooks with their outputs, 3D models, PDFs, tables, diffs, and live
+interactive apps that keep computing on your machine. Your code stays in
+ordinary folders, your transcripts stay on your disk, and the agents run on your
+own subscriptions and keys.
+
+For the whole picture in one go, read [A Day with BonitoAgents](@ref): one
+working day, from the first coffee to the overnight render.
 
 !!! warning
     Use at your own risk: there are no safeguards (yet) preventing an LLM
     driven through BonitoAgents from wiping your entire PC or leaking all your
     secrets.
+
+## Bring any agent, keep your work
+
+Claude Code, Codex, Kimi Code, OpenCode and MiMo ship as providers, and any
+other ACP agent plugs in with a small descriptor. Each chat names its agent, and
+you can switch it in the chat's header at any time: the next turn runs under the
+new agent, which gets the conversation so far. When one provider runs out of
+credits or gets stuck, the work carries on under another.
+
+The BonitoAgents tools behave the same for every agent: the persistent Julia
+sessions, `bt_show`, share links and the to-do list render as the same cards
+whichever agent calls them. Projects are ordinary folders and git checkouts on
+your machines, transcripts are markdown files in your own server's state
+directory, and **Discover** imports the Claude Code and Codex sessions you
+already have, history included. See [Agent Providers](@ref).
+
+```@raw html
+<img src="assets/how-it-fits.svg" alt="Any ACP agent runs on any of your machines; one dashboard in any browser drives them all and shows what they make"
+     style="display: block; width: 100%; margin: 16px auto;">
+```
 
 ## One dashboard for the whole workflow
 
@@ -53,7 +81,8 @@ Every eval-family tool also accepts `worker = "name"`. Run code on another
 connected machine while its output and rich result remain in the current chat;
 use `bt_sync_folder` to send the code and data first. A laptop conversation can
 therefore drive a warm environment, dataset or GPU on another worker without
-moving the whole agent session.
+moving the whole agent session. This is off by default: an admin switches it on
+per chat with **Remote julia** in the chat's ⋯ menu.
 
 Read [Julia Tools & Live Apps](@ref) for the eval lifecycle, remote workers,
 output limits and live-value bridge.
@@ -70,6 +99,37 @@ the worker.
 This supports a complete loop for analyses, simulations, visualizations,
 reports and small interfaces: ask the agent to create the result, inspect the
 real artifact beside the conversation, then refine it without switching tools.
+
+```@raw html
+<img src="assets/screenshot-media.png" alt="One chat with the agent's loss plot, a prediction video and a 3D model inline, next to the Jupyter notebook and the metrics table it wrote, open as workspace panels"
+     style="display: block; width: 100%; margin: 16px auto; border-radius: 10px; border: 1px solid rgba(128,128,128,0.25);">
+```
+
+## Share a report or a live app with a link
+
+A finished report or app often has to go to someone else. Ask the agent to
+share it, or use the share button on an eval result, on a file the agent showed
+you or on a file open in a tab. You get a link that opens in any browser, on a
+phone too, without an account.
+
+A markdown report opens as a web page with its images and videos. A Julia file
+that builds a Bonito app opens as the running app: a colleague moves the slider
+on their phone and the new result is computed on your worker, in the project's
+own environment. Each visitor gets their own copy of the app.
+
+```@raw html
+<img src="assets/screenshot-share-phone.png" alt="A shared Bonito app on a phone: the Lorenz attractor with a slider, computed on the worker that shared it"
+     style="display: block; width: 300px; max-width: 100%; margin: 16px auto; border-radius: 10px; border: 1px solid rgba(128,128,128,0.25);">
+```
+
+A CSV, a 3D model or a PDF opens in the same viewer the chat uses, with a
+download button. A link reaches only that file and what it embeds. You can add a
+password, and Settings lists your links so you can end any of them.
+
+A link works while its worker is online. Shared `.jl` files run again after a
+restart, so prefer them over sharing a result straight from the chat, which
+needs its Julia session to stay open. The details are in the `bt_share` section
+of [Julia Tools & Live Apps](@ref).
 
 ## Review the agent's changes
 

@@ -59,8 +59,8 @@ click_dock(s)     = TK.eval_js(s, "(()=>{const p=document.querySelector('.bw-ws-
 click_activate(s) = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); if(!t)return false; t.click(); return true;})()")
 click_close(s)    = TK.eval_js(s, "(()=>{const t=[...document.querySelectorAll('.bw-tab')].find(x=>x._panelId==='$P'); const c=t&&t.querySelector('.bw-tab-close'); if(!c)return false; c.click(); return true;})()")
 
-scroll_st(s) = TK.eval_js(s, raw"""(()=>{const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); return m?Math.round(m.scrollTop):-1;})()""")
-scroll_to_bottom(s) = TK.eval_js(s, raw"""(()=>{const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); if(m)m.scrollTop=m.scrollHeight; return true;})()""")
+scroll_st(s) = TK.eval_js(s, raw"""(()=>{const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); return m?Math.round(m.scrollTop):-1;})()""")
+scroll_to_bottom(s) = TK.eval_js(s, raw"""(()=>{const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); if(m)m.scrollTop=m.scrollHeight; return true;})()""")
 reload_shown(s) = TK.eval_js(s, "document.body.innerText.includes('Reload live app')")
 app_out(s)      = TK.eval_js(s, raw"""(()=>{const o=document.querySelector('.s-out'); return o?o.innerText:'<none>';})()""")
 bump(s)         = TK.eval_js(s, "(()=>{const b=document.querySelector('.s-btn'); if(b)b.click(); return true;})()")
@@ -79,6 +79,22 @@ function bump_live(s, prev; timeout = 40)
         return false                       # never satisfied within the budget
     end
     return TK.eval_js(s, pred) === true    # a Bool, so @test can read it
+end
+
+# The app's output once it holds still. `bump_live` may land more than one
+# click, and a later one can still be on its way when the predicate first
+# holds: a value read right then went up by one more click afterwards (21 → 28
+# in a run), and the "state kept" check compared against the earlier one.
+function steady_out(s; settle = 1.0, timeout = 20)
+    t0 = time()
+    last = app_out(s)
+    while time() - t0 < timeout
+        sleep(settle)
+        now = app_out(s)
+        now == last && return now
+        last = now
+    end
+    error("app output never held still: $(last)")
 end
 
 # Only the FIRST detach retries: the button's handler may still be wiring up on
@@ -108,7 +124,7 @@ function run_suite(server)
         # Force a scroll region regardless of screen size.
         TK.set_window_size(server, 1280, 460); sleep(1.0)
         @test TK.wait_for(server, "chat is scrollable",
-            "(() => { const p=[...document.querySelectorAll('.bt-chatpane')].find(x=>x.offsetParent!==null); const m=p&&p.querySelector('.bt-messages'); return !!m && (m.scrollHeight - m.clientHeight) > 40; })()";
+            "(() => { const p=document.querySelector('.bt-chatpane[aria-hidden=false]'); const m=p&&p.querySelector('.bt-messages'); return !!m && (m.scrollHeight - m.clientHeight) > 40; })()";
             timeout = 10) == true
 
         # Detach into a float. Content shrinks as the embed leaves the chat, so
@@ -118,7 +134,7 @@ function run_suite(server)
         # Liveness WHILE FLOATING, before any dock — isolates whether the tab
         # path specifically breaks the round-trip.
         @test bump_live(server, "SVAL=0")          # live while floating
-        floating_val = app_out(server)
+        floating_val = steady_out(server)
 
         # DOCK must not move the chat: the embed is already out of the message
         # list, so docking the float as a tab changes nothing in it.
@@ -134,7 +150,7 @@ function run_suite(server)
         # Live as a tab: a click round-trips to its Julia map.
         @test click_activate(server); sleep(0.3)
         @test bump_live(server, floating_val)      # live as a docked tab
-        tab_val = app_out(server)
+        tab_val = steady_out(server)
 
         # CLOSE returns the embed below the user (content grows). Scroll must
         # hold or follow down — never collapse toward the top.

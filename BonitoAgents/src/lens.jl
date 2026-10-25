@@ -347,7 +347,7 @@ emit_saved_lenses(model::ChatModel, lenses::Vector{SavedLens}) =
 function handle_command!(model::ChatModel, ::Session, cmd::LensQueryCommand)
     msgs = lock(() -> copy(model.msgs_store), shared(model).lock)
     visible, actions = apply_lens(msgs, parse_lens(cmd.query))
-    chat_emit(model, Dict{String,Any}(
+    reply!(model, Dict{String,Any}(
         "type"    => "lens.result",
         "q"       => cmd.query,
         "active"  => !isempty(strip(cmd.query)),

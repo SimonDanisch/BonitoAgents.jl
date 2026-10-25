@@ -12,8 +12,8 @@
 # `state.chat_models[pid]`, and assert on `msgs_store`. The mock `agent_fn` is a
 # scripted closure that replies per prompt KIND, which is what makes the two-step
 # protocol observable from outside.
-@testitem "e2e:yolo_mode" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:yolo_mode" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     TK = TestKit
     BA = TestKit.BT
 
@@ -142,7 +142,9 @@
 
             # The tool-answer turn must be followed by a further CONTINUE prompt:
             # that is the loop refusing the escape.
-            @test poll_until(() -> confirm_prompts(model) == base_k + 1; timeout = 30)
+            # `>=`: the loop does not pause, so a poll can miss this step. The
+            # exact totals are checked once it settles, below.
+            @test poll_until(() -> confirm_prompts(model) >= base_k + 1; timeout = 30)
             @test poll_until(() -> yolo_prompts(model) == base_c + 2; timeout = 30)
             @test poll_until(() -> confirm_prompts(model) == base_k + 2; timeout = 30)
             sleep(3.0)
@@ -277,7 +279,7 @@
                 "document.querySelector('.bt-send-btn').classList.contains('bt-send-btn-yolo')";
                 timeout = 10) == true
             @test TK.eval_js(server,
-                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('lock in')") == true
+                "(document.querySelector('.bt-text-input').getAttribute('placeholder')||'').includes('Press ✓ to save')") == true
             @test TK.wait_for(server, "yolo bar armed",
                 "document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
                 timeout = 10) == true
@@ -302,11 +304,7 @@
         end
 
         # LAST: this one kills the mock agent's session on purpose.
-        @testset "a turn that FAILS stops the loop and disarms" begin
-            # Out of credits, transport gone, model unavailable: the turn throws
-            # instead of ending. The loop used to return silently and stay armed;
-            # now it says why and switches itself off, because the next nudge
-            # would hit exactly the same wall.
+        @testset "a lost agent connection pauses the loop and stays armed" begin
             reset_script!() do k, n
                 k === :task && return [TK.text("here is the initial result")]
                 return [TK.crash()]
@@ -316,14 +314,13 @@
             BA.send_message!(model, BA.UserMsg(model, "one more time"))
 
             @test poll_until(timeout = 60) do
-                agent_said(model, "the turn failed")
+                agent_said(model, "the agent connection was lost")
             end
-            @test agent_said(model, "Yolo switched off")
-            @test poll_until(() -> !BA.shared(model).yolo[]; timeout = 10)
-            # The browser is still open from the DOM testset: switching off is
-            # something the USER sees, not just server state.
-            @test TK.wait_for(server, "yolo bar disarmed by the failed turn",
-                "!document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
+            @test agent_said(model, "Yolo remains on")
+            @test poll_until(() -> BA.shared(model).yolo[]; timeout = 10)
+            # Check the visible toggle too, not only the shared server value.
+            @test TK.wait_for(server, "yolo bar stays armed after connection loss",
+                "document.querySelector('.bt-yolo-bar').classList.contains('bt-yolo-bar-on')";
                 timeout = 10) == true
             @test yolo_prompts(model) == base_c + 1   # the nudge that died, no more
             sleep(3.0)

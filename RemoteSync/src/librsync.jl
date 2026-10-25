@@ -175,9 +175,13 @@ end
 # or IOBuffer); the C callback marshals through a per-job heap structure that
 # carries the IO and a reusable buffer.
 mutable struct PatchBasisCtx
-    io  :: IO
-    buf :: Vector{UInt8}
+    io      :: IO
+    buf     :: Vector{UInt8}
+    # Why the callback failed. C can't carry a Julia exception: the callback
+    # returns RS_IO_ERROR and `apply_patch` throws this instead.
+    failure :: Union{Nothing,CapturedException}
 end
+PatchBasisCtx(io::IO, buf::Vector{UInt8}) = PatchBasisCtx(io, buf, nothing)
 
 # C signature: rs_result rs_copy_cb(void *opaque, rs_long_t pos, size_t *len, void **buf)
 function _basis_copy_cb_impl(opaque::Ptr{Cvoid}, pos::Clonglong,
@@ -186,15 +190,16 @@ function _basis_copy_cb_impl(opaque::Ptr{Cvoid}, pos::Clonglong,
     requested = Int(unsafe_load(len_ptr))
     try
         seek(ctx.io, pos)
-        length(ctx.buf) < requested && resize!(ctx.buf, requested)
-        n = readbytes!(ctx.io, ctx.buf, requested)
+        # librsync permits a short callback result and asks again for the rest.
+        # A COPY instruction may span the whole basis; keep its buffer bounded.
+        n = readbytes!(ctx.io, ctx.buf, min(requested, length(ctx.buf)))
         unsafe_store!(len_ptr, Csize_t(n))
         unsafe_store!(buf_ptr, pointer(ctx.buf))
         return RS_DONE
-    catch
-        # Surface any error as RS_IO_ERROR; details lost on the C side.
+    catch e
+        ctx.failure = CapturedException(e, catch_backtrace())
         unsafe_store!(len_ptr, Csize_t(0))
-        return Cint(100)
+        return Cint(100)   # RS_IO_ERROR
     end
 end
 

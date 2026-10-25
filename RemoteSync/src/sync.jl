@@ -137,29 +137,38 @@ end
 
 # ── Public: sender side ────────────────────────────────────────────────────
 """
-    send_directory(root, transport::IO; on_progress = nothing)
+    send_directory(root, transport::IO; on_progress = nothing, streaming = true)
 
 Send `root` over `transport`. The receiver on the other end of `transport`
-must be running `receive_directory`. Returns when the transfer completes.
+must be running `receive_directory`. Updated peers stream bounded chunks and
+acknowledge completion once per transfer. Older peers automatically use the
+legacy protocol; `streaming=false` forces it for diagnostics. Returns when
+the transfer completes.
 
 `on_progress` is an optional callback `(stage::Symbol, info::NamedTuple) -> Any`
 invoked at: `:walk_done`, `:plan_received`, `:file_start`, `:file_done`,
 `:transfer_done`. Useful for driving a UI progress bar without polling.
 """
 function send_directory(root::AbstractString, transport::IO;
-                        on_progress = nothing)
+                        on_progress = nothing, streaming::Bool = true)
     notify_progress(on_progress, :walk_start, (root = root,))
     manifest = walk_directory(root)
     notify_progress(on_progress, :walk_done, (count = length(manifest),))
 
-    write_frame(transport, TAG_MANIFEST, encode_manifest(manifest))
+    write_frame(transport, TAG_MANIFEST, encode_manifest(manifest; streaming))
 
     tag, payload = read_frame(transport)
     tag == TAG_PLAN || error("RemoteSync sender: expected PLAN, got tag $(tag)")
-    plan = decode_plan(payload)
+    plan, peer_streaming = decode_plan(payload; with_features = true)
+    streaming &= peer_streaming
     work = filter(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
     notify_progress(on_progress, :plan_received,
                     (planned = length(plan), work = length(work)))
+
+    if streaming
+        send_streamed_directory(root, transport, manifest, work; on_progress)
+        return nothing
+    end
 
     for (i, p) in pairs(work)
         # The plan came from the REMOTE receiver; validate its rel before we
@@ -233,14 +242,16 @@ Returns a NamedTuple `(written, deleted, skipped)` with file counts.
 function receive_directory(root::AbstractString, transport::IO;
                            on_progress = nothing,
                            quick_check::Bool = true,
-                           delete_extraneous::Bool = false)
+                           delete_extraneous::Bool = false,
+                           streaming::Bool = true)
     mkpath(root)
     notify_progress(on_progress, :wait_manifest, NamedTuple())
 
     tag, payload = read_frame(transport)
     tag == TAG_MANIFEST ||
         error("RemoteSync receiver: expected MANIFEST, got tag $(tag)")
-    manifest = decode_manifest(payload)
+    manifest, peer_streaming = decode_manifest(payload; with_features = true)
+    streaming &= peer_streaming
     notify_progress(on_progress, :manifest_received, (count = length(manifest),))
 
     plan = build_plan(root, manifest; quick_check)
@@ -249,7 +260,7 @@ function receive_directory(root::AbstractString, transport::IO;
         doomed == 0 || error("RemoteSync receiver: refusing to delete $(doomed) local file(s) " *
                              "to mirror an EMPTY source into $(root)")
     end
-    write_frame(transport, TAG_PLAN, encode_plan(plan))
+    write_frame(transport, TAG_PLAN, encode_plan(plan; streaming))
 
     skipped = count(p -> p.action == ACTION_SKIP, plan)
     written = 0
@@ -265,6 +276,15 @@ function receive_directory(root::AbstractString, transport::IO;
         sr === nothing || (by_rel[sr] = e)
     end
     for (i, p) in pairs(expected)
+        if streaming
+            notify_progress(on_progress, :apply_start,
+                            (rel = p.rel, idx = i, total = length(expected)))
+            receive_streamed_entry(root, transport, p, by_rel[p.rel])
+            written += 1
+            notify_progress(on_progress, :apply_done,
+                            (rel = p.rel, idx = i, total = length(expected)))
+            continue
+        end
         tag2, pl = read_frame(transport)
         tag2 == TAG_DELTA ||
             error("RemoteSync receiver: expected DELTA, got tag $(tag2)")
@@ -305,9 +325,10 @@ function receive_directory(root::AbstractString, transport::IO;
         if haskey(by_rel, srel)
             try
                 touch_mtime(dst, by_rel[srel].mtime)
-            catch
-                # touch_mtime is a best-effort optimisation; failing it
-                # only costs us an extra rsync round-trip next time.
+            catch e
+                # Only costs an extra rsync round-trip next time, but a file
+                # we just wrote refusing its mtime is not expected.
+                @warn "RemoteSync: could not set the mtime" dst exception = e
             end
         end
 
@@ -340,6 +361,9 @@ function receive_directory(root::AbstractString, transport::IO;
         end
     end
 
+    # Streaming is bounded by transport flow control, not one round trip per
+    # file. Confirm the entire transfer only after every file and delete landed.
+    streaming && write_frame(transport, TAG_OK)
     notify_progress(on_progress, :transfer_done,
                     (written = written, deleted = deleted, skipped = skipped))
     return (written = written, deleted = deleted, skipped = skipped)
@@ -430,8 +454,9 @@ function receive_file(dst::AbstractString, transport::IO;
 
     try
         touch_mtime(dst, mtime)
-    catch
-        # best-effort; mtime mismatch only costs a directory-resync round-trip.
+    catch e
+        # Only costs a directory-resync round-trip, but not expected.
+        @warn "RemoteSync: could not set the mtime" dst exception = e
     end
     notify_progress(on_progress, :file_done, (size = received,))
     return (size = received, mtime = mtime)

@@ -6,8 +6,7 @@
     using Bonito
     const BT = BonitoAgents
 
-    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir(),
-                          worker_secret = "x")
+    st = BT.ServerState(; state_dir = mktempdir(), working_dir = mktempdir())
     # No worker behind the agent: the session restart fails fast and is
     # swallowed by `restart_chat_session!` (the chat object survives), which is
     # all the switch's bookkeeping needs.
@@ -30,4 +29,11 @@
     @test occursin("npm install -g @agentclientprotocol/codex-acp", detail)
     @test occursin("codex login", detail)
     @test occursin("CODEX_API_KEY or OPENAI_API_KEY", detail)
+    denied = "failed to spawn agent (/managed/.bin/codex-acp): permission denied"
+    detail = BT.provider_startup_detail(model, codex, denied)
+    @test startswith(detail, denied)
+    @test occursin("Worker \"w1\" is connected", detail)
+    @test occursin("file permissions", detail)
+    @test !occursin("npm install", detail)
+    @test !occursin("codex login", detail)
 end

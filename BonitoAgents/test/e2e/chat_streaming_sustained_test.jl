@@ -27,21 +27,17 @@
 # exercise ordering across hundreds of streamed chunks and to prove no bleed
 # across 10 distinct bubbles, while keeping the suite to a couple of minutes.
 #
-# VIRTUAL SCROLL AWARENESS: the pane virtualises — parked at the bottom, the
-# render window is only `viewport + OVERSCAN·EST_HEIGHT` px deep, and bubbles
-# above it are EVICTED from the DOM (that's the designed contract; the
-# virtual_scroll suite asserts head-eviction at the tail explicitly). Ten
-# 30-chunk bubbles overflow that window, so the earliest turns' bubbles are
-# legitimately gone from the DOM by turn ~10. Therefore:
+# BOUNDED BLOCK AWARENESS: the pane holds one bounded block of rows, and a
+# chat reopened or scrolled far may hold only part of the conversation. So:
 #   * the per-turn "streaming finished" gate keys on the NEWEST visible agent
-#     bubble (follow mode pins it in the window), never on an absolute index —
-#     an absolute `VIS[k-1]` shifts as soon as one early bubble evicts, and
-#     the turn-10 gate then waits forever on a 10th bubble that can't exist
-#     (the exact 60 s "turn N bubble complete" soak flake this replaced);
+#     bubble (follow mode keeps it in view), never on an absolute index: an
+#     absolute `VIS[k-1]` shifts as soon as one early bubble leaves the page,
+#     and the turn-10 gate then waits forever on a 10th bubble that can't
+#     exist (the 60 s "turn N bubble complete" soak flake this replaced);
 #   * the final order/no-bleed verification SCROLLS each turn's bubble back
-#     into the window first (scroll-up → msgs.request → server re-render),
-#     which additionally proves the invariants hold across eviction +
-#     re-materialisation, not just for the live-streamed nodes.
+#     into view first (scroll-up → msgs.request → server render), which also
+#     proves the invariants hold for rows loaded again, not just for the
+#     live-streamed nodes.
 
 @testitem "e2e:chat_streaming_sustained" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer

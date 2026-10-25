@@ -38,10 +38,7 @@ using Test, Jail
             run(jail(Cmd(["cmd", "/c", "copy", src, ok]); whitelist = [work]))
             @test isfile(ok)             # whitelist (Low-labelled) write reaches host
 
-            try
-                run(jail(Cmd(["cmd", "/c", "copy", src, evil]); whitelist = [work]))
-            catch
-            end
+            @test !success(jail(Cmd(["cmd", "/c", "copy", src, evil]); whitelist = [work]))
             @test !isfile(evil)          # write outside whitelist is denied
 
             rm(work; recursive = true, force = true)

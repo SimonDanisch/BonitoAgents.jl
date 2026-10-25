@@ -567,13 +567,17 @@
             # "gap > one viewport" can hold at once (top at mid-viewport ⇒
             # gap ≈ height - viewport/2 + tail > viewport needs height >
             # 1.5 viewports).
-            tall_enough = TK.eval_js(s, """(() => {
+            tall = TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
                 const node = chat.cache.get(chat.totalCount - 1);
-                return node.getBoundingClientRect().height > 1.5 * c.clientHeight + 100;
+                return {h: Math.round(node.getBoundingClientRect().height), view: c.clientHeight,
+                        total: chat.totalCount, cls: node.className,
+                        lines: (node.querySelector('pre')?.innerText || '').split('\\n').length};
             })()""")
-            @test tall_enough == true
+            tall_enough = tall["h"] > 1.5 * tall["view"] + 100
+            tall_enough || @info "the tall block is not tall enough" tall
+            @test tall_enough
             # Doc-coordinate of the tall block's top, measured while pinned at
             # the bottom (the node is guaranteed rendered here — far away the
             # virtual scroller may detach it and rects would read zero).

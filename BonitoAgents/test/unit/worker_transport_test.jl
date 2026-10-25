@@ -23,8 +23,20 @@
 
 using Test
 import HTTP
+import BonitoAgents
 using AgentClientProtocol
 const ACP = AgentClientProtocol
+
+# Read until the peer goes; a socket the test closed is how that ends. Closing
+# under a blocked read surfaces as the WebSocket's message channel closing.
+function drain(ws)
+    try
+        for _ in ws end
+    catch e
+        BonitoAgents.is_peer_gone(e) || e isa HTTP.WebSockets.WebSocketError ||
+            e isa InvalidStateException || rethrow()
+    end
+end
 
 # A connected WebSocket end (server side) + a keep-alive server. The caller must
 # `close(srv)` when done.
@@ -33,20 +45,11 @@ function ws_pair()
     port = rand(20000:40000)
     srv  = HTTP.WebSockets.listen!("127.0.0.1", port) do ws
         put!(got, ws)
-        try
-            for _ in ws end          # keep the read side alive
-        catch
-        end
+        drain(ws)                    # keep the read side alive
     end
-    Threads.@spawn try
-        HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
-            put!(got, ws)
-            try
-                for _ in ws end
-            catch
-            end
-        end
-    catch
+    Threads.@spawn HTTP.WebSockets.open("ws://127.0.0.1:$port") do ws
+        put!(got, ws)
+        drain(ws)
     end
     ws = take!(got); take!(got)      # server end (used) + client end (parked)
     sleep(0.2)                        # let the handshake settle

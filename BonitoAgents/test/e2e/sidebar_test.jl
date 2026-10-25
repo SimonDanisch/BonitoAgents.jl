@@ -19,14 +19,14 @@
 # the rebuild unnecessary in the first place: navigation toggles
 # `.bt-side-active` from JS on `data-project-id`, the status LED is rewritten
 # by `status_obs`, and ✕ is a delegated handler on the aside.
-@testitem "e2e:sidebar" tags = [:e2e] begin
+@testitem "e2e:sidebar" setup = [SharedServer] tags = [:e2e] begin
     import BonitoAgents as BT
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+    const TestKit = SharedServer.TestKit
     using .TestKit
     const TK = TestKit
 
     parseInt_px(v) = (m = match(r"^([0-9.]+)px$", String(v)); m === nothing ? -1.0 : parse(Float64, m[1]))
-    ITEMS = ".bt-side-item[data-project-id]:not([data-project-id=''])"
+    ITEMS = ".bt-side-item[data-project-id]:not(.bt-side-nav)"   # chat rows, not Home / Settings
     # Mark every chat row; a rebuilt row loses the mark.
     stamp = """(() => { let n = 0;
         document.querySelectorAll($(repr(ITEMS))).forEach(e => { e.dataset.keep = '1'; n++; });
@@ -137,7 +137,8 @@
                         thumbRadius: getComputedStyle($(wrap).querySelector('.bt-proj-thumb')).borderTopLeftRadius,
                         badgeColor: getComputedStyle($(wrap).querySelector('.bt-proj-tag')).backgroundColor};
             })()""")
-            @test startswith(ring["worker"], "oklch(")
+            # The worker's palette colour (`worker_color`), a plain hex colour.
+            @test occursin(r"^#[0-9A-Fa-f]{6}$", ring["worker"])
             # The ring is the tile's own BACKGROUND with the picture inset and
             # rounded tighter, not a second shape sharing the picture's curved
             # edge — two shapes on one curve are each anti-aliased against it and
@@ -160,7 +161,8 @@
             TK.send_message(server, "glow")
             @test TK.wait_for(server, "the icon pulses while the agent works",
                 "!!$(wrap)?.classList.contains('bt-glow-active')"; timeout = 20) == true
-            @test TK.eval_js(server, "getComputedStyle($(wrap).querySelector('.bt-proj-icon')).animationName") == "bt-icon-glow"
+            # On the icon's own layer (an opacity pulse needs no repaint).
+            @test TK.eval_js(server, "getComputedStyle($(wrap).querySelector('.bt-proj-icon'), '::after').animationName") == "bt-icon-glow"
             TK.screenshot(server, joinpath(tempdir(), "sidebar_ring_glow.png"))
             @test TK.wait_for(server, "and settles when the turn ends",
                 "!!$(wrap)?.classList.contains('bt-glow-online')"; timeout = 30) == true
@@ -168,16 +170,16 @@
             server.agent_fn[] = _ -> [TK.text("ok"), TK.end_turn()]
         end
 
-        @testset "image identity survives new output and source deletion; right-click sets it" begin
+        @testset "image identity survives new output and source deletion; toolbar sets it" begin
             dir = mktempdir()
             cwd = mktempdir()
             red = joinpath(dir, "identity-red.svg")
             blue = joinpath(dir, "identity-blue.svg")
             write(red, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"73\" height=\"41\"><rect width=\"73\" height=\"41\" fill=\"red\"/></svg>")
             write(blue, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"97\" height=\"53\"><rect width=\"97\" height=\"53\" fill=\"blue\"/></svg>")
-            menuitem = "document.querySelector('.bt-chat-icon-menu [role=menuitem]')"
             visible = "[...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent)"
-            rightclick(target) = TK.eval_js(server, "$(target).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:420, clientY:300})); true")
+            native_context(target) = TK.eval_js(server, "$(target).dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true}))")
+            choose(target) = TK.eval_js(server, "$(target).closest('.bt-media-wrap').querySelector('.bt-media-chat-icon').click(); true")
             try
                 server.agent_fn[] = prompt -> begin
                     path = occursin("second", prompt) ? blue : red
@@ -196,33 +198,33 @@
                 rm(red)  # the icon must be independent of the worker's original
                 TK.send_message(server, "second picture")
                 shown = "[...$(visible).querySelectorAll('.bt-media')].find(i => i.naturalWidth === 97)"
-                @test TK.wait_for(server, "new image shown in chat", "!!$(shown)"; timeout=60)
+                got = try
+                    TK.wait_for(server, "new image shown in chat", "!!$(shown)"; timeout=60) == true
+                catch e
+                    (e isa ErrorException && startswith(e.msg, "wait_for timed out")) || rethrow()
+                    false
+                end
+                # Missing once in a full suite run (2026-10-01), never alone or in
+                # order: say what the chat showed instead, and stop here rather
+                # than right-click nothing (which failed the no-JS-errors check too).
+                got || @info "the second picture is not in the chat" chat = TK.eval_js(server, """(() => {
+                    const v = $(visible);
+                    if (!v) return 'no visible chat';
+                    return JSON.stringify({
+                        media: [...v.querySelectorAll('.bt-media')].map(i => [i.naturalWidth, i.complete, (i.currentSrc || i.src || '').slice(-60)]),
+                        tools: [...v.querySelectorAll('.bt-tool-msg')].map(t => (t.querySelector('.bt-tool-header')?.innerText || '').replace(/\\s+/g, ' ')),
+                        tail: v.innerText.slice(-400)}); })()""")
+                @test got
+                got || error("the second picture never showed in the chat")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))) === window.__recognitionIcon")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
                 @test TK.eval_js(server, decoded(73))
 
-                # Right-click on the new picture in the chat: its one action
-                # makes it the icon. Opening the menu alone changes nothing.
-                rightclick(shown)
-                @test TK.wait_for(server, "the picture's menu opens", "!!$(menuitem)"; timeout=10)
-                menu = TK.eval_js(server, """(() => {
-                    const b = $(menuitem);
-                    const r = b.getBoundingClientRect();
-                    const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-                    return {label: b.textContent,
-                            onscreen: r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 &&
-                                      r.right <= innerWidth && r.bottom <= innerHeight,
-                            hit: hit === b ? 'menu' : (hit ? hit.tagName + '.' + hit.className : 'nothing'),
-                            font: getComputedStyle(b).fontFamily,
-                            chatFont: getComputedStyle($(visible)).fontFamily};
-                })()""")
-                @test menu["label"] == "Set as chat icon"
-                @test menu["onscreen"] == true
-                @test menu["hit"] == "menu"
-                @test menu["font"] == menu["chatFont"]  # styled like the chat it floats over
-                TK.screenshot(server, joinpath(tempdir(), "chat_icon_menu.png"))
+                @test native_context(shown)
+                @test TK.eval_js(server, "!document.querySelector('.bt-chat-icon-menu')")
+                @test TK.eval_js(server, "$(shown).closest('.bt-media-wrap').querySelector('.bt-media-chat-icon').title") == "Set as chat icon"
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") == original
-                TK.eval_js(server, "$(menuitem).click(); true")
+                choose(shown)
                 @test TK.wait_for(server, "the picked picture becomes the icon", decoded(97); timeout=30)
                 @test TK.eval_js(server, "!document.querySelector('.bt-chat-icon-menu')")
                 @test TK.eval_js(server, "document.querySelector($(repr(icon))).src") != original
@@ -241,9 +243,8 @@
                 TK.send_message(server, "and this one")
                 attached = "[...$(visible).querySelectorAll('.bt-user-att-img')].find(i => i.complete && i.naturalWidth === 1)"
                 @test TK.wait_for(server, "attachment shown in chat", "!!$(attached)"; timeout=60)
-                rightclick(attached)
-                @test TK.wait_for(server, "the attachment's menu opens", "!!$(menuitem)"; timeout=10)
-                TK.eval_js(server, "$(menuitem).click(); true")
+                @test native_context(attached)
+                choose(attached)
                 @test TK.wait_for(server, "the attachment becomes the icon", decoded(1); timeout=30)
                 chosen = TK.eval_js(server, "document.querySelector($(repr(icon))).src")
 

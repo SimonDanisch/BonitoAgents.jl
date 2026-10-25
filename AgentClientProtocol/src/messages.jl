@@ -289,9 +289,9 @@ struct Plan <: Message
     # This is the STREAM's answer, and `close_turn!` is the single place it is
     # given — the same one that force-fails live tools, on the same events. It is
     # not the only way a plan ends (an agent that works its entries to terminal
-    # ends it by status, and an episode that simply STOPS is visible to a
-    # consumer as `session_activity` — neither needs a frame). It is the one that
-    # covers a stream dying under a live plan, which nothing else can see.
+    # ends it by status, and a consumer sees the turn it belongs to end:
+    # `open_turns`). It is the one that covers a stream dying under a live plan,
+    # which nothing else can see.
     #
     # The entries are left EXACTLY as the agent last reported them: sealing is a
     # property of the plan, not a status we forge onto its entries. Tools get
@@ -320,7 +320,10 @@ struct UsageUpdate <: Message
     cost_amount::Union{Float64,Nothing}
     cost_currency::Union{String,Nothing}
     origin_kind::Union{String,Nothing}
+    thinking_tokens::Union{Int,Nothing}    # see `UsageUpdateNotif`
 end
+UsageUpdate(used, size, cost_amount, cost_currency, origin_kind) =
+    UsageUpdate(used, size, cost_amount, cost_currency, origin_kind, nothing)
 # The agent's slash-command set (complete state, re-pushed on change).
 struct CommandsUpdate <: Message
     commands::Vector{CommandInfo}
@@ -375,21 +378,6 @@ Base.append!(m::UserMessage, t::AbstractString)  = (put!(m.stream, String(t)); m
 # A message now folds its own stream, so there is nothing to drain and no list of
 # types to keep in sync — the three that were missing from it took down every
 # `session/load` that replayed one.)
-
-# Same question as `is_agent_work(::SessionUpdate)`, asked of a coalesced
-# message: is this the agent DOING something, or telling us about the session?
-#
-# A renderer reads it to decide whether an AUTO-WAKE EPISODE has begun — the
-# agent talking with no prompt open. Session metadata (config/mode/usage/
-# commands) arrives on bind and at turn boundaries, so counting it would open an
-# episode on a chat that has done nothing.
-is_agent_work(::Message)        = true
-is_agent_work(::ConfigUpdate)   = false
-is_agent_work(::ModeUpdate)     = false
-is_agent_work(::UsageUpdate)    = false
-is_agent_work(::CommandsUpdate) = false
-is_agent_work(::StreamFlush)    = false
-
 
 # ── Wire → typed dispatch ────────────────────────────────────────────────────
 # One place maps Claude Code's tool name to a concrete `ToolCall` subtype.
@@ -733,6 +721,19 @@ function parse_json_object(s::AbstractString)
     return v isa AbstractDict ? Dict{String,Any}(String(k) => x for (k, x) in v) : nothing
 end
 
+# An update's content replaces the call's (ACP), with one exception: a call that
+# SUCCEEDED keeps its diff when the result brings none. claude-agent-acp streams
+# an edit's diff mid-flight and ends with only `rawOutput` "The file … has been
+# updated successfully." (test/fixtures/claude_edit_wire.jsonl), which says
+# nothing the diff does not. A failed edit gets its error text as usual.
+function replace_content!(tc::ToolCall, content::Vector)
+    isempty(content) && return tc
+    has_diff(c) = any(x -> x isa DiffContent, c)
+    tc.status == "completed" && has_diff(tc.content) && !has_diff(content) && return tc
+    tc.content = Vector{ToolContent}(content)
+    return tc
+end
+
 function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never touches the text bubble
     tc = get(st.tools, u.tool_call_id, nothing)
     tc === nothing && return nothing
@@ -750,7 +751,7 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
     # overwrite content. See `streamed_input_text`.
     args_text = streamed_input_text(tc, u)
     if args_text === nothing
-        isempty(u.content) || (tc.content = Vector{ToolContent}(u.content))
+        replace_content!(tc, u.content)
     else
         parsed = parse_json_object(args_text)
         parsed === nothing || merge_late_input!(tc, parsed)
@@ -791,7 +792,8 @@ function parse_update!(out, st, u::SessionNoticeNotif)
 end
 parse_update!(out, st, u::CurrentModeUpdateNotif)  = (put!(out, ModeUpdate(u.mode_id)); nothing)
 parse_update!(out, st, u::UsageUpdateNotif) =
-    (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind)); nothing)
+    (put!(out, UsageUpdate(u.used, u.size, u.cost_amount, u.cost_currency, u.origin_kind,
+                           u.thinking_tokens)); nothing)
 parse_update!(out, st, u::AvailableCommandsUpdateNotif) =
     (put!(out, CommandsUpdate(u.commands)); nothing)
 

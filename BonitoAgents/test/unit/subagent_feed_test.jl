@@ -20,7 +20,7 @@ const ACP = BonitoAgents.AgentClientProtocol
 # A ChatModel with a never-started WorkerAgent: valid for the message-lifecycle
 # paths (send!/route/close only touch msgs_store, comm and chat_dir).
 function headless_model()
-    state = BT.serve(; host = "127.0.0.1", port = 0, worker_secret = "x",
+    state = BT.serve(; host = "127.0.0.1", port = 0,
                      state_dir = mktempdir(), working_dir = mktempdir())
     agent = BT.WorkerAgent(state, "w1", "/p")
     return BT.ChatModel(state, mktempdir(); project_id = "proj", agent = agent)

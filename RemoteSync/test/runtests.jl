@@ -20,7 +20,7 @@ end
 
 Base.read(io::BidirIO, ::Type{UInt8}) = read(io.in_io, UInt8)
 Base.read(io::BidirIO, n::Integer) = read(io.in_io, n)
-Base.readbytes!(io::BidirIO, dst, n = length(dst)) = readbytes!(io.in_io, dst, n)
+Base.readbytes!(io::BidirIO, dst::AbstractArray{UInt8}, n = length(dst)) = readbytes!(io.in_io, dst, n)
 Base.eof(io::BidirIO) = eof(io.in_io)
 Base.bytesavailable(io::BidirIO) = bytesavailable(io.in_io)
 Base.write(io::BidirIO, b::UInt8) = write(io.out_io, b)
@@ -35,6 +35,8 @@ function make_blob(n::Int; seed::UInt64 = UInt64(0xCAFEBABEDEADBEEF))
     rng = Random.Xoshiro(seed)
     return rand(rng, UInt8, n)
 end
+
+include("streaming.jl")
 
 # ── Layer 1: librsync primitives ───────────────────────────────────────────
 @testset "primitives" begin
@@ -481,12 +483,13 @@ end
             stages_receiver = Symbol[]
 
             a, b = pipe_pair()
-            @async (try
+            sender = @async (try
                 send_directory(src, a; on_progress = (s, _) -> push!(stages_sender, s))
             finally
                 close(a)
             end)
             receive_directory(dst, b; on_progress = (s, _) -> push!(stages_receiver, s))
+            wait(sender) # the sender reports completion after the final ACK
             close(b)
 
             @test :walk_done       in stages_sender

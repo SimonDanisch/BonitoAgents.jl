@@ -23,7 +23,7 @@ agent_script(_prompt) = [TK.usage(21784, 200000; cost = 0.42),
                          TK.text("done.")]
 
 # Pane-scoped helpers (the shared soak server keeps other panes mounted).
-const PANE = "[...document.querySelectorAll('.bt-chatpane')].find(x => x.offsetParent !== null)"
+const PANE = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
 
 setinput(s, v) = TK.eval_js(s, """(() => {
     const p = $(PANE);

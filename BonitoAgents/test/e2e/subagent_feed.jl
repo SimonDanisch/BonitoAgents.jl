@@ -215,7 +215,9 @@ function run_suite(server)
                         Dict("type" => "sub_text", "parent" => "task-BG2",
                              "text" => "POSTTURN-SUB scanning archives"),
                         Dict("type" => "text",
-                             "text" => "The background agent completed and replied: DONE_MARKER_42")];
+                             "text" => "The background agent completed and replied: DONE_MARKER_42"),
+                        # The agent ends its own turn at the cycle's result.
+                        TK.usage(; origin = "task-notification")];
                     delay_ms = 800),
                 TK.end_turn()]
             TK.send_message(server, "research in background")
@@ -243,6 +245,11 @@ function run_suite(server)
             @test TK.wait_for(server, "auto-wake message rendered",
                 "[...document.querySelectorAll('.bt-agent-msg')].some(e => (e.innerText||'').includes('DONE_MARKER_42'))";
                 timeout = 15) == true
+            # ... and the agent's own turn is over at its end marker: not busy.
+            @test TK.wait_for(server, "the agent's own turn over",
+                "!document.querySelector('.bt-busy.bt-busy-active')"; timeout = 15) == true
+            @test isempty(TK.BT.AgentClientProtocol.open_turns(model))
+            @test !BA.shared(model).busy_active[]
             # (3) The auto-wake does NOT guess the pill's completion (the old
             # "exactly one running → done" heuristic is gone). This mock task has
             # no transcript `outputFile`, so the poller has no done-signal — the

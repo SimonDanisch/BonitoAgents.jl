@@ -7,11 +7,8 @@ default_backend() = Sys.which("bwrap") !== nothing ? :bwrap : :landrun
 
 "True when running inside WSL2 (GPU is exposed via /dev/dxg, not /dev/dri+kfd)."
 function is_wsl()
-    try
-        return occursin("microsoft", lowercase(read("/proc/version", String)))
-    catch
-        return false
-    end
+    isfile("/proc/version") || return false
+    return occursin("microsoft", lowercase(read("/proc/version", String)))
 end
 
 "Best-effort list of GPU device nodes to expose, based on what actually exists."

@@ -65,40 +65,81 @@ Base.hash(c::WorkerCard, h::UInt) = hash(c.worker_id, hash(:WorkerCard, h))
 Base.:(==)(a::WorkerCard, b::WorkerCard) = a.worker_id == b.worker_id
 
 # Compact, persistent feedback for the worker's relationship to this server
-# build. The explanatory note below the card is reserved for states that need
-# action; the badge remains visible after a successful reconnect so an update
-# does not appear to have done nothing.
+# build; the note below the card says what it means and whether to act. The
+# badge stays after a successful reconnect, so an update does not appear to have
+# done nothing. `working` steps run by themselves: they get a spinner and the
+# time they have taken, so a slow install does not look stuck.
 function worker_update_badge(online::Bool, state::Symbol, message::AbstractString = "")
-    online || return (label = "", class = "bt-pill bt-hidden", title = "")
-    state === :current && return (
-        label = "Up to date",
-        class = "bt-pill bt-pill-online bt-worker-update-badge",
-        title = "This worker matches the server build",
-    )
-    state === :updating && return (
-        label = "Updating…",
-        class = "bt-pill bt-pill-syncing bt-worker-update-badge",
-        title = String(message),
-    )
-    state === :reinstall && return (
-        label = "Reinstall needed",
-        class = "bt-pill bt-pill-warn bt-worker-update-badge",
-        title = String(message),
-    )
-    return (
-        label = "Update available",
-        class = "bt-pill bt-pill-warn bt-worker-update-badge",
-        title = String(message),
-    )
+    title = String(message)
+    badge(label, tone; working = false) =
+        (label = label, class = "bt-pill bt-pill-$(tone) bt-worker-update-badge", title = title, working = working)
+    # Restarting is the one step a worker is offline for, and the one that would
+    # otherwise read as a plain "offline".
+    (online || state === :restarting) ||
+        return (label = "", class = "bt-pill bt-hidden", title = "", working = false)
+    state === :current &&
+        return (label = "Up to date", class = "bt-pill bt-pill-online bt-worker-update-badge",
+                title = "This worker matches the server build", working = false)
+    state === :requested  && return badge("Starting update", "syncing"; working = true)
+    state === :installing && return badge("Installing update", "syncing"; working = true)
+    state === :restarting && return badge("Restarting", "syncing"; working = true)
+    state === :waiting    && return badge("Update queued", "warn")
+    state === :failed     && return badge("Update failed", "error")
+    state === :reinstall  && return badge("Reinstall needed", "warn")
+    return badge("Update available", "warn")
 end
 
-function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
-    state, wid = c.state, c.worker_id
+# The note's tone: an update running by itself is information, not a warning.
+update_note_class(state::Symbol) =
+    state in (:requested, :installing, :restarting) ? "bt-worker-update-note bt-worker-update-note-info" :
+    state === :failed ? "bt-worker-update-note bt-worker-update-note-error" : "bt-worker-update-note"
 
+# The badge as a node. A working step's timer counts on in the browser
+# (`update_timer_ticker`) from `since`, so it needs no re-render per second.
+function render_update_badge(w::Union{WorkerInfo,Nothing})
+    w === nothing && return DOM.span(""; class = "bt-pill bt-hidden")
+    b = worker_update_badge(isopen(w), w.update_state, w.update_message)
+    b.working || return DOM.span(b.label; class = b.class, title = b.title)
+    return DOM.span(DOM.span(""; class = "bt-spinner bt-spinner-sm"),
+                    DOM.span(b.label),
+                    DOM.span(elapsed_str(time() - w.update_since); class = "bt-update-elapsed",
+                             dataStarted = string(w.update_since));
+                    class = b.class, title = b.title)
+end
+
+# One ticker per card for its update timer; the badge is rebuilt on every step,
+# each time with the step's own start. Stops once the card left the page.
+update_timer_ticker(card) = js"""
+    (card => {
+        const es = sec => sec <= 1 ? "" : sec < 60 ? Math.round(sec) + "s"
+            : (() => { const m = Math.floor(sec / 60), s = Math.round(sec - 60 * m);
+                       return s === 0 ? m + "m" : m + "m" + s + "s"; })();
+        let seen = false;
+        const iv = setInterval(() => {
+            if (!card.isConnected) { if (seen) clearInterval(iv); return; }
+            seen = true;
+            const now = Date.now() / 1000;
+            card.querySelectorAll('.bt-update-elapsed[data-started]').forEach(el => {
+                el.textContent = es(now - parseFloat(el.dataset.started)); });
+        }, 1000);
+    })($(card))
+"""
+
+function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnostics.jl
+    state, wid = c.state, c.worker_id
+    # A worker shared with someone's group (`share_worker!`) shows them its name
+    # and lets them start chats on it; renaming, updating, sharing, removing it
+    # and importing its machine's sessions stay with whoever manages it.
+    manage = let w = get(state.workers[], wid, nothing)
+        w === nothing || can_manage(state, w)
+    end
+
+    # `:restarting`: offline because it installed an update, and back by itself.
     status_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w === nothing ? :unknown : (!isopen(w) ? :offline :
-                                    (w.update_state !== :current ? :update : :online))
+        w === nothing ? :unknown :
+            !isopen(w) ? (w.update_state === :restarting ? :restarting : :offline) :
+            w.update_state !== :current ? :update : :online
     end
     subtitle_obs = map(state.workers) do workers
         w = get(workers, wid, nothing)
@@ -166,14 +207,13 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # `[DT]` tag — short worker initials shown next to every chat/project that
     # lives on this worker. Up to 4 chars (room for a short emoji). Empty
     # input clears the override and the UI falls back to derive_initials(name).
-    # The pill's border is the worker's fixed colour: the same ring the
+    # The pill and card stripe use the worker's fixed colour: the same ring the
     # sidebar draws around this machine's chat icons.
     initials_input = DOM.input(
         type      = "text",
         value     = c.initials_obs,
         maxlength = 4,
         class     = "bt-card-initials bt-card-initials-edit",
-        style     = "border:1.5px solid $(worker_color(wid))",
         title     = "Worker tag (1–4 chars, emoji ok) — shown as [XX] in chat labels; its colour rings this machine's chat icons",
         onblur    = js"event => $(c.initials_obs).notify(event.target.value)",
         onkeydown = js"""event => {
@@ -200,14 +240,9 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     end
 
     status_dot_obs = map(status_obs) do s
-        status_dot(s)
+        status_dot(s === :restarting ? :update : s)
     end
-    update_badge = map(state.workers) do workers
-        w = get(workers, wid, nothing)
-        badge = w === nothing ? worker_update_badge(false, :current) :
-                                worker_update_badge(isopen(w), w.update_state, w.update_message)
-        DOM.span(badge.label; class = badge.class, title = badge.title)
-    end
+    update_badge = map(workers -> render_update_badge(get(workers, wid, nothing)), state.workers)
 
     # The note shows for every non-current state; the button only where the
     # worker can act on it (a `:reinstall` worker does not know `force_update`).
@@ -222,12 +257,28 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
         w = get(workers, wid, nothing)
         quiet = w === nothing || w.update_state === :current
         DOM.span(quiet ? "" : w.update_message;
-                 class = quiet ? "bt-worker-update-note bt-hidden" :
-                                 "bt-worker-update-note")
+                 class = quiet ? "bt-worker-update-note bt-hidden" : update_note_class(w.update_state))
     end
-    # `force_worker_update!` flips the worker to `:updating`, which hides this
-    # button and changes the note and badge. The replacement worker's hello
-    # flips it back to `:current`, leaving the compact success badge visible.
+    # The managed agent adapters the worker reports (its harnesses.jl), and why
+    # the last install failed. Always a node, for the same reason as above. Not
+    # the update note's amber: what is installed is information, not a warning;
+    # only a failure is red.
+    adapters_note = map(session, state.workers) do workers
+        w = get(workers, wid, nothing)
+        installed = w === nothing ? Dict{String,String}() : w.harnesses
+        err = w === nothing ? "" : w.harness_error
+        list = isempty(installed) ? "" :
+            "adapters: " * join(("$(last(split(k, '/'))) $(v)" for (k, v) in sort!(collect(installed))), " · ")
+        DOM.div(
+            DOM.span(list; class = isempty(list) ? "bt-hidden" : ""),
+            DOM.span(isempty(err) ? "" : "adapter install failed: " * err;
+                     class = isempty(err) ? "bt-hidden" : "bt-worker-adapters-error");
+            class = isempty(list) && isempty(err) ? "bt-worker-adapters bt-hidden" : "bt-worker-adapters")
+    end
+    # Shown while the update waits for something (`:available`, `:waiting`,
+    # `:failed`). `force_worker_update!` flips the worker to `:requested`, which
+    # hides it while the worker's steps run; the replacement worker's hello
+    # flips it to `:current`, leaving the compact success badge visible.
     update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
     on(session, update_btn.value) do clicked
         clicked || return
@@ -240,7 +291,7 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     end
     update_btn_class = map(state.workers) do workers
         w = get(workers, wid, nothing)
-        w !== nothing && w.update_state === :available ? "" : "bt-hidden"
+        w !== nothing && w.update_state in (:available, :waiting, :failed) ? "" : "bt-hidden"
     end
 
     # Remove worker. The confirm() lives in JS so we never fire the
@@ -267,12 +318,17 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
 
     # Render both action variants; toggle visibility via class. Keeps the
     # Bonito.Button instances mounted so click handlers don't churn.
-    online_class  = map(o -> o ? "bt-card-actions"            : "bt-card-actions bt-hidden", is_online_obs)
-    offline_class = map(o -> o ? "bt-card-actions bt-hidden"  : "bt-card-actions",            is_online_obs)
+    # A restarting worker shows neither: its badge says where it is.
+    online_class  = map(o -> o ? "bt-card-actions" : "bt-card-actions bt-hidden", is_online_obs)
+    offline_class = map(s -> s in (:offline, :unknown) ? "bt-card-actions" : "bt-card-actions bt-hidden",
+                        status_obs)
     actions_block = DOM.div(
-        DOM.div(new_proj_btn, gh_btn, DOM.div(update_btn; class = update_btn_class); class = online_class),
+        DOM.div(new_proj_btn, gh_btn, manage ? DOM.div(update_btn; class = update_btn_class) : DOM.div();
+                class = online_class),
         DOM.div(DOM.span("offline"; class = "bt-pill bt-pill-muted"); class = offline_class))
 
+    manage || (initials_input = DOM.span(c.initials_obs; class = "bt-card-initials");
+               name_input = DOM.span(c.name_obs; class = "bt-card-name"))
     card_body = DOM.div(
         DOM.div(status_dot_obs, initials_input, name_input, update_badge;
                 class = "bt-card-title"),
@@ -284,7 +340,8 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # title row). The discover details lives inside the SAME pill (below this
     # row), so a worker with a collapsed project list takes the same space as a
     # bare card — no separate pill underneath.
-    card_row = DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row")
+    card_row = manage ? DOM.div(card_body, actions_block, remove_btn; class = "bt-card-row") :
+                        DOM.div(card_body, actions_block; class = "bt-card-row")
 
     is_picking_obs = map(s -> s == wid, c.picker_state)
     picker_form    = render_remote_picker_form(session, c, wid)
@@ -300,10 +357,14 @@ function Bonito.jsrender(session::Bonito.Session, c::WorkerCard)
     # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
     # from state.discovered (no scan needed on first paint); the per-card Rescan
     # button refreshes it.
-    card = DOM.div(card_row, update_notice, render_discover_panel(session, c, wid); class = "bt-card")
+    card = DOM.div(card_row, update_notice, adapters_note,
+                   worker_sharing_row(state.auth, session, state, wid),
+                   manage ? render_discover_panel(session, c, wid) : DOM.div();
+                   class = "bt-card bt-worker-card", dataWorkerId = wid,
+                   style = Styles("--bt-worker" => worker_color(state, wid)))
 
     return Bonito.jsrender(session,
-        DOM.div(card, picker_block, gh_block; class = "bt-worker-cell"))
+        DOM.div(card, picker_block, gh_block, update_timer_ticker(card); class = "bt-worker-cell"))
 end
 
 function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::String)
@@ -313,11 +374,8 @@ function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::
 
     on(session, create_btn.value) do clicked
         clicked || return
-        # `is_busy_running`, not `is_busy_idle`: the progress card parks on the
-        # LAST outcome (:ok / :err) so the user can read it, and a guard that
-        # demanded :idle would refuse every click after the first operation for
-        # the rest of the window's life.
-        refuse_if_busy(c.busy, c.error_obs, "Can't create a chat right now") && return
+        # A second click while this one runs is dropped by `do_import`'s latch,
+        # and a later import of the same folder reuses its chat.
         # The path field IS the selection — nothing else to resolve. A path that
         # doesn't exist yet ("type /newname to create it") is created on the
         # WORKER here (mkpath) before import; `do_import` itself stays strict
@@ -458,9 +516,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
                        nothing : String(prov_raw)
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
-        # Drop double-clicks while a start is in flight (see create_btn above
-        # for why this asks "running?" and not "idle?").
-        refuse_if_busy(c.busy, c.error_obs, "Can't open that chat right now") && return
+        # Double-clicks: `do_import` drops a second one while the first runs.
         c.do_import(w_name, path; resume_session_id = resume_session_id,
                     provider = provider)
     end
@@ -528,10 +584,12 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     empty_block = DOM.div(empty_msg_obs; class = empty_class)
 
     # Errors are 0..N small spans, rebuilt via map(); KeyedList overkill.
-    errors_obs = map(results_obs) do results
+    # Not while a rescan runs: the error is the previous attempt's, and next to
+    # the spinner it read as this one having failed already.
+    errors_obs = map(results_obs, scan_busy) do results, busy
         DOM.div(
             (DOM.div("Error: $(r["error"])"; class = "bt-error")
-             for r in results if haskey(r, "error"))...;
+             for r in results if haskey(r, "error") && !busy);
             class = "bt-errors-list")
     end
 

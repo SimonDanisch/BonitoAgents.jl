@@ -1,7 +1,142 @@
 # BonitoAgents Apps
 
-An App is a small Julia package that implements a workflow: code, agent calls,
-and a live UI pinned into a chat. Apps are ordinary packages, so they are
+There are two kinds of app. **Server apps** are built (2026-10-16): permanent
+parts of the server with a chat, a pane and MCP tools of their own; the To-do
+app is the first. [Workflow apps](#workflow-apps), the rest of this document,
+are still a plan: small Julia packages that run in a chat's worker and
+orchestrate agents from code. A server
+app is where a workflow app's launcher and live UI would sit once they exist.
+
+## Server apps
+
+An app lives as long as the server (`ServerState.apps`, started by
+`start_apps!` when the state is built), so its state and its tools are there
+whether or not anyone has its chat open. Code: `BonitoAgents/src/apps.jl`; user
+docs with a complete example: `docs/src/apps.md`.
+
+### Apps are packages
+
+An app is a type, `MyApp <: AgentApp`, in a package that depends on
+BonitoAgents and uses its public names only (`public` in `BonitoAgents.jl`). A
+server runs the apps it is given: `serve(; apps = (BonitoAgents.BUILTIN_APPS...,
+MyApp))`, `dev_server(; apps)`, `ServerState(; apps)`. There is no global
+registry. The server starts each from its type, `MyApp(AppContext(server,
+dir))`, which is why `app_id` is defined on the type: the server needs it to
+find the app's directory (`<state_dir>/apps/<id>`) before the app exists.
+
+The To-do app is `BonitoAgents.BonitoTodo`, a submodule written exactly like a
+package (`import ..BonitoAgents` would become `import BonitoAgents`).
+`unit:app_platform` checks that every BonitoAgents name it uses is public, and
+defines a small app in its own module to run the whole interface from outside.
+
+Not built yet: loading app packages into the installed server (BonitoAgentsApp
+calls `serve` itself, so it would need a list of packages in its settings) and
+a shutdown hook for apps that own tasks.
+
+### The interface
+
+All of it dispatched on the app's type:
+
+```julia
+app_id(::Type{MyApp})  # required: a short lowercase word, the chat's `app` field
+app_title(app)         # what the app is called in the UI (default: the id)
+app_description(app)   # a few lines: its tile's details, its setup dialog
+app_icon(app)          # path of its logo file (square SVG/PNG), or nothing for a letter tile
+app_tools(app)         # Vector{AppTool}: the MCP tools it adds
+call_tool(app, Val(:name), call::AppCall) -> String | Dict   # one call of one of them
+chat_pane(app, view) -> DOM node(s)                          # its chat's open pane
+app_briefing(app)      # markdown, appended to its chat's system prompt
+app_allowed(app, user) # who may use it (default: admins)
+```
+
+### Its chat
+
+The app's chat is an ordinary chat: a project in a folder of its own on a
+worker (`<projects root>/bonitoagents-apps/<id>`), with an agent, a transcript
+and everything else a chat has. `ProjectInfo.app` marks it; it is persisted and
+never derived from the folder, like `dev_mode`. The dashboard shows each app as a
+tile (its logo, the details on hover); the first click opens a dialog that
+picks the worker and creates the chat, every later click opens it. The chat
+wears the app's logo as its icon; the sidebar pins app chats first, under
+"Apps". "Continue on" carries the mark, and
+`app_chat` takes the newest chat with it.
+
+### Its pane is DOM it returns
+
+Opening an app's chat renders `chat_pane(app, view)` instead of the ordinary
+layout. The ordinary layout is the method for `nothing`, built from the chat's
+widgets, which are Bonito components (structs with `jsrender`) an app can place
+wherever it likes:
+
+| widget | what it is |
+| --- | --- |
+| `ChatHeader(view)` | title, session pills, menu, lens bar |
+| `ChatNotice(view)` | the provider's warnings |
+| `ChatTranscript(view)` | the messages with their rail, busy line and taskbar |
+| `ChatComposer(view)` | the composer |
+| `ChatToolbar()` | the row under the composer |
+
+`view` is the tab's copy of the chat's model. Whatever the app returns (one
+node or a tuple) goes into the chat's root (`.bt-app[data-app=<id>]`, a flex
+column filling the pane), which is what ties the widgets to the chat: the
+chat's browser code finds the composer, lens bar and taskbar by searching the
+root from the message list. So each widget can appear once per pane, nested as
+deep as the layout wants, and the pane needs no other glue. The app's own parts
+are components too: the To-do list is `TodoPanel(app, view)`, whose `jsrender`
+maps the shared list into the tab's session (`map(f, session, app.todos)`) and
+hands it, as data, to an ES6 module that draws it and sends the user's actions
+back on one Observable.
+
+### MCP extensions
+
+`app_tools` adds tools to the agents' MCP. An `AppTool` has a name, a
+description, a `NamedTuple` of typed `Param`s and a `ToolScope`. The JSON schema
+is made from the parameters, and a call's arguments arrive checked and
+converted (`call.args.todo_id::Int`), so a tool's types are written once.
+Scopes are types: `EveryChat()`, `AppChat()` (the app's own chat), or one an
+app defines with a method of `in_scope(scope, app, chat)`.
+
+BonitoMCP has no copy of the tools: on `tools/list` it asks the server
+(`app_tools` over the chat's control channel), and a `tools/call` for a name
+that isn't one of its own goes to the server (`app_call`), which runs
+`call_tool` with the calling chat known from the channel. A name the chat may
+not see is the same unknown tool as a name nobody has. `AppError` is a request
+the app cannot do as asked; the agent gets its message and the server log does
+not. Code: `BonitoMCP/src/tools/app_tools.jl`, the ops in `apps.jl`.
+
+### What apps can do with the server
+
+`start_chat!` (a chat in a folder on a worker, owned by someone, with a first
+prompt), `chat_folders` and `find_worker` (where a user's chats run, what they
+may use), `chat_title`, `app_chat`, `caller_user` (whose chat called a tool);
+from the pane `show_chat!` and `send_message!`; and `atomic_write_json` /
+`load_json_tolerant` for the app's own files (typed: `load_json_tolerant(file,
+label, MyState)`).
+
+### The To-do app
+
+`BonitoAgents/src/apps/BonitoTodo/` (the module and its browser code,
+`todo.js`). One list for the whole server, saved to
+`<state_dir>/apps/todo/todos.json` on every change. Ids are never reused.
+
+- Every chat's agent: `todo_list`, `todo_add`, `todo_done` (with a note). The
+  list records which chat added or checked off an item.
+- The app chat's agent also: `todo_remove`, `todo_projects` (the folders the
+  user's chats run in, newest activity first, with their chats' titles) and
+  `todo_start_chat` (a new chat in one of them, with a prompt; the chat is told
+  which item it works on and is linked from it).
+- The pane is the ordinary chat with the list pinned between the header and the
+  messages: add, check off, edit (double click), remove, open a linked chat,
+  and "Start chat", which asks the app chat's agent in the user's name.
+
+Tests: `unit:todo_app` (the list, persistence, who sees which tool),
+`unit:app_platform` (an outside app, parameters, scopes, public names only),
+`unit:mcp_ctrl` (the tools over the real control channel), `e2e:todo_app`.
+
+## Workflow apps
+
+A workflow app is a small Julia package that implements a workflow: code, agent
+calls, and a live UI pinned into a chat. Apps are ordinary packages, so they are
 versioned, testable, `Pkg.add`-able, and registrable in General.
 
 BonitoAgents provides three hooks and nothing more:

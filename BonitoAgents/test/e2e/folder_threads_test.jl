@@ -3,8 +3,8 @@
 # discover scan (state.discovered) and closes a chat, both of which would
 # pollute a shared soak server's dashboard for neighbouring suites — so it gets
 # its own throwaway dev_server + browser, torn down at the end.
-@testitem "e2e:folder_threads" tags = [:e2e] begin
-    include(joinpath(@__DIR__, "..", "testkit", "TestKit.jl"))
+@testitem "e2e:folder_threads" setup = [SharedServer] tags = [:e2e] begin
+    const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "folder_threads.jl"))
     server = TestKit.dev_server()
     try

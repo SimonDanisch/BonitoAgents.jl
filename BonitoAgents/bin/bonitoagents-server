@@ -3,12 +3,12 @@
 #
 # Thin wrapper around `julia --project=<monorepo root> -m BonitoAgents`. All flags
 # are passed straight through; everything has a baked-in default (port 8038,
-# host 0.0.0.0) and the worker secret is generated + persisted in the state dir
-# on first run, so no env vars are required:
+# localhost only), so no env vars are required. A `proxy.json` in the state dir,
+# written by install_server.sh, puts it behind Caddy + Authelia:
 #
 #   bonitoagents-server                         # defaults
 #   bonitoagents-server --port 8080
-#   bonitoagents-server --public-url https://team.example.com --state-dir /var/lib/bonitoagents/state
+#   bonitoagents-server --state-dir /var/lib/bonitoagents/state
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -26,8 +26,12 @@ for JULIAUP_BIN in \
     [[ -d "$JULIAUP_BIN" ]] && export PATH="$JULIAUP_BIN:$PATH"
 done
 
+# A few threads, not one per core: the server waits on sockets far more than it
+# computes, and every idle thread spins up on each wakeup to look for work. On
+# the same agent stream, a 32-thread worker spent 20 times the CPU of a 2-thread
+# one; the server's 42 threads paid that tax on every message.
 exec julia \
     "--project=${PROJECT_DIR}" \
     --startup-file=no \
-    --threads=auto \
+    --threads=4 \
     -m BonitoAgents "$@"

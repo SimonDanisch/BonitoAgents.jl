@@ -8,6 +8,12 @@ using BonitoWorker
 import AgentProviders
 const BW = BonitoWorker
 
+# `Pkg.test` runs this process with `JULIA_LOAD_PATH="@:<testdir>"` (no
+# `@stdlib`), and every julia the tests start (the worker, the debug checkout's
+# `Pkg.develop`) would inherit it. Nothing sets it in production; removing it
+# restores those conditions. Our own `LOAD_PATH` was read at startup and stays.
+delete!(ENV, "JULIA_LOAD_PATH")
+
 # A WebSocket stand-in that drops sends — handle_* helpers write their JSON
 # response to the WS, which the unit tests don't need to read. Reach the
 # exact `send` the worker calls (`HTTP.WebSockets.send`) through the module
@@ -237,6 +243,34 @@ end
         @test BW.scan_acp_providers() == Dict{String,Any}[]
     end
     AgentProviders.refresh_providers!()
+
+    # An agent that never answers costs the scan its deadline, not more, and the
+    # others' sessions still come back: asked one after another with 20 s per
+    # request, a slow agent ran the scan past the server's 15 s, and the worker
+    # card showed no projects at all.
+    mktempdir() do dir
+        silent = joinpath(dir, "silent"); fast = joinpath(dir, "fast")
+        write(silent, "#!/bin/sh\nexec sleep 60\n")
+        write(fast, """
+            #!/bin/sh
+            while IFS= read -r line; do
+              case "\$line" in
+                *'"initialize"'*) echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"list":{}}}}}' ;;
+                *'"session/list"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"sessions":[{"sessionId":"s1","cwd":"/tmp","title":"hi","updatedAt":"2026-09-30T10:00:00Z"}]}}' ;;
+              esac
+            done
+            """)
+        chmod(silent, 0o755); chmod(fast, 0o755)
+        withenv("KIMI_AGENT_ACP" => silent, "MIMO_AGENT_ACP" => silent,
+                "OPENCODE_AGENT_ACP" => fast, "CODEX_AGENT_ACP" => "/nonexistent/codex-acp") do
+            AgentProviders.refresh_providers!()
+            rows = nothing
+            t = @elapsed rows = BW.scan_acp_providers(; timeout = 2.0)
+            @test t < 5.0                    # two silent agents, in parallel: ~2 s
+            @test [(r["provider"], r["session_id"]) for r in rows] == [("OpenCode", "s1")]
+        end
+    end
+    AgentProviders.refresh_providers!()
 end
 
 @testset "pidfile singleton guard" begin
@@ -288,6 +322,74 @@ end
     end
 end
 
+# A crash is told from a stop by the pidfile a run leaves behind: removed by a
+# normal exit and by whoever stops the worker on purpose (this module, the
+# systemd unit's ExecStop), left by anything that kills it outright. Real
+# processes and real signals.
+@testset "a crashed run is told from a stopped one" begin
+    mktempdir() do dir
+        pf = joinpath(dir, "worker.pid")
+        booted = BW.boot_time()
+        @test 0 < time() - booted < 400 * 24 * 3600
+        @test BW.crashed_instance(pf) == ""                      # no file
+        BW.claim_pidfile!(pf; instance = "live-run")
+        @test BW.pidfile_instance(pf) == "live-run"
+        @test BW.pidfile_boot(pf) ≈ booted atol = 1
+        @test BW.crashed_instance(pf) == ""                      # our own, live
+        write(pf, "1\njulia\nother-run\n$(booted)\n")
+        @test BW.crashed_instance(pf) == ""                      # another, live (pid 1)
+        write(pf, "999999\njulia\n")
+        @test BW.crashed_instance(pf) == ""                      # dead, from before runs had ids
+        write(pf, "999999\njulia\ngone-run\n")
+        @test BW.crashed_instance(pf) == ""                      # dead, boot unknown
+        write(pf, "999999\njulia\ngone-run\n$(booted - 3600)\n")
+        @test BW.crashed_instance(pf) == ""                      # ended with an earlier boot
+        write(pf, "999999\njulia\ngone-run\n$(booted)\n")
+        @test BW.crashed_instance(pf) == "gone-run"
+        rm(pf)
+
+        # The worker's own claim, in a process of its own that is then killed.
+        project = dirname(something(Base.active_project()))
+        function start_claimed(tag)
+            rm(pf; force = true)
+            script = "using BonitoWorker; BonitoWorker.claim_pidfile!($(repr(pf)); instance = \"$(tag)\"); " *
+                     "println(\"ready\"); flush(stdout); sleep(120)"
+            # stderr away: an abort or segfault prints the runtime's crash report.
+            p = open(pipeline(`$(Base.julia_cmd()) --startup-file=no --project=$(project) -e $(script)`;
+                              stderr = devnull), "r")
+            @test readline(p) == "ready"
+            return p
+        end
+        function killed(sig)
+            p = start_claimed("run-$(sig)")
+            ccall(:kill, Cint, (Cint, Cint), getpid(p), sig)
+            wait(p)
+            return BW.crashed_instance(pf)
+        end
+        if Sys.isunix()
+            @test killed(9) == "run-9"                            # SIGKILL, an OOM kill
+            @test killed(6) == "run-6"                            # abort
+            @test killed(11) == "run-11"                          # segfault
+            # The unit's ExecStop, as systemd runs it (`$$` is its literal `$`):
+            # while the worker runs, the stop removes the pidfile; after a crash
+            # (the pid gone) it leaves it.
+            line = BW.service_exec_stop(pf)
+            @test occursin("ExecStop=", BW.render_service_unit(; projects_root = "/tmp"))
+            cmd = replace(line, "ExecStop=/bin/sh -c '" => "", "\$\$" => "\$")
+            cmd = cmd[1:end-1]                                      # the closing quote
+            p = start_claimed("run-stopped")
+            run(`/bin/sh -c $(cmd)`)
+            @test !isfile(pf)
+            kill(p, Base.SIGKILL); wait(p)
+            @test BW.crashed_instance(pf) == ""                   # killed after the stop: not a crash
+            p = start_claimed("run-crashed")
+            kill(p, Base.SIGKILL); wait(p)
+            run(`/bin/sh -c $(cmd)`)                              # systemd runs it after a crash too
+            @test BW.crashed_instance(pf) == "run-crashed"
+        end
+    end
+end
+
 # The bug: `juliaup default 1.13`, install; trouble; `juliaup default 1.12`,
 # re-install — and the 1.13 worker (with the 1.13 BonitoMCP launch command it
 # had told the server about) stayed up, because "did the code change" was the
@@ -312,13 +414,17 @@ end
 # touch the real user systemd). render_service_unit is a pure string builder;
 # decide_run_mode is the pure answer→mode map factored out of the tty IO.
 @testset "service unit rendering" begin
-    u = BW.render_service_unit(; julia = "/opt/julia/bin/julia",
-                                 projects_root = "/home/u/projs",
+    u = BW.render_service_unit(; projects_root = "/home/u/projs",
                                  memory_max = "80%",
                                  path_env = "/usr/bin:/home/u/.local/bin")
-    # ExecStart launches start() in the shared env.
-    @test occursin("ExecStart=/opt/julia/bin/julia --project=@bonito-agents", u)
+    # ExecStart launches start() in the shared env, on the `julia` the unit's
+    # PATH holds (systemd itself does not search that PATH, `env` does).
+    @test occursin("ExecStart=/usr/bin/env julia --project=@bonito-agents", u)
     @test occursin("BonitoWorker.start()", u)
+    # Its own thread count, never the shell's JULIA_NUM_THREADS: a relay's idle
+    # threads only spin (32 of them cost 20x the CPU of 2 on the same stream).
+    @test occursin("--threads=2", u)
+    @test "--threads=2" in BW.worker_julia_args("@bonito-agents")
     # PATH is baked in (systemd --user doesn't inherit the shell PATH; without
     # this the worker can't find claude-agent-acp/node/git at runtime).
     @test occursin("Environment=PATH=/usr/bin:/home/u/.local/bin", u)
@@ -329,77 +435,29 @@ end
     @test occursin("WorkingDirectory=/home/u/projs", u)
     # Pure: identical inputs → byte-identical output (so install can diff for
     # idempotency — only rewrite+reload when the unit actually changed).
-    @test u == BW.render_service_unit(; julia = "/opt/julia/bin/julia",
-                                        projects_root = "/home/u/projs",
+    @test u == BW.render_service_unit(; projects_root = "/home/u/projs",
                                         memory_max = "80%",
                                         path_env = "/usr/bin:/home/u/.local/bin")
 end
 
-# Which julia the worker launches its own processes with — the systemd unit, a
-# respawn, and the BonitoMCP server claude-agent-acp starts per chat. All three
-# used to bake `Sys.BINDIR`, which under juliaup is a VERSION-specific directory
-# the next `juliaup update` deletes — systemd then restart-loops on a missing
-# binary until someone re-runs the installer, with the worker absent throughout
-# (41 failed EXECs in 2.5 minutes, observed), and every new chat's `bt_*` tools
-# fail to start until the worker is restarted.
-@testset "julia launcher" begin
-    channel = BW.julia_channel()
-    # A CHANNEL, not a patch version: juliaup registers `1.12`, so `+1.12.7` is
-    # rejected with "not installed" while `+1.12` follows the channel forward.
-    @test occursin(r"^\d+\.\d+$", channel)
-    @test channel == "$(VERSION.major).$(VERSION.minor)"
-
-    # The probe is the whole safety of this: writing a launch command we never
-    # ran is the mistake being undone here, and a wrong one stays invisible until
-    # the next restart.
-    @test BW.launcher_resolves_here("/nonexistent/julia-xyz", channel) === false
-    # Exists and is executable, but is not a launcher — exits 0 and prints the
-    # wrong thing, so the BINDIR comparison is what rejects it, not the status.
-    Sys.isunix() && @test BW.launcher_resolves_here("/bin/echo", channel) === false
-    # The version-pinned binary we are RUNNING is not a launcher either: a plain
-    # julia reads `+1.12` as a script name and exits non-zero. Important, or the
-    # fallback would dress the old pinned path up as a fixed one.
-    @test BW.launcher_resolves_here(BW.julia_bin(), channel) === false
-    # A launcher asked for a channel that isn't registered must not pass.
-    for exe in BW.juliaup_launcher_candidates()
-        isfile(exe) && @test BW.launcher_resolves_here(exe, "0.1") === false
-    end
-
-    launcher = BW.julia_launcher()
-    exe  = BW.mcp_exe(launcher)
-    args = BW.mcp_args(launcher)
-    @test isfile(exe)
-    if launcher.exec == [BW.julia_bin()]
-        # No launcher on this machine (a plain install). That is the documented
-        # fallback and it does not have the problem either — nothing deletes a
-        # plain install's bindir out from under it.
-        @test startswith(args[1], "--project=")
-    else
-        # A launcher was found AND probed. It must be pinned to the channel,
-        # otherwise `juliaup default <other>` silently moves the worker onto a
-        # different Julia — the failure mode a bare launcher trades for.
-        @test launcher.exec == [exe, "+" * channel]
-        # And it must NOT be the version-specific path, which is the whole point.
-        @test exe != BW.julia_bin()
-        @test !occursin(string(VERSION), exe)
-        # The pin rides FIRST in the MCP argv — julialauncher only reads it there.
-        @test args[1] == "+" * channel
-        @test startswith(args[2], "--project=")
-    end
+# Which julia the worker launches its own processes with: the systemd unit, a
+# respawn, the debug checkout's `Pkg.develop` and the BonitoMCP server
+# claude-agent-acp starts per chat. Always the `julia` on PATH, looked up when the
+# process starts. A baked path or version breaks the day a package manager or
+# juliaup moves it: a system update removed `/usr/bin/julia`, the unit
+# restart-looped on it and no new chat got its `bt_*` tools.
+@testset "julia comes from PATH, never a baked path or version" begin
+    args = BW.mcp_args()
+    @test startswith(args[1], "--project=")
     @test args[end-1:end] == ["-e", "using BonitoMCP; BonitoMCP.run_stdio()"]
-
-    # The composed command — command + argv exactly as the MCP config carries
-    # them, minus the `-e` payload — has to land on THIS julia. The probe checked
-    # `exe +channel` alone; this checks what actually gets exec'd.
-    bindir = read(`$(exe) $(args[1:end-2]) -e $("print(Sys.BINDIR)")`, String)
-    @test strip(bindir) == Sys.BINDIR
-
-    # The unit execs the same thing, as text.
-    cmd = BW.service_julia_cmd()
-    @test cmd == join(launcher.exec, ' ')
-    @test occursin("ExecStart=$(cmd) --project=@bonito-agents",
-                   BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%",
-                                            path_env = "/usr/bin"))
+    @test !any(a -> startswith(a, "+"), args)            # no channel pin
+    @test !any(a -> occursin(Sys.BINDIR, a), args)       # no version-specific path
+    unit = BW.render_service_unit(; projects_root = "/tmp", memory_max = "80%", path_env = "/usr/bin")
+    @test !occursin(Sys.BINDIR, unit)
+    # What the MCP config carries runs: `julia` from PATH with exactly these args.
+    if Sys.which("julia") !== nothing
+        @test success(`julia $(args[1:end-2]) -e 'exit(0)'`)
+    end
 end
 
 # ── the debug checkout: BonitoAgents' source, on this worker ─────────────────
@@ -642,6 +700,102 @@ end
     @test !BW.update_needed(Dict{String,Any}("auto_update" => true), newer)
 end
 
+# The server's worker card shows each step of an update, so nobody has to guess
+# whether to act, wait, or read a log: every step goes out over the control
+# channel served now, a new link hears the current step again (the server rebuilt
+# the card from the hello alone), and the last one ("restarting") is delivered
+# before the process goes. Never runs an install: `update_packages!` would change
+# the real @bonito-agents environment.
+@testset "update steps reach the server" begin
+    WL = BW.WorkerLink
+    w = BW.Worker(BW.WorkerConfig(; server_url = "http://127.0.0.1:1",
+        worker_id = "update-status-test", name = "upd", mcp_command = "julia",
+        mcp_arguments = String[], projects_root = mktempdir(),
+        update_config = Dict{String,Any}("auto_update" => false)))
+    # No link yet: kept for the next one, and the log says so.
+    @test_logs (:info, r"kept for the next link") BW.report_update!(w, "waiting"; busy = 2)
+    @test (w.update.status, w.update.busy) == ("waiting", 2)
+    since = w.update.since
+
+    ct, st = WL.memory_pair()
+    server_task = Threads.@spawn begin
+        h = WL.read_hello(st)
+        server = WL.Link(:server; id = h.link_id)
+        WL.welcome!(server, st, h, UInt8[]; resumed = false)
+        server
+    end
+    WL.connect!(w.link, ct, UInt8[])
+    server = fetch(server_task)
+    s0 = WL.control_channel(server)
+    next_frame() = BW.MsgPack.unpack(BW.WebSockets.receive(s0))
+    command(d) = BW.WebSockets.send(s0, BW.MsgPack.pack(d))
+
+    # A new link hears the step again, with how long it has been at it.
+    BW.connected!(w, Dict{String,Any}("registered_as" => "upd", "update_spec" => nothing))
+    f = next_frame()
+    @test (f["type"], f["status"], f["busy"]) == ("update_status", "waiting", 2)
+    @test f["elapsed"] >= 0
+    # The same step keeps its start, a new one starts the clock again.
+    BW.report_update!(w, "waiting"; busy = 1)
+    @test w.update.since == since
+    @test next_frame()["busy"] == 1
+    BW.report_update!(w, "installing")
+    @test w.update.since >= since
+    @test next_frame()["status"] == "installing"
+
+    # "Update now" while an install runs: the one under way answers with its step.
+    spec = Dict("repo" => "https://example.test/agents.git", "rev" => "main", "source_id" => "abc123",
+                "bonito_url" => "https://example.test/bonito.git", "bonito_rev" => "master")
+    blocker = Base.Channel{Nothing}(1)
+    lock(w.lock) do
+        w.update.task = @async take!(blocker)
+        w.update.pending = true
+    end
+    command(Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
+    @test next_frame()["status"] == "installing"
+    put!(blocker, nothing)
+    lock(() -> (w.update.pending = false), w.lock)
+    # A request naming no build says so, instead of leaving the card waiting.
+    command(Dict("type" => "force_update", "immediate" => true, "update_spec" => nothing))
+    f = next_frame()
+    @test f["status"] == "failed"
+    @test occursin("no build", f["error"])
+
+    # The last step before the process goes: delivered, not merely queued.
+    BW.report_update!(w, "restarting")
+    @test flush(w.link; timeout = 5)
+    @test next_frame()["status"] == "restarting"
+    close(w)
+    WL.kill!(server, "done")
+end
+
+# A file piece is one msgpack bin. Without Bonito loaded (as on every worker)
+# a `Vector{UInt8}` packed as an array of 262144 numbers, which the server took
+# 49 ms and 4.5 MB of garbage to decode per piece: images loaded at 5 MB/s.
+struct CaptureWS
+    frames::Vector{Any}
+end
+BonitoWorker.WebSockets.send(ws::CaptureWS, x) = push!(ws.frames, x)
+
+@testset "file pieces are sent as bytes" begin
+    @test all(id -> id.name != "Bonito", keys(Base.loaded_modules))
+    mktempdir() do dir
+        path = joinpath(dir, "photo.jpg")
+        data = rand(UInt8, 2 * BW.FILE_RANGE_BYTES)
+        write(path, data)
+        ws = CaptureWS(Any[])
+        start, count = 1000, BW.FILE_RANGE_BYTES
+        BW.handle_read_file_range(ws, Dict{String,Any}("request_id" => "r1", "path" => path,
+                                                       "start" => start, "count" => count))
+        frame = only(ws.frames)
+        @test length(frame) < count + 100
+        reply = BW.decode_control(frame)
+        @test reply["data"] isa Vector{UInt8}
+        @test reply["data"] == data[(start + 1):(start + count)]
+        @test !haskey(reply, "error")
+    end
+end
+
 # ── file_writer_pids / kill_file_writers (background-shell stop) ────────────
 # The direct stop for a background bash: the shell holds its `>> output`
 # redirect open until it exits, so the file's writers ARE the shell. Linux
@@ -681,10 +835,22 @@ end  # BonitoWorker
 # Stability regressions (M1 clone_repo data-loss guard, M8/M12/M13). Pure unit
 # tests — no subprocess, no network.
 include("test_stability.jl")
+include("test_logging.jl")
 
 # Agent subprocess reaping (process group + startup stray sweep). Spawns
 # short-lived `sleep`/`bash` children only — no agent, no network.
 include("test_agent_reaping.jl")
+
+# A background task's output followed for the server: streamed bytes, the end
+# from the writer's close. Real writer processes over a memory link pair.
+include("test_file_watch.jl")
+
+# The thinking-progress patch on claude-agent-acp, against a fixture of its code.
+include("test_adapter_patches.jl")
+
+# The managed agent adapters, installed for real from nodejs.org and npm into a
+# cache, then started and asked for an ACP initialize. Skipped without a network.
+include("test_managed_adapters.jl")
 
 # Real-agent integration test — separate file because it boots a subprocess
 # and stands up an HTTP+WS server. Skipped automatically when

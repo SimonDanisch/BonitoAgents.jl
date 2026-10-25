@@ -1,0 +1,114 @@
+{
+  "date": "2026-10-06",
+  "route": "Desktop 192.168.178.28 -> Bosgame 192.168.178.59, direct LAN WorkerLink over WebSocket",
+  "julia": "1.12.7",
+  "http": "2.8.0",
+  "samples": {
+    "large_legacy": [
+      {
+        "allocated_mib": 624.8131637573242,
+        "gc_seconds": 0.12405211,
+        "seconds": 0.907143472,
+        "mib_s": 70.55113328313737,
+        "verified": true
+      },
+      {
+        "allocated_mib": 624.8139877319336,
+        "gc_seconds": 0.137848907,
+        "seconds": 0.933026972,
+        "mib_s": 68.59394414162767,
+        "verified": true
+      },
+      {
+        "allocated_mib": 624.814079284668,
+        "gc_seconds": 0.107368191,
+        "seconds": 0.923931214,
+        "mib_s": 69.26922592313241,
+        "verified": true
+      }
+    ],
+    "small_legacy": [
+      {
+        "allocated_mib": 108.67438507080078,
+        "gc_seconds": 0.004333242,
+        "seconds": 0.698447685,
+        "mib_s": 1.431746459292796,
+        "verified": true
+      },
+      {
+        "allocated_mib": 108.67530059814453,
+        "gc_seconds": 0.013283117,
+        "seconds": 0.732815284,
+        "mib_s": 1.3646003595088774,
+        "verified": true
+      },
+      {
+        "allocated_mib": 108.67534637451172,
+        "gc_seconds": 0.008507033,
+        "seconds": 0.763119619,
+        "mib_s": 1.3104105504591934,
+        "verified": true
+      }
+    ],
+    "small_streamed": [
+      {
+        "allocated_mib": 10.833793640136719,
+        "gc_seconds": 0.0,
+        "seconds": 0.016883582,
+        "mib_s": 59.2291375135916,
+        "verified": true
+      },
+      {
+        "allocated_mib": 10.835380554199219,
+        "gc_seconds": 0.0,
+        "seconds": 0.023888075,
+        "mib_s": 41.86189134118174,
+        "verified": true
+      },
+      {
+        "allocated_mib": 10.8253173828125,
+        "gc_seconds": 0.004590234,
+        "seconds": 0.054205735,
+        "mib_s": 18.448232461011738,
+        "verified": true
+      }
+    ],
+    "large_streamed": [
+      {
+        "allocated_mib": 249.80127716064453,
+        "gc_seconds": 0.05624499,
+        "seconds": 0.645444868,
+        "mib_s": 99.15641625335535,
+        "verified": true
+      },
+      {
+        "allocated_mib": 249.8022689819336,
+        "gc_seconds": 0.06497329,
+        "seconds": 0.722306976,
+        "mib_s": 88.60498669751183,
+        "verified": true
+      },
+      {
+        "allocated_mib": 249.8017807006836,
+        "gc_seconds": 0.036033025,
+        "seconds": 0.669457667,
+        "mib_s": 95.59977150877862,
+        "verified": true
+      }
+    ]
+  },
+  "methodology": {
+    "runs": 3,
+    "warmups_per_case": 1,
+    "large": "one 64 MiB file",
+    "small": "256 files of 4 KiB",
+    "legacy": "updated code with streaming=false, retains legacy whole-file delta and per-file ACK protocol",
+    "streamed": "updated code with streaming=true",
+    "timing": "send_directory through receiver completion; excludes connection setup and SHA verification; fresh destinations; OS page cache, no fsync",
+    "verification": "tree SHA256 matched every run",
+    "allocations": "cumulative sender Julia allocations, NOT peak RSS",
+    "scope": "direct transport microbenchmark; excludes live Mini-Server TLS, proxy, relay and MCP overhead",
+    "isolation": "temporary source copies and existing pinned dependency manifests; production processes unchanged",
+    "payload": "deterministic pseudo-random block repeated in large file, same seeded block for small files; no compression"
+  }
+}

@@ -2,8 +2,8 @@
 # pending RPCs, etc.) lives in `state.jl::ServerState`; every public function
 # in this file takes a `state::ServerState` argument as its first parameter.
 # Worker registration is handled in worker_client.jl when the worker dials
-# the server's /worker-ws endpoint. Liveness comes from the WS itself; no
-# periodic probing or heartbeat task.
+# the server's /w endpoint. Liveness comes from the worker's link; no
+# periodic probing here.
 
 # Project lock
 """
@@ -15,15 +15,20 @@ The claim is persisted to projects.json so it survives a server restart,
 and the matching project card shows a "locked by …" badge in the UI.
 """
 function claim_project!(state::ServerState, p::ProjectInfo, worker_id::String)
-    lock(state.lock) do
+    # Every chat open lands here. When the worker holds the claim already, the
+    # usual case, nothing changes: rewriting projects.json and re-rendering the
+    # project list in every tab (53 messages per tab) was pure cost per open.
+    changed = lock(state.lock) do
         if p.locked_by !== nothing && p.locked_by != worker_id
             error("Project '$(p.name)' is claimed by worker '$(p.locked_by)'")
         end
+        p.locked_by == worker_id && return false
         p.locked_by = worker_id
         p.locked_at = now(UTC)
         save_projects!(state)
+        return true
     end
-    notify_projects!(state)
+    changed && notify_projects!(state)
     return p
 end
 
@@ -38,7 +43,7 @@ function release_project!(state::ServerState, p::ProjectInfo)
 end
 
 # Release every project claim held by `worker_id` (called from
-# handle_worker_control's finally branch when the WS drops). Snapshot the
+# `teardown_worker!` when the worker's link dies). Snapshot the
 # matching projects under the lock so we don't iterate `state.projects[]`
 # while a concurrent writer is mutating it; `release_project!` re-takes the
 # lock per project (reentrant, harmless).
@@ -196,7 +201,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     # scan reports the provider per row, so a resumed kimi thread comes back up
     # under kimi instead of the default.
     p.provider = provider
-    track_project!(state, p)
+    track_project!(state, p; new_chat = true)
 
     if sync
         @info "Pulling project from worker" worker=worker_name worker_path server_path
@@ -261,34 +266,17 @@ function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress
 end
 
 """
-    ensure_project_session!(state, p; target_worker="", progress=nothing) → ChatModel
+    ensure_project_session!(state, p; progress=nothing) → ChatModel
 
-Build (or return) the chat ChatModel for `p` running on `target_worker`.
+Build (or return) the chat ChatModel for `p` on the worker it belongs to:
+the cached model, or a new one claimed on that worker. Idempotent. A chat never
+changes workers; "Continue on <worker>" makes a new one (`continue_on!`).
 
-If `target_worker` is unset or matches the project's current `worker_id`,
-this is the fast path: returns the cached model or builds + claims on the
-current worker. Idempotent.
-
-If `target_worker` is a *different* online worker, this routes through
-`start!` to run the full transparent-move flow (pre-pull from current
-worker → push to target → re-bind → claim). The user-visible effect is
-"opening the chat on B"; the file shuffling underneath is bookkeeping.
-
-Called from project creation flows, worker reconnect, and the dashboard's
-"Open chat on <worker>" handler. The unified app's main panel pulls the
-cached model out of state.chat_models when the user selects this project
-in the sidebar.
+Called from project creation flows and worker reconnect. The unified app's main
+panel pulls the cached model out of state.chat_models when the user selects this
+project in the sidebar.
 """
-function ensure_project_session!(state::ServerState, p::ProjectInfo;
-                                  target_worker::AbstractString = "",
-                                  progress = nothing)
-    # When a target worker is specified that differs from the current
-    # owner, delegate to `start!` which handles the atomic move. The
-    # `start!` body updates `p.worker_id` and then calls back here with
-    # no `target_worker` — so we hit the fast path below on the way out.
-    if !isempty(target_worker) && String(target_worker) != p.worker_id
-        return start!(state, p, target_worker; progress = progress)
-    end
+function ensure_project_session!(state::ServerState, p::ProjectInfo; progress = nothing)
     # Funnel concurrent bring-ups for the SAME project through ONE in-flight
     # task (T1). Without this, two tabs opening the same project both pass the
     # unlocked `haskey(state.chat_models, p.id)` check (the cache write happens
@@ -376,8 +364,8 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # The worker reports its BonitoMCP launch as a `julia` binary (`mcp_path`)
     # plus an argv array (`mcp_args`) — no shell wrapper, so it's identical on
     # Windows. claude-agent-acp spawns `command + args` directly.
-    # `env` carries the eval-worker dial-back coordinates so BonitoMCP's eval
-    # session can connect back to the server for interactive app proxying.
+    # `env` carries the chat's identity; the worker adds its relay grant
+    # (BonitoWorker's `inject_mcp_grant`), the MCP's only way to the server.
     #
     # The server name must NOT collide with any MCP server the user has in their
     # global/project config: claude-agent-acp runs the agent with
@@ -388,7 +376,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     mcp = isempty(w.mcp_path) ? AgentClientProtocol.MCPServer[] :
         [AgentClientProtocol.MCPServer(INJECTED_MCP_NAME, w.mcp_path;
                                        args = w.mcp_args,
-                                       env  = eval_dialback_env(state, p.id))]
+                                       env  = mcp_env(state, p.id))]
 
     # The agent carries everything start! needs — the `resume_session_id` (so
     # bring-up uses session/load) and the agent this thread was last used with.
@@ -477,7 +465,9 @@ function maybe_resync_on_open!(state::ServerState, p::ProjectInfo, model)
     last = lock(() -> get(state.last_scan, p.worker_id, 0.0), state.lock)
     time() - last < RESCAN_ON_OPEN_AFTER && return nothing
     Base.errormonitor(@async try
-        scan_and_store!(state, p.worker_id)
+        # A Claude chat's session is in the session files: no agent needs to
+        # start for it. Another agent's is known only by asking the agents.
+        scan_and_store!(state, p.worker_id; agents = !(project_provider(p) isa ClaudeCodeAgent))
         # Re-ask now that the scan is current; bind only if it actually moved.
         session_advanced_since_sync(state, p) && restart_chat_session!(model)
     catch e
@@ -529,96 +519,86 @@ function stop_session!(state::ServerState, p::ProjectInfo)
         notify_chats!(state)   # drop from the active-chats sidebar
     end
     release_project!(state, p)
+    # A closed chat is not continued after a worker crash.
+    forget_interrupted_turn!(state, p.id)
     # The reaped claude subprocess takes its MCP server + eval worker with it, so
     # the eval bridge's worker session is gone — tear the bridge down explicitly
     # (a WS drop alone no longer does; its lifetime is the worker session).
     teardown_eval_bridge!(state, p.id)
-    # Its evals on OTHER workers end with it: those hosts serve this session only.
-    close_eval_hosts!(state, p.id)
+    # Every process it ran ends with it, on every worker: its eval hosts, and the
+    # Julia eval workers, which the kill of the agent's group does not reach.
+    end_chat_processes!(state, p.id)
     return nothing
 end
 
 """
-    transfer_project!(state, p, target_worker_id; progress=nothing)
+    continue_on!(state, p, target_worker_id; progress = nothing) -> ProjectInfo
 
-File-shuffling half of a project move. Pre-pulls from the current
-worker (if online), pushes the server's mirror to `target_worker_id`,
-then re-binds `p.worker_id` / `p.worker_path` / clears
-`resume_session_id`. Does NOT bring up a chat session — that's
-`ensure_project_session!`'s job. `start!` chains the two together.
+"Continue on <worker>": a NEW chat on `target_worker_id` that picks up where `p`
+is, with the agent's own record of the conversation (so it resumes with its
+memory) and the project's files as they are now. `p` is left alone: its session
+keeps running, and whatever it is doing finishes where it started.
 
-Split out from `start!` so the file-movement contract can be tested
-without standing up an ACP session.
+This used to MOVE the chat: stop its session, re-bind it to the target, start it
+there. A move that took a while left the user chatting in a chat that was about
+to change machines under them, and afterwards it ran on the target while tools
+and background tasks it had started kept running on the source.
+
+The conversation is carried first, at a turn boundary (the caller refuses while
+a turn runs), and the files after, so chatting on in `p` meanwhile changes
+neither what the new chat remembers nor where `p` runs.
 """
-function transfer_project!(state::ServerState, p::ProjectInfo,
-                            target_worker_id::AbstractString;
-                            progress = nothing)
+function continue_on!(state::ServerState, p::ProjectInfo, target_worker_id::AbstractString;
+                      progress = nothing)
     target_id = String(target_worker_id)
-    haskey(state.workers[], target_id) ||
-        error("Unknown worker: $target_id")
-    target_w = state.workers[][target_id]
-    isopen(target_w) ||
-        error("Worker '$(target_w.name)' is offline")
-    target_id == p.worker_id && return p   # no-op
-
+    target_w = get(state.workers[], target_id, nothing)
+    target_w === nothing && error("Unknown worker: $(target_id)")
+    isopen(target_w) || error("Worker '$(target_w.name)' is offline")
+    target_id == p.worker_id && error("$(p.name) already runs on $(target_w.name)")
+    source_online = haskey(state.workers[], p.worker_id) && isopen(state.workers[][p.worker_id])
+    # With the source offline only the server's mirror can be pushed. A project
+    # registered without a sync has an EMPTY mirror; pushing that once emptied a
+    # live folder at the target (2026-09-15). Refuse before anything moves.
+    source_online || p.last_sync_at !== nothing ||
+        error("Cannot continue $(p.name) on $(target_w.name): its worker is offline and the server " *
+              "holds no copy of it (never synced). Bring the worker online, or sync the project first.")
     target_path = worker_join(target_w.projects_root, p.name)
-    notify_progress(progress, :phase,
-        (msg = "Stopping session on $(p.worker_id)…",))
-    stop_session!(state, p)
 
-    # Pre-pull: if the source worker is online, capture its latest
-    # filesystem state into the server's mirror BEFORE we push. Without
-    # this, any edits made on the source worker in an external editor
-    # since the last "Sync to server" would be silently lost on the move.
-    source_online = haskey(state.workers[], p.worker_id) &&
-                    isopen(state.workers[][p.worker_id])
+    carried = carry_session!(state, p, target_w, target_path; progress)
+
     if source_online
         source_name = state.workers[][p.worker_id].name
-        notify_progress(progress, :phase,
-            (msg = "Pulling latest from $(source_name)…",))
+        notify_progress(progress, :phase, (msg = "Pulling the files from $(source_name)…",))
         try
             sync_project_to_server!(state, p; on_progress = progress)
         catch e
-            # Stale-mirror fallback: prefer continuing the move with
-            # whatever the server has over aborting. Surfaced as a warning
-            # so the user can see they were on the optimistic path.
-            @warn "pre-pull from source worker failed; continuing with server's existing mirror" project=p.name source=p.worker_id exception=e
+            e isa InterruptException && rethrow()
+            # A mirror synced before is still worth pushing; none at all is not.
+            p.last_sync_at === nothing && rethrow()
+            @warn "pulling from the source worker failed; continuing from the server's copy" project = p.name source = p.worker_id exception = e
         end
-    else
-        # The mirror is the only copy we can push. It must BE a copy: a project
-        # registered without a sync has an empty mirror, and pushing that used
-        # to arrive at the target with mirror semantics and delete every file
-        # of a live project there (2026-09-15). Refuse rather than guess.
-        p.last_sync_at === nothing &&
-            error("Cannot move $(p.name): its worker is offline and the server holds no copy " *
-                  "of it (never synced). Bring the worker online, or sync the project to the server first.")
-        @info "source worker offline; moving from server's existing mirror" project=p.name source=p.worker_id target=target_id last_sync_at=p.last_sync_at
     end
+    notify_progress(progress, :phase, (msg = "Pushing the files to $(target_w.name)…",))
+    # Additive: whatever already sits at the target path stays.
+    sync_dir_to_worker!(state, target_id, p.server_path, target_path; on_progress = progress)
 
-    notify_progress(progress, :phase,
-        (msg = "Pushing $(p.name) → $(target_w.name)…",))
-    # The push is additive: whatever already sits at the target path stays. A
-    # move never empties a folder it did not fill.
-    sync_dir_to_worker!(state, target_id, p.server_path, target_path;
-                         on_progress = progress)
-
-    # The agent's own record of the conversation travels too, so the session
-    # resumes on the target with its memory intact. When it can't (nothing to
-    # carry, a provider whose record we can't move, the source offline, or a
-    # failed transport) the chat continues with a fresh agent session and the
-    # server-side history stays visible — `resume_session_id` is cleared so the
-    # target's agent isn't asked to load a session it never saw.
-    carried = carry_session!(state, p, target_w, target_path; progress)
-
-    # Re-bind. Persistent state is written before we return so a server crash
-    # mid-`start!` (between this point and ensure_project_session!) doesn't
-    # leave projects.json disagreeing with the bytes on disk.
-    p.worker_id          = target_id
-    p.worker_path        = target_path
-    carried || (p.resume_session_id = nothing)
-    save_projects!(state)
-    notify_projects!(state)
-    return p
+    # The new chat. A folder the target already has a chat in shares that
+    # chat's server mirror; otherwise it gets its own, empty until it is synced,
+    # like a chat opened on a worker's folder (never a second full copy).
+    sibling = find_project_by_location(state, target_id, target_path)
+    new_id = string(uuid4())[1:8]
+    server_path = sibling !== nothing ? sibling.server_path :
+        (base = joinpath(state.working_dir, p.name); ispath(base) ? "$(base)-$(new_id)" : base)
+    new_p = ProjectInfo(new_id, p.name, target_id, server_path, target_path, now(UTC))
+    new_p.resume_session_id = carried ? p.resume_session_id : nothing
+    new_p.provider = p.provider
+    new_p.desired_config = copy(p.desired_config)
+    new_p.title[] = p.title[]
+    # An app's chat continues as the app's chat (`app_chat` takes the newest).
+    new_p.app = p.app
+    add_project!(state, new_p; new_chat = false)
+    @info "chat continued on another worker" source = p.id new = new_id target = target_w.name carried
+    return new_p
 end
 
 """
@@ -685,37 +665,6 @@ function carry_session!(state::ServerState, p::ProjectInfo, target_w::WorkerInfo
         @warn "could not remove the staged conversation on the source worker" source = src_w.name staging = staging_src exception = e
     end
     return carried
-end
-
-"""
-    start!(state, p, worker_id; progress=nothing) → ChatModel
-
-Bring up `p`'s chat session on `worker_id`, transparently re-syncing
-through the server. The server is the source of truth; workers are
-caches that may drift between sessions (the user might edit files in
-their own editor on the worker's filesystem outside BonitoAgents).
-
-If `worker_id == p.worker_id` this is just `ensure_project_session!`.
-
-Otherwise: `transfer_project!` does the atomic file-move (pre-pull
-from source → push to target → re-bind), then a fresh session boots
-on the target.
-
-Failure semantics: if any step before `transfer_project!`'s re-bind
-fails, `worker_id` is NOT flipped — the project remains bound to the
-source. The error propagates to the caller (the dashboard's open-on
-handler renders it in the error banner).
-"""
-function start!(state::ServerState, p::ProjectInfo, worker_id::AbstractString;
-                progress = nothing)
-    target_id = String(worker_id)
-    if target_id == p.worker_id
-        return ensure_project_session!(state, p)
-    end
-    transfer_project!(state, p, target_id; progress = progress)
-    notify_progress(progress, :phase,
-        (msg = "Starting chat on $(state.workers[][target_id].name)…",))
-    return ensure_project_session!(state, p)
 end
 
 """
@@ -859,6 +808,14 @@ const DashboardStyles = Bonito.Styles(
         "user-select" => "none"),
     CSS(".bt-tagline",
         "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+    # The wordmark, and the Settings button at the far end of its line.
+    CSS(".bt-header-top",
+        "display" => "flex", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "12px",
+        "align-self" => "stretch", "flex-basis" => "100%"),
+    CSS(".bt-copy-project",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "flex-wrap" => "wrap"),
 
     # ── Stats strip ──────────────────────────────────────────────────────────
     CSS(".bt-stats",
@@ -1021,6 +978,12 @@ const DashboardStyles = Bonito.Styles(
         "background" => "var(--bt-surface)",
         "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)",
         "color" => "var(--bt-text)"),
+    # Machine identity is shared with every chat badge and border.
+    CSS(".bt-worker-card", "border-left" => "4px solid var(--bt-worker)"),
+    CSS(".bt-worker-card input.bt-card-initials, .bt-worker-card span.bt-card-initials",
+        "background" => "var(--bt-worker)", "color" => "white",
+        "border" => "1px solid var(--bt-worker)",
+        "padding" => "4px 6px", "border-radius" => "var(--bt-radius-sm)"),
     # `[XX]` pill in front of a project's title — read-only mirror of the
     # worker's initials. Same pill shape as the editable input above so the
     # tag reads consistently across worker / project cards.
@@ -1046,6 +1009,10 @@ const DashboardStyles = Bonito.Styles(
         "margin-top" => "2px",
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "white-space" => "nowrap", "overflow" => "hidden",
+        "text-overflow" => "ellipsis"),
+    # The text sits in a child (the subtitle Observable's span), which a flex
+    # row does not shrink: a long user@host · root ran past a phone's edge.
+    CSS(".bt-card-meta > *", "min-width" => "0", "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
     CSS(".bt-card-actions",
         "display" => "flex", "gap" => "6px", "flex-shrink" => "0",
@@ -1088,6 +1055,8 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-pill-syncing",
         "background" => "rgba(59,130,246,0.12)", "color" => "#1d4ed8",
         "gap" => "6px"),
+    CSS(".bt-pill-error",
+        "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
     # (Buttons: `.bt-btn` and its variants live in BASE_CSS, styles.jl.)
 
@@ -1374,9 +1343,10 @@ const DashboardStyles = Bonito.Styles(
         "border-bottom" => "2px solid var(--bt-border)",
         "border-left" => "2px solid var(--bt-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
-        "animation" => "bt-spin 0.7s linear infinite",
+        "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0"),
-    CSS(".bt-spinner-sm",
+    # Two classes, so it wins over `.bt-spinner` wherever that rule loads.
+    CSS(".bt-spinner.bt-spinner-sm",
         "width" => "11px", "height" => "11px", "border-width" => "1.5px"),
     # MUST have an explicit `from`: with only `to { rotate(360deg) }` the
     # browser interpolates from the element's base transform (a matrix) to
@@ -1386,7 +1356,7 @@ const DashboardStyles = Bonito.Styles(
         CSS("from", "transform" => "rotate(0deg)"),
         CSS("to", "transform" => "rotate(360deg)")),
 
-    # ── Chat loading screen (project_loading_view) ───────────────────────────
+    # ── Chat loading screen (ChatLoadingView) ───────────────────────────
     # Centered in the main panel while a chat's ACP session is brought up, or
     # to explain that the project's worker is offline.
     CSS(".bt-loading",
@@ -1415,14 +1385,14 @@ const DashboardStyles = Bonito.Styles(
         "border-left" => "3px solid var(--bt-border)",
         "flex-shrink" => "0",
         "will-change" => "transform",
-        "animation" => "bt-spin 0.7s linear infinite"),
+        "animation" => "bt-spin 0.7s steps(8) infinite"),
     # Stacked text under the spinner (loading state) / standalone message
     # (offline / error). Both centre their own contents; the message variant
     # brings its own ⚠ glyph, so the shared spinner is hidden for it.
     CSS(".bt-loading-text, .bt-loading-msg",
         "display" => "flex", "flex-direction" => "column",
         "align-items" => "center", "gap" => "8px", "text-align" => "center"),
-    CSS(".bt-loading:has(.bt-loading-msg) .bt-loading-spinner", "display" => "none"),
+    CSS(".bt-loading-done .bt-loading-spinner", "display" => "none"),
     CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
     CSS(".bt-loading-title",
         "font-size" => "15px", "font-weight" => "600",
@@ -1509,9 +1479,11 @@ const DashboardStyles = Bonito.Styles(
         "font-family" => "ui-monospace, monospace", "font-size" => "12.5px",
         "padding" => "10px 12px", "border-radius" => "var(--bt-radius-sm)",
         "margin-top" => "4px"),
+    # One click selects the whole command, for copying it by hand.
     CSS(".bt-install-cmd code",
-        "white-space" => "pre", "overflow-x" => "auto"),
+        "white-space" => "pre", "overflow-x" => "auto", "user-select" => "all"),
     CSS(".bt-install-copy",
+        "user-select" => "none",
         "background" => "rgba(255,255,255,0.06)",
         "color" => "#e2e8f0",
         "border" => "1px solid rgba(255,255,255,0.12)",
@@ -1522,9 +1494,6 @@ const DashboardStyles = Bonito.Styles(
         "background" => "rgba(255,255,255,0.12)"),
 
     # ── Global agent instructions (AGENTS.md) editor ─────────────────────────
-    CSS(".bt-agents-body",
-        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
-        "padding-top" => "8px"),
     CSS(".bt-agents-hint",
         "font-size" => "12px", "color" => "var(--bt-text-muted)",
         "line-height" => "1.5"),
@@ -1769,7 +1738,10 @@ function refresh_picker!(p::RemoteFolderPicker; debounce_ms::Int = 300)
         try
             st = stat_worker_path(p.state, p.worker_name, path)
             ex = st.exists ? (st.isdir ? :dir : :file) : :missing
-        catch
+        catch e
+            # An offline worker is the picker's to show; a failing stat is not.
+            e isa WorkerUnreachableError ||
+                @warn "folder picker: could not check the path" path worker = p.worker_name exception = e
             ex = :error
         end
         my_id == p.fetch_id[] || return
@@ -1870,7 +1842,7 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.path).notify($(js_path(joinpath(wdir, e.name))));")
              for e in entries]
-        DOM.div(rows...; class = "bt-picker bt-slide-in")
+        DOM.div(rows; class = "bt-picker bt-slide-in")
     end
 
     DOM.div(path_row, list)
@@ -1964,45 +1936,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
 
     # Workers self-register over WS — no manual "Add worker" form.
 
-    # `which_form` is the single source of truth for which slide-in panel is
-    # open. `:none` (closed) or `:copy_project` — new-project and GitHub clone
-    # now live on the per-worker cards, so the dashboard's own forms are Copy
-    # only. One enum is clearer than two booleans that always have to be kept
-    # opposite.
-    which_form = Observable(:none)
     # Where this dashboard's long-running work (sync, project import, GitHub
-    # clone, copy) reports. In the app this is the WINDOW's one progress card
+    # clone) reports. In the app this is the WINDOW's one progress card
     # (`pane.progress`, passed in by `unified_main`), so a sync started from the
     # dashboard stays readable after the user switches to a chat. A standalone
     # `dashboard_app` has no window, so it owns the observable and mounts its
     # own `progress_overlay`. Either way there is exactly one card. See
     # progress.jl.
     busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
-
-    # ── Copy-project form state ────────────────────────────────────────────────
-    cp_src_worker  = Observable("")
-    cp_src_project = Observable("")
-    cp_tgt_worker  = Observable("")
-    cp_new_name    = Observable("")
-
-    # When source worker changes, auto-select the first project on that worker.
-    on(session, cp_src_worker) do wid
-        isempty(wid) && return
-        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid];
-                         by = p -> p.name)
-        cp_src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
-    end
-    # Seed the copy name from the source's OWN name. No scrub: `copy_to!` now
-    # applies `valid_project_name` like every other create path, so a project
-    # called "Mantle DNN" seeds "Mantle DNN-copy" rather than the
-    # "Mantle-DNN-copy" the old whitelist invented for a name it had itself
-    # accepted at create time.
-    on(session, cp_src_project) do pid
-        isempty(pid) && return
-        p = get(state.projects[], pid, nothing)
-        p === nothing && return
-        cp_new_name[] = p.name * "-copy"
-    end
 
     # ── Sync-to-server click handler ─────────────────────────────────────────
     # Fired by the project card's "Sync to server" / "Re-sync" button. The
@@ -2034,116 +1975,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 busy_fail!(busy, "Failed to sync $(p.name)", error_detail(e, bt))
             end
         end
-    end
-
-    # ── "Open chat on <worker>" click handler ────────────────────────────────
-    # JS sends a {project, worker} payload. Same worker → just swap the
-    # main-panel view. Different worker → `start!` handles the whole
-    # transparent-move sequence (pre-pull from source, push to target,
-    # re-bind, start session). Long-running so it goes through the busy
-    # card; the (stage, info) callback surfaces per-file progress.
-    open_request = Observable(Dict{String,Any}())
-    on(session, open_request) do payload
-        isempty(payload) && return
-        pid    = String(get(payload, "project", ""))
-        target = String(get(payload, "worker",  ""))
-        open_request[] = Dict{String,Any}()   # reset
-        (isempty(pid) || isempty(target)) && return
-        haskey(state.projects[], pid) || return
-        p = state.projects[][pid]
-
-        if target == p.worker_id
-            current_view !== nothing && (current_view[] = p.id)
-            return
-        end
-
-        haskey(state.workers[], target) || return
-        refuse_if_busy(busy, error_obs, "Can't open that chat elsewhere yet") && return
-        target_w = state.workers[][target]
-        # Set the busy guard SYNCHRONOUSLY, before spawning (T16). Doing it
-        # inside the @async let a double-click pass the `is_busy_running` check
-        # twice (busy was still idle until the first task ran) and start two
-        # concurrent project moves. The other long-ops set it synchronously too.
-        busy_start!(busy, "Opening $(p.name) on $(target_w.name)")
-        @async begin
-            try
-                cb = (stage, info) -> busy_event!(busy, stage, info)
-                start!(state, p, target; progress = cb)
-                safe_set!(error_obs, "")
-                busy_done!(busy, "Opened $(p.name) on $(target_w.name)")
-                current_view !== nothing && (current_view[] = p.id)
-            catch e
-                bt = catch_backtrace()
-                @warn "open-on-worker failed" project=p.name target=target exception=(e, bt)
-                busy_fail!(busy, "Failed to open $(p.name) on $(target_w.name)",
-                           error_detail(e, bt))
-            end
-        end
-    end
-
-    cp_submit = Bonito.Button("Copy"; style=nothing, class = "bt-btn")
-    cp_cancel = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
-
-    on(session, cp_submit.value) do clicked
-        clicked || return
-        refuse_if_busy(busy, error_obs, "Can't copy right now") && return
-        pid = String(cp_src_project[])
-        tgt = String(cp_tgt_worker[])
-        nm  = String(strip(cp_new_name[]))
-        isempty(pid) && (error_obs[] = "Select a source project."; return)
-        isempty(tgt) && (error_obs[] = "Select a target worker."; return)
-        isempty(nm)  && (error_obs[] = "Enter a name for the copy."; return)
-        haskey(state.projects[], pid) ||
-            (error_obs[] = "Source project not found."; return)
-        haskey(state.workers[], tgt) ||
-            (error_obs[] = "Target worker not found."; return)
-        p    = state.projects[][pid]
-        tgt_w = state.workers[][tgt]
-        busy_start!(busy, "Copying $(p.name) → $(tgt_w.name)")
-        @async begin
-            try
-                new_p = copy_to!(state, p, tgt; name = nm,
-                    progress = (stage, info) -> busy_event!(busy, stage, info))
-                safe_set!(error_obs, "")
-                which_form[] = :none
-                busy_done!(busy, "Copied $(p.name) → $(tgt_w.name)")
-                current_view !== nothing && (current_view[] = new_p.id)
-            catch e
-                bt = catch_backtrace()
-                @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
-                busy_fail!(busy, "Copy failed", error_detail(e, bt))
-            end
-        end
-    end
-
-    on(session, cp_cancel.value) do clicked
-        clicked || return
-        is_busy_running(busy[]) && return
-        which_form[] = :none
-        error_obs[]  = ""
-    end
-
-    cp_btn = Bonito.Button("Copy project…"; style=nothing, class = "bt-btn bt-btn-secondary")
-    on(session, cp_btn.value) do clicked
-        clicked || return
-        if isempty(state.workers[]) || isempty(state.projects[])
-            error_obs[] = isempty(state.workers[]) ?
-                "Register a worker before copying projects." :
-                "No projects to copy yet."
-            return
-        end
-        # Prefer a source worker that actually has projects; fall back to first.
-        workers_with_projs = unique(p.worker_id for p in values(state.projects[]))
-        src_wid = isempty(workers_with_projs) ?
-            first(keys(state.workers[])) : first(workers_with_projs)
-        # Default target to a DIFFERENT worker than source when one exists.
-        other_wids = [w for w in keys(state.workers[]) if w != src_wid]
-        tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
-        cp_src_worker[] = ""          # force on(cp_src_worker) to fire even if same value
-        cp_src_worker[] = src_wid
-        cp_tgt_worker[] = tgt_wid
-        which_form[] = :copy_project
-        error_obs[]  = ""
     end
 
     # `picker_state` holds the worker_id whose picker form is currently
@@ -2187,23 +2018,25 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # longer treated as a decision — each worker gets its own project with
     # its own server_path mirror. The "merge / move" decision only matters
     # at sync-time and is handled separately.
+    #
+    # Creating a chat is opening a chat: no progress card of its own. The view
+    # moves to the new chat as soon as the worker has confirmed the folder, and
+    # the chat's loading spinner (`ChatLoadingView`, then the transcript's)
+    # is the one thing on screen, the same as for a chat that already existed.
+    # It used to run through the window's progress card, "Importing X" and then
+    # "Imported X" for 4.5 s, on top of the new chat's own header controls.
+    # A failure still lands in that card: it is the one place an error can be
+    # read and copied.
+    #
+    # `importing` is the double-click latch (T16): two imports of one folder at
+    # once would make two chats. Set synchronously, before anything yields.
+    importing = Ref(false)
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
                         resume_session_id::Union{Nothing,String} = nothing,
                         provider::Union{Nothing,String} = nothing)
-        # In-flight guard (T16): a double-click (or two import affordances firing
-        # at once) had no guard here and would run two concurrent imports of the
-        # same folder. Bail synchronously if a long-op is already running; the
-        # synchronous `busy_start!` just below then latches this one.
-        refuse_if_busy(busy, error_obs, "Can't create a chat right now") && return nothing
-        # Label for the busy card only — `busy_start!` has to run SYNCHRONOUSLY
-        # (it is the double-click latch), and the authoritative name can't be
-        # derived until the worker has confirmed the path below.
-        proj_name = name !== nothing ? name : project_name_from_path(path)
-        title = resume_session_id === nothing ?
-            "Importing $(proj_name)" :
-            "Resuming $(proj_name) (session $(resume_session_id[1:8])…)"
-        busy_start!(busy, title)
+        importing[] && return nothing
+        importing[] = true
         @async begin
             try
                 @info "do_import: starting" worker=w_name path resume=resume_session_id
@@ -2216,26 +2049,26 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 # `start_session=false` so the registration finishes fast and we
                 # can flip `current_view` early — the chat bring-up itself
                 # (ensure_project_session!) is then driven by
-                # `project_loading_view`, which shows a full-panel spinner while
+                # `ChatLoadingView`, which shows a full-panel spinner while
                 # it runs. Otherwise the user stares at the dashboard for ~10s
                 # of ACP `session/load` with only a tiny pill at the top.
                 p = create_project_from_worker!(state, w_name, real;
                     name = pname,
                     resume_session_id = resume_session_id,
                     provider = provider,
-                    start_session = false,
-                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                    start_session = false)
                 @info "do_import: registered project, flipping view" id=p.id
                 error_obs[]      = ""
                 discover_state[] = ""
                 picker_state[]   = ""
-                busy_done!(busy, "Imported $(p.name)")
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 # Never swallow silently: surface to the UI AND the server log.
                 bt = catch_backtrace()
                 @warn "do_import failed" worker=w_name path resume=resume_session_id exception=(e, bt)
-                busy_fail!(busy, "Failed to import", error_detail(e, bt))
+                busy_fail!(busy, "Failed to create the chat", error_detail(e, bt))
+            finally
+                importing[] = false
             end
         end
     end
@@ -2257,7 +2090,10 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                     progress    = (stage, info) -> busy_event!(busy, stage, info))
                 error_obs[] = ""
                 gh_state[]  = ""
-                busy_done!(busy, "Opened $(p.name) from GitHub")
+                # The clone needed the card (it takes a while, and no chat
+                # exists yet to show a spinner in). The chat opening is its
+                # result: the card goes, and the chat's own spinner takes over.
+                busy_clear!(busy)
                 current_view !== nothing && (current_view[] = p.id)
             catch e
                 bt = catch_backtrace()
@@ -2268,58 +2104,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         return nothing
     end
 
-    # A submit failure has to be visible WHERE you submitted. Each call builds
-    # its own node — the same mapped node can't be mounted in two places.
-    form_error() = map(error_obs) do msg
-        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
-    end
-
-    # `class` is the stable hook the e2e suite queries by. Keying a test on the
-    # placeholder TEXT means rewording a user-facing hint silently breaks the
-    # suite — same reason `.bt-np-worker-select` exists.
-    text_input(obs::Observable, ph::String; class::String = "") = DOM.input(
-        type = "text", placeholder = ph, class = class,
-        value = obs,    # Julia → JS: pushed back when obs changes (e.g. auto-fill)
-        oninput = js"event => $(obs).notify(event.target.value)")
-
-    worker_select(id_obs::Observable, cls::String) = DOM.select(
-        (DOM.option(w.name; value=w.worker_id,
-                    selected=w.worker_id==id_obs[]) for w in values(state.workers[]))...;
-        class = cls,
-        value = id_obs,
-        onchange = js"event => $(id_obs).notify(event.target.value)")
-
-    cp_form() = DOM.div(
-        DOM.label("Source worker"),
-        worker_select(cp_src_worker, "bt-cp-src-worker"),
-        DOM.label("Source project"),
-        map(session, state.projects, cp_src_worker) do projects, wid
-            wid_projs = sort([p for p in values(projects) if p.worker_id == wid];
-                             by = p -> lowercase(p.title[]))
-            isempty(wid_projs) ?
-                DOM.div("No projects on this worker";
-                        style = Styles("color"=>"var(--bt-text-muted)", "font-size"=>"12px")) :
-                DOM.select(
-                    # Listed by the name the user knows the chat by (its title,
-                    # or the folder when it has none), with the folder alongside
-                    # when the two differ.
-                    (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
-                                value=p.id,
-                                selected=p.id==cp_src_project[]) for p in wid_projs)...;
-                    class = "bt-cp-src-project",
-                    value = cp_src_project,
-                    onchange = js"event => $(cp_src_project).notify(event.target.value)")
-        end,
-        DOM.label("Target worker"),
-        worker_select(cp_tgt_worker, "bt-cp-tgt-worker"),
-        DOM.label("Name on target"),
-        text_input(cp_new_name, "e.g. my-project-copy"),
-        DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
-                class = "bt-form-note"),
-        form_error(),
-        DOM.div(cp_cancel, cp_submit; class = "bt-form-actions"),
-        class = "bt-form")
-
     # The per-worker picker form and discover panel are now rendered inside
     # WorkerCard (see worker_widget.jl) and toggled via class binding —
     # which means each card owns its own RemoteFolderPicker, persistent
@@ -2328,10 +2112,11 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # ── Stats strip ──────────────────────────────────────────────────────────
     # Stats touch both worker counts and project counts → listen to both.
     stats_strip = map(state.workers, state.projects) do workers, projects
-        online   = count(isopen, values(workers))
-        total    = length(workers)
-        n_proj   = length(projects)
-        n_active = count(p -> p.locked_by !== nothing, values(projects))
+        mine     = [w for w in values(workers) if visible(state, w)]
+        online   = count(isopen, mine)
+        total    = length(mine)
+        n_proj   = count(p -> visible(state, p), values(projects))
+        n_active = count(p -> p.locked_by !== nothing && visible(state, p), values(projects))
         sep()    = DOM.span("·"; class = "bt-stat-sep")
         DOM.div(
             DOM.div(
@@ -2374,6 +2159,327 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 trigger_scan     = trigger_scan!)
         end
     end
+    install_block = worker_install_block(state.auth, session, state)
+    # Drive the KeyedList off a derived Observable that yields a stable
+    # vector of WorkerCard instances (same widget objects across renders →
+    # same hash → no spurious unmount/remount).
+    worker_widgets_obs = map(state.workers) do workers
+        WorkerCard[get_worker_card(w.worker_id) for w in values(workers) if visible(state, w)]
+    end
+    worker_keyed_list = KeyedList(worker_widgets_obs;
+                                    key = c -> c.worker_id)
+    # Connected workers first (the real content), then the "add another"
+    # disclosure beneath them.
+    worker_list = DOM.div(
+        DOM.div(worker_keyed_list; class = "bt-cards"),
+        DOM.div(install_block; class = "bt-install-wrap"))
+
+    # ── Project list ────────────────────────────────────────────────────────
+    # The standalone dashboard "Projects" card list was removed: it duplicated
+    # the per-worker `▸ projects` tree (in each WorkerCard) and the left sidebar
+    # ("running on workers"). The only card-only feature was move-to-worker,
+    # which is being redesigned. Project creation stays on the dashboard via the
+    # + New project / + From GitHub buttons; the projects themselves live in the
+    # worker pills and the sidebar. (`sync_request` above
+    # remains defined for a future per-project sync control.)
+
+    # Top-of-page errors, for failures with no form on screen ("Register a
+    # worker before creating a project").
+    error_block = map(error_obs) do msg
+        isempty(msg) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    end
+
+    # Everything that configures rather than runs (defaults, agent
+    # instructions, accounts) is on the Settings page; this is its door.
+    settings_link = current_view === nothing ? nothing :
+        DOM.button("Settings";
+            class = "bt-btn bt-btn-secondary bt-btn-sm bt-open-settings",
+            title = "Defaults, agent instructions, accounts",
+            onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
+
+    apps = page_phase(() -> apps_section(session, state, current_view, busy), :apps)
+    apps_header = apps === nothing ? nothing : DOM.div(DOM.h2("Apps"); class = "bt-section")
+
+    # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
+    # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
+    DOM.div(
+        DOM.div(
+            DOM.div(
+                DOM.h1(
+                    DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
+                            draggable = "false"),
+                    "BonitoAgents"),
+                settings_link;
+                class = "bt-header-top"),
+            DOM.div("Multi-host orchestrator for agentic coding sessions";
+                    class = "bt-tagline"),
+            # Recent-chats overview — the header IS the landing overview: the
+            # last 6 chats as clickable cards (title, count, last prompts,
+            # last image), kept fresh via chat_signal/projects (overview.jl).
+            recent_chats_dom(session, state, current_view);
+            class = "bt-header"),
+        stats_strip,
+        error_block,
+
+        # The server's apps (apps.jl): one row each, opening the app's chat.
+        apps_header,
+        apps,
+
+        DOM.div(DOM.h2("Workers"); class = "bt-section"),
+        worker_list;
+
+        class = "bt-dash")
+end
+
+"""
+    settings_dom(session, state; current_view = nothing, progress = nothing) → DOM
+
+The Settings page: chat defaults, copying a project to another worker, Debug
+BonitoAgents, the global agent instructions, and the account sections.
+`progress` is the window's progress card, as for `dashboard_dom`.
+"""
+function settings_dom(session::Bonito.Session, state::ServerState;
+                      current_view::Union{Observable{String},Nothing} = nothing,
+                      progress::Union{Observable,Nothing} = nothing)
+    busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
+    copy_ui = copy_project_controls(session, state, busy, current_view)
+    DOM.div(
+        DOM.div(DOM.h1("Settings"); class = "bt-header"),
+        # Loose controls, one card of uniform rows.
+        DOM.div(DOM.h2("General"); class = "bt-section"),
+        DOM.div(
+            settings_row("Defaults",
+                "Applied to new and unconfigured chats; a chat's own picks override.",
+                session_defaults_bar(session, state)),
+            # New project & GitHub clone live on the per-worker cards; Copy is
+            # here because it crosses workers.
+            settings_row("Copy project",
+                "Snapshot a project's files onto another worker as a new project. " *
+                "To carry on a chat elsewhere, use that chat's ⋯ menu → Continue on.",
+                copy_ui.button),
+            debug_section(session, state, current_view);
+            class = "bt-card bt-settings"),
+        agents_md_section(session, state),
+        page_phase(() -> shares_section(session, state), :shares),
+        # Your account behind the proxy; accounts, invites and agent adapter
+        # versions for admins.
+        page_phase(() -> account_sections(session, state), :accounts),
+        copy_ui.modal;
+        class = "bt-dash bt-settings-page")
+end
+
+"""
+    copy_project_controls(session, state, busy, current_view) -> (; button, modal)
+
+"Copy project…" and the form it opens: a snapshot of a project's files onto
+another worker as a new project. The copy reports into `busy`, and navigates to
+the new project when `current_view` is given.
+"""
+function copy_project_controls(session::Bonito.Session, state::ServerState, busy::Observable,
+                               current_view::Union{Observable{String},Nothing})
+    error_obs  = Observable("")
+    is_open    = Observable(false)
+    src_worker = Observable("")
+    src_project = Observable("")
+    tgt_worker = Observable("")
+    new_name   = Observable("")
+
+    # When source worker changes, auto-select the first project on that worker.
+    on(session, src_worker) do wid
+        isempty(wid) && return
+        wid_projs = sort([p for p in values(state.projects[]) if p.worker_id == wid && visible(state, p)];
+                         by = p -> p.name)
+        src_project[] = isempty(wid_projs) ? "" : first(wid_projs).id
+    end
+    # Seed the copy name from the source's OWN name. No scrub: `copy_to!`
+    # applies `valid_project_name` like every other create path, so a project
+    # called "Mantle DNN" seeds "Mantle DNN-copy".
+    on(session, src_project) do pid
+        isempty(pid) && return
+        p = get(state.projects[], pid, nothing)
+        p === nothing && return
+        new_name[] = p.name * "-copy"
+    end
+    # Closing the form (✕, backdrop, Escape, Cancel, a finished copy) drops
+    # its error with it.
+    on(session, is_open) do open
+        open || (error_obs[] = "")
+    end
+
+    submit = Bonito.Button("Copy"; style = nothing, class = "bt-btn")
+    cancel = Bonito.Button("Cancel"; style = nothing, class = "bt-btn bt-btn-secondary")
+    on(session, submit.value) do clicked
+        clicked || return
+        refuse_if_busy(busy, error_obs, "Can't copy right now") && return
+        pid = String(src_project[])
+        tgt = String(tgt_worker[])
+        nm  = String(strip(new_name[]))
+        isempty(pid) && (error_obs[] = "Select a source project."; return)
+        isempty(tgt) && (error_obs[] = "Select a target worker."; return)
+        isempty(nm)  && (error_obs[] = "Enter a name for the copy."; return)
+        haskey(state.projects[], pid) ||
+            (error_obs[] = "Source project not found."; return)
+        haskey(state.workers[], tgt) ||
+            (error_obs[] = "Target worker not found."; return)
+        p     = state.projects[][pid]
+        tgt_w = state.workers[][tgt]
+        busy_start!(busy, "Copying $(p.name) → $(tgt_w.name)")
+        @async begin
+            try
+                new_p = copy_to!(state, p, tgt; name = nm,
+                    progress = (stage, info) -> busy_event!(busy, stage, info))
+                is_open[] = false
+                busy_done!(busy, "Copied $(p.name) → $(tgt_w.name)")
+                current_view !== nothing && (current_view[] = new_p.id)
+            catch e
+                bt = catch_backtrace()
+                @warn "copy_to! failed" project=p.name target=tgt exception=(e, bt)
+                busy_fail!(busy, "Copy failed", error_detail(e, bt))
+            end
+        end
+    end
+    on(session, cancel.value) do clicked
+        clicked || return
+        is_busy_running(busy[]) && return
+        is_open[] = false
+    end
+
+    button = Bonito.Button("Copy project…"; style = nothing, class = "bt-btn bt-btn-secondary")
+    on(session, button.value) do clicked
+        clicked || return
+        mine = [w.worker_id for w in values(state.workers[]) if visible(state, w)]
+        workers_with_projs = unique(p.worker_id for p in values(state.projects[]) if visible(state, p))
+        if isempty(mine) || isempty(workers_with_projs)
+            error_obs[] = isempty(mine) ?
+                "Register a worker before copying projects." :
+                "No projects to copy yet."
+            return
+        end
+        # Prefer a source worker that actually has projects.
+        src_wid = first(workers_with_projs)
+        # Default target to a DIFFERENT worker than source when one exists.
+        other_wids = [w for w in mine if w != src_wid]
+        tgt_wid = isempty(other_wids) ? src_wid : first(other_wids)
+        src_worker[] = ""          # force on(src_worker) to fire even if same value
+        src_worker[] = src_wid
+        tgt_worker[] = tgt_wid
+        error_obs[]  = ""
+        is_open[]    = true
+    end
+
+    # `class` is the stable hook the e2e suite queries by, not the placeholder.
+    worker_select(id_obs::Observable, cls::String) = DOM.select(
+        (DOM.option(w.name; value = w.worker_id,
+                    selected = w.worker_id == id_obs[]) for w in values(state.workers[]) if visible(state, w));
+        class = cls,
+        value = id_obs,
+        onchange = js"event => $(id_obs).notify(event.target.value)")
+    # A refusal shows where it was asked for: next to the button while the
+    # form is closed, in the form once it is open. Each call builds its own
+    # node — the same mapped node can't be mounted in two places.
+    shown_error(when_open::Bool) = map(error_obs, is_open) do msg, open
+        (isempty(msg) || open != when_open) ? DOM.div() : DOM.div(msg; class = "bt-error")
+    end
+
+    form = modal(session, is_open, "Copy project") do
+        DOM.div(
+            DOM.label("Source worker"),
+            worker_select(src_worker, "bt-cp-src-worker"),
+            DOM.label("Source project"),
+            map(session, state.projects, src_worker) do projects, wid
+                wid_projs = sort([p for p in values(projects) if p.worker_id == wid && visible(state, p)];
+                                 by = p -> lowercase(p.title[]))
+                isempty(wid_projs) ?
+                    DOM.div("No projects on this worker"; class = "bt-form-note") :
+                    DOM.select(
+                        # Listed by the name the user knows the chat by (its title,
+                        # or the folder when it has none), with the folder alongside
+                        # when the two differ.
+                        (DOM.option(titled(p) ? "$(p.title[]) ($(p.name))" : p.name;
+                                    value = p.id,
+                                    selected = p.id == src_project[]) for p in wid_projs);
+                        class = "bt-cp-src-project",
+                        value = src_project,
+                        onchange = js"event => $(src_project).notify(event.target.value)")
+            end,
+            DOM.label("Target worker"),
+            worker_select(tgt_worker, "bt-cp-tgt-worker"),
+            DOM.label("Name on target"),
+            DOM.input(type = "text", placeholder = "e.g. my-project-copy", value = new_name,
+                      oninput = js"event => $(new_name).notify(event.target.value)"),
+            DOM.div("It becomes a folder on the target worker: no / or \\, no leading dot.";
+                    class = "bt-form-note"),
+            shown_error(true),
+            DOM.div(cancel, submit; class = "bt-form-actions"),
+            class = "bt-form")
+    end
+    return (; button = DOM.div(button, shown_error(false); class = "bt-copy-project"), modal = form)
+end
+
+"""
+    agents_md_section(session, state)
+
+The global agent instructions (AGENTS.md): a system-prompt appendix every agent
+session gets, on every worker (state_dir/AGENTS.md; see `system_prompt_meta`).
+Read at session bring-up, so a save applies to the NEXT chat opened.
+"""
+function agents_md_section(session::Bonito.Session, state::ServerState)
+    status = Observable("")
+    saved  = Observable{Union{Nothing,String}}(nothing)
+    on(session, saved) do txt
+        txt === nothing && return
+        try
+            set_global_agents_md!(state, txt)
+            safe_set!(status, "saved · applies to chats opened from now on")
+        catch e
+            @warn "AGENTS.md save failed" exception = e
+            safe_set!(status, "save failed: $(sprint(showerror, e))")
+        end
+    end
+    return DOM.div(
+        DOM.div(DOM.h2("Agent instructions"); class = "bt-section"),
+        DOM.div(
+            DOM.div("AGENTS.md, appended to the system prompt of every agent session " *
+                    "on every worker: shared conventions, house rules, tool guidance.";
+                    class = "bt-agents-hint"),
+            DOM.textarea(global_agents_md(state);
+                class = "bt-agents-textarea", rows = 6,
+                placeholder = "e.g. ## Conventions every agent must follow…"),
+            DOM.div(
+                DOM.span(status; class = "bt-agents-status"),
+                DOM.button("Save";
+                    class = "bt-btn bt-btn-sm",
+                    onclick = js"""event => {
+                        const ta = event.target.closest('.bt-agents-block')
+                                       .querySelector('textarea');
+                        $(saved).notify(ta.value);
+                    }""");
+                class = "bt-agents-actions");
+            class = "bt-card bt-agents-block"))
+end
+
+# One install command with its Copy button. The command is copied from its own
+# element, never interpolated into the script: a credential command carries
+# quotes, which a JS string literal would break on.
+install_command_row(label::AbstractString, cmd::AbstractString) = DOM.div(
+    DOM.div(label; class = "bt-install-os"),
+    DOM.div(
+        DOM.code(cmd),
+        DOM.span("Copy";
+            class   = "bt-install-copy",
+            onclick = js"""event => {
+                const btn = event.target;
+                const say = t => { btn.textContent = t; setTimeout(() => btn.textContent = 'Copy', 1200); };
+                ($(COPY_TEXT_JS))(btn.parentNode.querySelector('code').textContent)
+                    .then(() => say('Copied'), () => say('Copy failed'));
+            }"""),
+        class = "bt-install-cmd"))
+
+# The "add a worker" block of the Workers section. On one machine's server only
+# this machine reaches it, so the plain install one-liner is the whole story; on
+# a network or behind the proxy each worker needs a credential first
+# (`worker_install_block(::Union{ProxyAuth,NetworkAuth}, …)` in accounts.jl).
+function worker_install_block(::LocalAuth, session::Bonito.Session, state::ServerState)
     # The "no workers" install-instructions block lives as a sibling that
     # toggles visibility based on workers-empty. Keeps the install snippet
     # out of every render's hot path.
@@ -2386,39 +2492,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     base         = install_base_url(state)
     install_unix = "curl -fsSL $base/install.sh | sh"
     install_win  = "irm $base/install.ps1 | iex"
-    # Copy MUST work on plain-http origins too: `navigator.clipboard` is
-    # undefined outside secure contexts (https / localhost), which is exactly
-    # how a LAN-hosted BonitoAgents is reached — that's why the button "did
-    # nothing". Fall back to the hidden-textarea + execCommand path there.
-    install_row(label, cmd) = DOM.div(
-        DOM.div(label; class = "bt-install-os"),
-        DOM.div(
-            DOM.code(cmd),
-            DOM.span("Copy";
-                class   = "bt-install-copy",
-                onclick = js"""event => {
-                    const btn  = event.target;
-                    const done = () => {
-                        btn.textContent = 'Copied';
-                        setTimeout(() => btn.textContent = 'Copy', 1200);
-                    };
-                    const fallback = () => {
-                        const ta = document.createElement('textarea');
-                        ta.value = $cmd;
-                        ta.style.position = 'fixed';
-                        ta.style.opacity = '0';
-                        document.body.appendChild(ta);
-                        ta.select();
-                        try { document.execCommand('copy'); done(); }
-                        finally { ta.remove(); }
-                    };
-                    if (navigator.clipboard && window.isSecureContext) {
-                        navigator.clipboard.writeText($cmd).then(done, fallback);
-                    } else {
-                        fallback();
-                    }
-                }"""),
-            class = "bt-install-cmd"))
     # Headline text reflects whether any workers have connected yet — but the
     # install snippet itself is always visible, so adding more workers later
     # doesn't require digging through docs.
@@ -2435,178 +2508,15 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
                 style = Styles("color" => "var(--bt-text-muted)",
                                 "font-size" => "13px",
                                 "margin-bottom" => "4px")),
-        install_row("Linux / macOS", install_unix),
-        install_row("Windows (PowerShell)", install_win);
+        install_command_row("Linux / macOS", install_unix),
+        install_command_row("Windows (PowerShell)", install_win);
         class = "bt-install-block")
     install_summary = DOM.summary(
         DOM.span("Add another worker"; class = "bt-discover-title");
         class = "bt-discover-header")
-    install_block = isempty(state.workers[]) ?
+    return isempty(state.workers[]) ?
         DOM.details(install_summary, install_body; class = "bt-card bt-install-details", open = true) :
         DOM.details(install_summary, install_body; class = "bt-card bt-install-details")
-    # ── Global agent instructions (AGENTS.md) ────────────────────────────────
-    # A server-wide system-prompt appendix every agent session gets, across
-    # all workers (state_dir/AGENTS.md; see `system_prompt_meta`). Read at
-    # session bring-up, so a save applies to the NEXT chat opened.
-    agents_status = Observable("")
-    agents_saved  = Observable{Union{Nothing,String}}(nothing)
-    on(session, agents_saved) do txt
-        txt === nothing && return
-        try
-            set_global_agents_md!(state, txt)
-            safe_set!(agents_status,
-                "saved · applies to chats opened from now on")
-        catch e
-            @warn "AGENTS.md save failed" exception = e
-            safe_set!(agents_status, "save failed: $(sprint(showerror, e))")
-        end
-    end
-    agents_block = DOM.details(
-        DOM.summary(
-            DOM.span("Global agent instructions (AGENTS.md)";
-                     class = "bt-discover-title");
-            class = "bt-discover-header"),
-        DOM.div(
-            DOM.div("Appended to the system prompt of every agent session " *
-                    "on every worker — shared conventions, house rules, " *
-                    "tool guidance. Saved to the server's state dir.";
-                    class = "bt-agents-hint"),
-            DOM.textarea(global_agents_md(state);
-                class = "bt-agents-textarea", rows = 10,
-                placeholder = "e.g. ## Conventions every agent must follow…"),
-            DOM.div(
-                DOM.span(agents_status; class = "bt-agents-status"),
-                DOM.button("Save";
-                    class = "bt-btn bt-btn-sm",
-                    onclick = js"""event => {
-                        const ta = event.target.closest('.bt-agents-body')
-                                       .querySelector('textarea');
-                        $(agents_saved).notify(ta.value);
-                    }""");
-                class = "bt-agents-actions");
-            class = "bt-agents-body");
-        class = "bt-card bt-agents-block")
-
-    # Drive the KeyedList off a derived Observable that yields a stable
-    # vector of WorkerCard instances (same widget objects across renders →
-    # same hash → no spurious unmount/remount).
-    worker_widgets_obs = map(state.workers) do workers
-        WorkerCard[get_worker_card(w.worker_id) for w in values(workers)]
-    end
-    worker_keyed_list = KeyedList(worker_widgets_obs;
-                                    key = c -> c.worker_id)
-    # Connected workers first (the real content), then the "add another"
-    # disclosure beneath them.
-    worker_list = DOM.div(
-        DOM.div(worker_keyed_list; class = "bt-cards"),
-        DOM.div(install_block; class = "bt-install-wrap"))
-
-    # ── Project list ────────────────────────────────────────────────────────
-    # The standalone dashboard "Projects" card list was removed: it duplicated
-    # the per-worker `▸ projects` tree (in each WorkerCard) and the left sidebar
-    # ("running on workers"). The only card-only feature was move-to-worker,
-    # which is being redesigned. Project creation stays on the dashboard via the
-    # + New project / + From GitHub buttons; the projects themselves live in the
-    # worker pills and the sidebar. (`sync_request` / `open_request` above
-    # remain defined for the future move-to-worker redesign.)
-
-    # One form, one source of truth: which one is open right now. Only
-    # copy-project remains on the dashboard; new-project and GitHub clone moved
-    # onto the per-worker cards (worker_widget.jl).
-    #
-    # It opens as a MODAL, not as a panel in the page: the button that opens it
-    # lives in the Settings card at the very bottom, so a user who scrolled up
-    # to pick a project clicked it and saw nothing happen — the form was
-    # appended below the fold. Closes on the ✕, on the backdrop, and on Escape.
-    form_close = Observable("")
-    on(session, form_close) do v
-        isempty(v) && return
-        form_close[] = ""
-        which_form[] = :none
-        error_obs[]  = ""
-    end
-    form_block = map(session, which_form) do which
-        which === :copy_project || return DOM.div()
-        close_btn = DOM.button("✕";
-            class = "bt-btn bt-btn-ghost bt-btn-sm bt-modal-close",
-            title = "Close",
-            onclick = js"event => $(form_close).notify('x')")
-        DOM.div(
-            DOM.div(
-                DOM.div(DOM.span("Copy project"; class = "bt-modal-title"), close_btn;
-                        class = "bt-modal-head"),
-                DOM.div(cp_form(); class = "bt-modal-body");
-                class = "bt-modal-card",
-                # A click inside the card must not reach the backdrop handler.
-                onclick = js"event => event.stopPropagation()"),
-            # Escape closes it too. The listener is on the document (the overlay
-            # never has focus) and retires itself once the overlay is gone — the
-            # node is discarded when `which_form` flips, so there is nothing else
-            # to hang a teardown on.
-            js"""(() => {
-                const esc = (e) => {
-                    if (!document.querySelector('.bt-modal-overlay')) {
-                        document.removeEventListener('keydown', esc, true);
-                        return;
-                    }
-                    if (e.key === 'Escape') { e.stopPropagation(); $(form_close).notify('x'); }
-                };
-                document.addEventListener('keydown', esc, true);
-            })()""";
-            class = "bt-modal-overlay",
-            onclick = js"event => $(form_close).notify('x')")
-    end
-    # Top-of-page errors, for failures with no form on screen ("Register a
-    # worker before creating a project"). While a form IS open its own copy
-    # shows the message next to the button — see `form_error` — so this one
-    # stands down rather than duplicating it far above the fold.
-    error_block = map(error_obs, which_form) do msg, wf
-        (isempty(msg) || wf !== :none) ? DOM.div() : DOM.div(msg; class = "bt-error")
-    end
-
-    # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
-    # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
-    DOM.div(
-        DOM.div(
-            DOM.h1(
-                DOM.img(src = logo_svg(), alt = "", class = "bt-logo",
-                        draggable = "false"),
-                "BonitoAgents"),
-            DOM.div("Multi-host orchestrator for agentic coding sessions";
-                    class = "bt-tagline"),
-            # Recent-chats overview — the header IS the landing overview: the
-            # last 6 chats as clickable cards (title, count, last prompts,
-            # last image), kept fresh via chat_signal/projects (overview.jl).
-            recent_chats_dom(session, state, current_view);
-            class = "bt-header"),
-        stats_strip,
-        error_block,
-
-        DOM.div(DOM.h2("Workers"); class = "bt-section"),
-        worker_list,
-
-        DOM.div(DOM.h2("Agents"); class = "bt-section"),
-        agents_block,
-
-        # Everything that is neither a worker nor a chat lives in ONE card of
-        # uniform rows, so the tail of the dashboard reads as one place rather
-        # than a stack of differently shaped sections.
-        DOM.div(DOM.h2("Settings"); class = "bt-section"),
-        DOM.div(
-            settings_row("Defaults",
-                "Applied to new and unconfigured chats; a chat's own picks override.",
-                session_defaults_bar(session, state)),
-            # New project & GitHub clone live on the per-worker cards; Copy stays
-            # here because it genuinely crosses workers.
-            settings_row("Copy project",
-                "Snapshot a project's files onto another worker as a new project. " *
-                "To carry on a chat elsewhere, use that chat's ⋯ menu → Continue on.",
-                cp_btn),
-            debug_section(session, state, current_view);
-            class = "bt-card bt-settings"),
-        form_block;
-
-        class = "bt-dash")
 end
 
 # One row of the Settings card: what it is (and why) on the left, the control
@@ -2635,7 +2545,8 @@ end
 # restart afterwards loads.
 function debug_section(session::Bonito.Session, state::ServerState,
                        current_view::Union{Observable{String},Nothing})
-    current_view === nothing && return nothing
+    # Its tools read and drive the whole server: admins only.
+    (current_view === nothing || !is_admin(state)) && return nothing
     chosen = Observable("")
     status = Observable("")
     # The picker follows the worker list: a worker that goes away is dropped and
@@ -2649,7 +2560,7 @@ function debug_section(session::Bonito.Session, state::ServerState,
             return DOM.span("no worker connected"; class = "bt-debug-noworker")
         return DOM.select(
             (DOM.option(w.name; value = w.worker_id, selected = w.worker_id == chosen[])
-             for w in online)...;
+             for w in online);
             class = "bt-debug-worker",
             title = "The worker the debug chat runs on; its checkout is what the agent edits",
             onchange = js"event => $(chosen).notify(event.target.value)")

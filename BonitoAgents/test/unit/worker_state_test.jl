@@ -16,11 +16,10 @@ import JSON
 @testset "remove_worker!" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
 
     wid = "worker-uuid-1"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Laptop", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Laptop", nothing,
                                       "host", "/home/u", "julia", String[],
                                       "/home/u/projects", :offline, now(UTC))
     mk(id, name, w) = BT.ProjectInfo(id, name, w,
@@ -67,7 +66,7 @@ import JSON
     # remove_projects=false keeps the project rows (just evicts the worker +
     # its live ChatModels).
     wid2 = "worker-uuid-2"
-    st.workers[][wid2] = BT.WorkerInfo(wid2, "Box", "<inbound-ws>", "s", nothing,
+    st.workers[][wid2] = BT.WorkerInfo(wid2, "Box", nothing,
                                        "h2", "/home/v", "julia", String[],
                                        "/home/v/projects", :offline, now(UTC))
     p4 = mk("p4", "Keep", wid2)
@@ -84,9 +83,8 @@ end
 @testset "thread identity (folder hosts multiple threads)" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
-    st.workers[]["wX"] = BT.WorkerInfo("wX", "Box", "<ws>", "s", nothing,
+                          working_dir = joinpath(dir, "work"))
+    st.workers[]["wX"] = BT.WorkerInfo("wX", "Box", nothing,
                                        "h", "/home", ".", String[],
                                        "/home/u/projects", :online, now(UTC))
     imp(path; sess = nothing) = BT.create_project_from_worker!(
@@ -118,8 +116,7 @@ end
 @testset "dedup keeps sibling threads, collapses true dupes" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     folder = "/home/u/projects/Repo"
     mk(id) = BT.ProjectInfo(id, "Repo", "wY",
                             joinpath(dir, "work", "wY-Repo"), folder, now(UTC))
@@ -141,8 +138,7 @@ end
 @testset "discovered scan persistence" begin
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     st.discovered[]["wA"] = [Dict{String,Any}(
         "session_id" => "s1", "path" => "/p/App",
         "first_prompt" => "fix the bug", "last_used" => 1.7e9, "kind" => "session")]
@@ -151,8 +147,7 @@ end
 
     # A fresh state over the same dir reloads the cache (survives restart).
     st2 = BT.ServerState(; state_dir = dir,
-                           working_dir = joinpath(dir, "work"),
-                           worker_secret = "s")
+                           working_dir = joinpath(dir, "work"))
     @test haskey(st2.discovered[], "wA")
     @test st2.discovered[]["wA"][1]["first_prompt"] == "fix the bug"
 
@@ -162,21 +157,30 @@ end
     @test length(res) == 1 && haskey(res[1], "error")
     @test haskey(st2.discovered[], "ghost")
     @test JSON.parsefile(joinpath(dir, "discovered.json")) |> d -> haskey(d, "ghost")
+
+    # A worker scanned before keeps what that scan found when a rescan fails
+    # (here: it is not connected), with the failure next to it. Storing the error
+    # alone showed "projects (0)" until some later scan got through.
+    res = BT.scan_and_store!(st2, "wA")
+    @test [r["session_id"] for r in res if !haskey(r, "error")] == ["s1"]
+    @test count(r -> haskey(r, "error"), res) == 1
+    @test startswith(only(r for r in res if haskey(r, "error"))["error"], "the last scan failed: ")
+    # Another failure does not pile up errors.
+    res = BT.scan_and_store!(st2, "wA")
+    @test length(res) == 2 && count(r -> haskey(r, "error"), res) == 1
 end
 
-@testset "teardown_worker_control! identity guard" begin
-    # Regression: two control sockets sharing a worker_id (duplicate worker
-    # process, or a reconnect that re-registered before the old socket's
-    # `finally` ran) must not destroy each other. The stale socket's teardown
-    # must be a no-op; only the socket that is STILL the registered one tears
-    # down the worker. Per #28 the chat model is KEPT for reconnect (only the
-    # dead agent session is torn down) — it must NOT be evicted.
+@testset "teardown_worker! identity guard" begin
+    # Two links for one worker_id: a worker that reconnected with a new link
+    # (restart), or a duplicate worker process. When the OLD link dies, its
+    # teardown must be a no-op; only the worker's CURRENT link tears it down.
+    # Per #28 the chat model is KEPT for reconnect (only the dead agent session
+    # is torn down), never evicted.
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     wid = "dup-worker"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Box", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Box", nothing,
                                       "h", "/home/u", "julia", String[],
                                       "/home/u/projects", :online, now(UTC))
     st.projects[][ "pp" ] = BT.ProjectInfo("pp", "Proj", wid,
@@ -186,29 +190,27 @@ end
     st.chat_models["pp"] = BT.ChatModel(st, cpp; project_id = "pp",
                                         agent = BT.WorkerAgent(st, wid, cpp))
 
-    # Sockets are compared by `===`, so any two distinct objects stand in for
-    # two real WebSockets here.
-    ws_old = Ref(:old)
-    ws_new = Ref(:new)
+    # Links are compared by `===`; two unconnected ones stand in for two real
+    # ones here.
+    link_old = BT.WorkerLink.Link(:server)
+    link_new = BT.WorkerLink.Link(:server)
+    st.worker_links[wid] = link_new
 
-    # Worker connects (old), then reconnects (new) — last writer wins.
-    st.worker_control_ws[wid] = ws_old
-    st.worker_control_ws[wid] = ws_new
-
-    # The OLD socket's loop now ends and runs teardown. It is NOT the current
-    # registration → must be a no-op: live socket, worker, and chat model intact.
-    @test BT.teardown_worker_control!(st, wid, ws_old) == false
-    @test st.worker_control_ws[wid] === ws_new
+    # The OLD link dies: it is NOT the current one → a no-op, the live link,
+    # the worker and the chat model stay.
+    @test BT.teardown_worker!(st, wid, link_old) == false
+    @test st.worker_links[wid] === link_new
     @test st.workers[][wid].online[] == true
     @test haskey(st.chat_models, "pp")
 
-    # The NEW (current) socket dropping DOES tear down: the worker goes offline
-    # and its registration is dropped, but the chat model is KEPT (#28) so the
-    # chat survives the disconnect and rebinds on the worker's next reconnect.
-    @test BT.teardown_worker_control!(st, wid, ws_new) == true
-    @test !haskey(st.worker_control_ws, wid)
+    # The CURRENT link dies: the worker goes offline and its registration is
+    # dropped, but the chat model is KEPT (#28) so the chat survives and
+    # rebinds once the worker is back.
+    @test BT.teardown_worker!(st, wid, link_new) == true
+    @test !haskey(st.worker_links, wid)
     @test st.workers[][wid].online[] == false
     @test haskey(st.chat_models, "pp")            # #28: kept for reconnect, not evicted
+    foreach(l -> BT.WorkerLink.kill!(l, "done"), (link_old, link_new))
 end
 
 @testset "workers.json round-trips (persistent rig restart)" begin
@@ -220,17 +222,15 @@ end
     # worker happened to re-register.
     dir = mktempdir()
     st = BT.ServerState(; state_dir = dir,
-                          working_dir = joinpath(dir, "work"),
-                          worker_secret = "s")
+                          working_dir = joinpath(dir, "work"))
     wid = "worker-roundtrip-1"
-    st.workers[][wid] = BT.WorkerInfo(wid, "Studio", "<inbound-ws>", "s", nothing,
+    st.workers[][wid] = BT.WorkerInfo(wid, "Studio", nothing,
                                       "host", "/home/u", "julia", String["--project"],
                                       "/home/u/projects", :online, now(UTC))
     BT.save_workers!(st)
 
     st2 = BT.ServerState(; state_dir = dir,
-                           working_dir = joinpath(dir, "work"),
-                           worker_secret = "s")
+                           working_dir = joinpath(dir, "work"))
     @test haskey(st2.workers[], wid)              # NOT dropped as malformed
     w = st2.workers[][wid]
     @test w.name == "Studio"

@@ -51,17 +51,14 @@ function b_wait(ctx, predicate; timeout = 30)
     while time() - t0 < timeout
         try
             ECT.eval_js(ctx, predicate) === true && return true
-        catch
+        catch e
+            e isa TK.ElectronCall.JSExecutionError || rethrow()   # page not there yet
         end
         sleep(0.3)
     end
     return false
 end
-b_out(ctx) = try
-    ECT.eval_js(ctx, "(() => { const e=document.querySelector('.two-out'); return e ? e.innerText : ''; })()")
-catch
-    ""
-end
+b_out(ctx) = ECT.eval_js(ctx, "(() => { const e=document.querySelector('.two-out'); return e ? e.innerText : ''; })()")
 function b_click_wait(ctx, want)
     ECT.eval_js(ctx, "(() => { const b=document.querySelector('.two-btn'); if(b){b.click();return true} return false })()")
     return b_wait(ctx, out_pred(want); timeout = 10)
@@ -84,10 +81,9 @@ function run_suite(server)
         # open the SAME chat via its sidebar entry (exactly like TestKit.open_chat,
         # but driven on the second window). History replay re-mounts the SAME parked
         # value into a fresh per-page render → its own instance @ 0.
-        url  = "http://127.0.0.1:$(server.h.state.srv.port)/"
-        ctxB = ECT.open_window(url; show = false)
+        tabB = TK.another_browser(server)
+        ctxB = tabB.browser[]
         try
-            ECT.install_error_sink(ctxB)
             @test b_wait(ctxB, "!!document.querySelector('.bt-side-item[data-project-id=\"$(pid)\"]')"; timeout = 60)
             ECT.eval_js(ctxB, """(() => {
                 const el = document.querySelector('.bt-side-item[data-project-id="$(pid)"]');
@@ -107,14 +103,9 @@ function run_suite(server)
             @test a_click_wait(server, "TWO=22")
             @test b_out(ctxB) == "TWO=22"
 
-            @test isempty(ECT.js_errors(ctxB))
+            @test isempty(TK.js_errors(tabB))
         finally
-            try
-                ECT.close(ctxB)
-            catch e
-                e isa InterruptException && rethrow()
-                @debug "two_tab: closing second window failed" exception = e
-            end
+            TK.close_browser!(tabB)
         end
         @test isempty(TK.js_errors(server))
     end

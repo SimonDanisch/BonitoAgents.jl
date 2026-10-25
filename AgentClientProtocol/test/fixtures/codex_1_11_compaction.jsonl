@@ -1,0 +1,3 @@
+{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"active","activeFlags":[]}}}}
+{"sessionUpdate":"tool_call","toolCallId":"01a1632f-ab7b-77b2-ae6d-64d792e7ec00","kind":"think","title":"Compact conversation","status":"in_progress","_meta":{"contextCompaction":{"version":1}}}
+{"sessionUpdate":"session_info_update","_meta":{"codex":{"threadStatus":{"type":"systemError"}}}}

@@ -102,10 +102,13 @@ function wrap_for_detach(tool_id::AbstractString, body)
     tid = String(tool_id)
     placeholder = DOM.span("In floating window — close it to bring this back";
                           class = "bt-detach-placeholder")
+    slot = DOM.div(
+        DOM.div(body; id = "bt-embed-$(tid)", class = "bt-embed");
+        id = "bt-slot-$(tid)", class = "bt-slot")
     DOM.div(
         DOM.div(placeholder; class = "bt-embed-controls"),
-        DOM.div(
-            DOM.div(body; id = "bt-embed-$(tid)", class = "bt-embed");
-            id = "bt-slot-$(tid)", class = "bt-slot");
+        slot,
+        # The card holding an embed gets more room (`.bt-tool-embed`, styles.jl).
+        js"""$(slot).closest('.bt-tool-msg')?.classList.add('bt-tool-embed')""";
         class = "bt-embed-frame")
 end

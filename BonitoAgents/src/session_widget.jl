@@ -74,7 +74,7 @@ function resolve_session_title!(sr::SessionRow, projects::AbstractDict)
     want = session_preview_title(sr.preview)
     if !isempty(sr.session_id)
         for p in values(projects)
-            if p.resume_session_id == sr.session_id && titled(p)
+            if p.worker_id == sr.worker_id && p.resume_session_id == sr.session_id
                 want = p.title[]
                 break
             end
@@ -96,7 +96,7 @@ end
 Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
 Base.:(==)(a::SessionRow, b::SessionRow) = a.row_key == b.row_key
 
-function Bonito.jsrender(session::Bonito.Session, s::SessionRow)
+function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnostics.jl
     btn_label = isempty(s.session_id) ? "Import" : "Resume"
     running_pill = s.running ?
         DOM.span("running"; class = "bt-pill bt-pill-online") :
@@ -180,7 +180,7 @@ function group_summary_string(rs::Vector)
     return join(parts, "  ·  ")
 end
 
-function Bonito.jsrender(session::Bonito.Session, g::SessionGroup)
+function render_part(session::Bonito.Session, g::SessionGroup)   # timed: diagnostics.jl
     # Start a brand-new thread (fresh claude session, no resume) in this folder.
     # Like the session rows, this is a delegated `data-bt-action="session-pick"`
     # button (empty session_id ⇒ the import handler uses session/new and

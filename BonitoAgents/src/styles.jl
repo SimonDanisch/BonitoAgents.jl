@@ -10,6 +10,124 @@
 #   • one-shot actions go into a `.bt-menu` popover, not into a row of buttons;
 #   • outcomes are reported by a toast, never by rewriting a button's label;
 #   • spacing from the `--bt-space-*` scale, radii from `--bt-radius(-sm)`.
+# The browser's localStorage, for what a page only keeps for convenience (the
+# sidebar's width, the route to restore, drafts). Storage can be switched off
+# (SecurityError) or full (QuotaExceededError): those warn in the console and act
+# as "nothing stored". Anything else throws. Interpolate it:
+# `const store = $(STORAGE_JS);`.
+const STORAGE_JS = js"""(() => {
+    const refused = (error, key) => {
+        if (!(error instanceof DOMException) ||
+            !['SecurityError', 'QuotaExceededError'].includes(error.name)) throw error;
+        console.warn(`browser storage refused (${key}):`, error.message);
+    };
+    return {
+        get(key) { try { return localStorage.getItem(key); } catch (e) { refused(e, key); return null; } },
+        set(key, value) { try { localStorage.setItem(key, value); } catch (e) { refused(e, key); } },
+        remove(key) { try { localStorage.removeItem(key); } catch (e) { refused(e, key); } },
+    };
+})()"""
+
+# `text` onto the clipboard: resolves once it is there, rejects when it is not.
+# The async clipboard needs a secure context; a LAN http:// page falls back to a
+# selected textarea (iOS ignores `select()` without `setSelectionRange`, and
+# `readonly` keeps the keyboard shut). Interpolate it: `($(COPY_TEXT_JS))(text)`.
+const COPY_TEXT_JS = js"""(text) => {
+    const legacy = () => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+    };
+    return navigator.clipboard && window.isSecureContext ?
+        navigator.clipboard.writeText(text).catch(legacy) : legacy();
+}"""
+
+# The `⋯` trigger of a `.bt-menu`: toggles the list open, and while it is open a
+# click anywhere outside closes it. One capture listener per open (a re-open
+# replaces it), removed on every close path.
+const MENU_TOGGLE_JS = js"""event => {
+    event.stopPropagation();
+    const m = event.currentTarget.parentElement;
+    if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+    const open = m.classList.toggle('bt-menu-open');
+    if (open) {
+        m.__close = (ev) => {
+            if (m.contains(ev.target)) return;
+            m.classList.remove('bt-menu-open');
+            document.removeEventListener('click', m.__close, true);
+            m.__close = null;
+        };
+        document.addEventListener('click', m.__close, true);
+    }
+}"""
+
+# Closes the `.bt-menu` holding `event.currentTarget`: the first statements of a
+# menu item's handler (splice it in with `Bonito.JSString`).
+const MENU_CLOSE_JS = """
+    const m = event.currentTarget.closest('.bt-menu');
+    if (m) {
+        m.classList.remove('bt-menu-open');
+        if (m.__close) { document.removeEventListener('click', m.__close, true); m.__close = null; }
+    }"""
+
+"""
+    action_menu(items...; title = "More actions") -> Node
+
+A `⋯` button that opens `items` (`.bt-menu-item` buttons) in a popover.
+"""
+action_menu(items...; title::AbstractString = "More actions") = DOM.div(
+    DOM.button("⋯"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger",
+               title = title, onclick = MENU_TOGGLE_JS),
+    DOM.div(items; class = "bt-menu-list");
+    class = "bt-menu")
+
+"""
+    modal(content, session, is_open, title) -> Observable
+
+A form over the page (`.bt-modal-overlay`) while `is_open[]`. `content()` builds
+its body anew on every open. Closes on its ✕, on the backdrop and on Escape.
+"""
+function modal(content::Function, session::Bonito.Session, is_open::Observable{Bool},
+               title::AbstractString)
+    return map(session, is_open) do open
+        open || return DOM.div()
+        close = js"event => $(is_open).notify(false)"
+        DOM.div(
+            DOM.div(
+                DOM.div(DOM.span(title; class = "bt-modal-title"),
+                        DOM.button("✕"; class = "bt-btn bt-btn-ghost bt-btn-sm bt-modal-close",
+                                   title = "Close", onclick = close);
+                        class = "bt-modal-head"),
+                DOM.div(content(); class = "bt-modal-body");
+                class = "bt-modal-card",
+                # A click inside the card must not reach the backdrop handler.
+                onclick = js"event => event.stopPropagation()"),
+            # The listener is on the document (the overlay never has focus) and
+            # retires itself once the overlay is gone: the node is discarded when
+            # `is_open` flips, so there is nothing else to hang a teardown on.
+            js"""(() => {
+                const esc = (e) => {
+                    if (!document.querySelector('.bt-modal-overlay')) {
+                        document.removeEventListener('keydown', esc, true);
+                        return;
+                    }
+                    if (e.key === 'Escape') { e.stopPropagation(); $(is_open).notify(false); }
+                };
+                document.addEventListener('keydown', esc, true);
+            })()""";
+            class = "bt-modal-overlay",
+            onclick = close)
+    end
+end
+
 """
     connection_guard(session) -> Node
 
@@ -27,15 +145,22 @@ visible only once the drop has lasted longer than a blink, so the routine
 sub-second reconnect on a healthy link does not flash a modal. Anything typed
 or sent while Bonito is reconnecting is at risk, so a small dot changing colour
 was not a warning, it was a way to lose work. "connecting" is the retry phase,
-shown as reconnecting; "disconnected" is Bonito giving up after its retries,
-shown with a reload button. Before the first successful connection nothing is
-shown: the page is still loading then.
+shown as reconnecting; "disconnected" is Bonito's retries running out, shown
+with a reload button while Bonito goes on trying in the background. Before the
+first successful connection the page looks loaded and takes clicks that go
+nowhere (a chat opened from the sidebar shows an empty area: the server renders
+its loading card), so the card shows
+then too, once the first connection has taken longer than `first_connect`
+seconds or Bonito gave up on it. "expired" is final: the server has no
+session for this page (it restarted, or dropped the page after an hour away), so
+the page reloads itself, or asks first when a reload would lose unsent text (text
+kept as a chat's draft comes back after the reload, so it does not count).
 
 NOT the same signal as the in-chat status dot: that one is the AGENT session's
 liveness, this one is whether this browser tab can still talk to the server at
 all. Both matter, and they fail independently.
 """
-function connection_guard(session::Bonito.Session)
+function connection_guard(session::Bonito.Session; first_connect::Real = 4)
     css = Styles(
         CSS(".bt-conn-led",
             "position" => "fixed", "bottom" => "10px", "left" => "10px",
@@ -47,6 +172,7 @@ function connection_guard(session::Bonito.Session)
         CSS(".bt-conn-led[data-status=\"connected\"]",  "background" => "var(--bt-status-online)"),
         CSS(".bt-conn-led[data-status=\"connecting\"]", "background" => "var(--bt-warning)"),
         CSS(".bt-conn-led[data-status=\"disconnected\"]", "background" => "var(--bt-status-offline)"),
+        CSS(".bt-conn-led[data-status=\"expired\"]", "background" => "var(--bt-status-offline)"),
         # The overlay blocks from the first millisecond of a drop but only BECOMES
         # VISIBLE if the drop outlasts a blink: Bonito reconnects a healthy local
         # link within milliseconds, and a modal flashing on every such blip would
@@ -74,13 +200,14 @@ function connection_guard(session::Bonito.Session)
             "position" => "relative", "width" => "44px", "height" => "44px", "margin-bottom" => "8px",
             "border-radius" => "50%", "border" => "3px solid var(--bt-border)",
             "border-top-color" => "var(--bt-warning)",
-            "animation" => "bt-conn-spin 0.9s linear infinite"),
+            "animation" => "bt-conn-spin 0.9s steps(8) infinite"),
         CSS("@keyframes bt-conn-spin", CSS("to", "transform" => "rotate(360deg)")),
-        # Given up: the ring stops, turns red and shows an exclamation mark.
-        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph",
+        # Given up, or nothing left to reconnect to: the ring stops, turns red and
+        # shows an exclamation mark.
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph, .bt-conn-modal[data-status=\"expired\"] .bt-conn-glyph",
             "animation" => "none", "border-color" => "var(--bt-status-offline)",
             "background" => "color-mix(in srgb, var(--bt-status-offline) 12%, transparent)"),
-        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph::after",
+        CSS(".bt-conn-modal[data-status=\"disconnected\"] .bt-conn-glyph::after, .bt-conn-modal[data-status=\"expired\"] .bt-conn-glyph::after",
             "content" => "\"!\"", "position" => "absolute", "inset" => "0",
             "display" => "flex", "align-items" => "center", "justify-content" => "center",
             "font-weight" => "700", "font-size" => "22px", "color" => "var(--bt-status-offline)"),
@@ -119,13 +246,41 @@ function connection_guard(session::Bonito.Session)
         const msg     = modal.querySelector('.bt-conn-msg');
         const elapsed = modal.querySelector('.bt-conn-elapsed');
         const titles = {connected: 'Connected to the server', connecting: 'Reconnecting to the server…',
-                        disconnected: 'Disconnected from the server', no_connection: 'No server connection'};
+                        disconnected: 'Disconnected from the server', no_connection: 'No server connection',
+                        expired: 'This page has to be reloaded'};
         const copy = {
+            first:        ['Connecting to the server',
+                           'This page has not reached the server yet, so nothing on it works until it does. It keeps trying; reloading often helps.'],
+            first_failed: ['Could not reach the server',
+                           'This page never reached the server, so nothing on it works. Reload it to try again.'],
             connecting:   ['Reconnecting to the server',
                            'The link to the server dropped. The composer is locked until it is back, so nothing you type is lost.'],
             disconnected: ['Connection lost',
-                           'Reconnecting did not succeed. Reload the page to continue; anything sent since the drop did not reach the server.'],
+                           'Reconnecting has not worked yet. The page keeps trying by itself; reloading it may be quicker.'],
+            expired:      ['This page has to be reloaded',
+                           'The server restarted, or this page sat unused for over an hour, so it cannot reconnect. Copy what you typed, then reload.'],
         };
+        // Text typed into a chat composer that a reload would throw away: not
+        // sent, and not kept as the chat's draft either (bonitoagents.js keeps one
+        // per chat in localStorage and puts it back after a reload, unless the
+        // storage is full or off). What the page rendered into it (the yolo
+        // reminders) the server keeps.
+        const store = $(STORAGE_JS);
+        const draftOf = t => {
+            const pid = t.closest('.bt-chatpane')?.dataset.panePid;
+            return pid ? store.get('bt-draft:' + pid) : null;
+        };
+        const unsent = () => Array.from(document.querySelectorAll('textarea.bt-text-input'))
+            .some(t => t.value.trim() !== '' && t.value !== t.defaultValue && t.value !== draftOf(t));
+        function reloadWhenShown() {
+            if (document.visibilityState === 'visible') { window.location.reload(); return; }
+            const onShow = () => {
+                if (document.visibilityState !== 'visible') return;
+                document.removeEventListener('visibilitychange', onShow);
+                window.location.reload();
+            };
+            document.addEventListener('visibilitychange', onShow);
+        }
         // While the guard is up, a keystroke aimed at an editable element goes
         // nowhere: the overlay stops clicks, this stops the textarea that still
         // had focus when the socket dropped.
@@ -133,13 +288,16 @@ function connection_guard(session::Bonito.Session)
         let wasConnected = false, blocking = false, since = 0, ticker = null;
         function tick() {
             const s = Math.max(0, Math.round((Date.now() - since) / 1000));
-            elapsed.textContent = modal.dataset.status === 'disconnected'
-                ? 'Gave up after ' + s + ' s'
+            const st = modal.dataset.status;
+            elapsed.textContent = st === 'expired' ? ''
+                : st === 'disconnected' ? 'Offline for ' + s + ' s'
                 : (s < 1 ? 'Trying again…' : 'Trying again for ' + s + ' s');
         }
-        function setBlocked(on, status) {
+        // `key` picks the words (the first connection has its own), `status`
+        // the look.
+        function setBlocked(on, status, key = status) {
             modal.dataset.status = status;
-            if (on && copy[status]) { title.textContent = copy[status][0]; msg.textContent = copy[status][1]; }
+            if (on && copy[key]) { title.textContent = copy[key][0]; msg.textContent = copy[key][1]; }
             if (on === blocking) { on && tick(); return; }
             blocking = on;
             modal.classList.toggle('bt-conn-open', on);
@@ -156,19 +314,162 @@ function connection_guard(session::Bonito.Session)
                 document.removeEventListener('paste', swallow, true);
             }
         }
+        // A connection that does not come back may be a login that ended: the
+        // login gate turns the websocket away, which a browser reports as
+        // nothing but a failed connection, and the card said "Reconnecting"
+        // forever, a hung server to anyone looking. Asked once per drop, after a
+        // moment (a blip is back by then): if so, the login card says so, over
+        // this one, and the page goes on once the login is back.
+        // Back from the login, the page reconnects at once. Bonito ignores that
+        // while its own retries still run, and they can run out before their
+        // next attempt: one more round when they give up.
+        let loginAsked = false, reviveOnGiveUp = false;
+        const revive = () => window.WEBSOCKET && window.WEBSOCKET.retry_connection();
+        const askLogin = () => {
+            if (loginAsked) return;
+            loginAsked = true;
+            setTimeout(() => {
+                if (!blocking) return;
+                $(LoginLib).then(login => login.check().then(s => s === 'ended' &&
+                    login.logged_in().then(() => { reviveOnGiveUp = true; revive(); })));
+            }, 2000);
+        };
+        // The first connection is normally up well within a second.
+        const firstWait = setTimeout(() => { if (!wasConnected) { setBlocked(true, 'connecting', 'first'); askLogin(); } },
+                                     $(round(Int, 1000 * first_connect)));
         Bonito.register_connection_indicator({ onStatusChange(status) {
             led.dataset.status = status; led.title = titles[status] || titles.disconnected;
-            if (status === 'connected') { wasConnected = true; setBlocked(false, status); return; }
-            if (status === 'no_connection') { setBlocked(false, status); return; }
-            if (!wasConnected) return;            // first load: the page is still coming up
+            if (status === 'connected') {
+                wasConnected = true; loginAsked = false; reviveOnGiveUp = false;
+                clearTimeout(firstWait); setBlocked(false, status); return;
+            }
+            if (status === 'disconnected' && reviveOnGiveUp) { reviveOnGiveUp = false; revive(); return; }
+            if (status === 'no_connection') { clearTimeout(firstWait); setBlocked(false, status); return; }
+            // The server has no session for this page (Bonito: close code 4404).
+            // Nothing will reconnect it, and before the first connection too:
+            // a page restored from the back/forward cache never connects at all.
+            if (status === 'expired') {
+                clearTimeout(firstWait);          // it has its own way out
+                $(ChatLib).then(lib => {
+                    lib.flushDrafts();            // text typed just now counts as kept
+                    if (unsent()) { setBlocked(true, status); return; }
+                    // Its login ended too (the server restarted with Authelia),
+                    // a reload lands on the login page, and a login made there
+                    // drops the one the other tabs have meanwhile: this tab
+                    // waits for the login, with its card, and reloads after.
+                    $(LoginLib).then(login => login.check()
+                        .then(s => s === 'ended' ? login.logged_in() : null)
+                        .then(reloadWhenShown));
+                });
+                return;
+            }
+            if (!wasConnected) {
+                // Still loading: `firstWait` shows the card if it takes too long,
+                // and giving up shows it at once.
+                if (status === 'disconnected') { clearTimeout(firstWait); setBlocked(true, status, 'first_failed'); askLogin(); }
+                return;
+            }
             setBlocked(true, status);
+            askLogin();
         }});
     }""")
     return root
 end
 
-const BASE_CSS = [
-    CSS(":root",
+# Where a page reports how its load went (`page_load_report`).
+const PAGE_TIMING_ROUTE = "/page-timing"
+
+"""
+    page_load_report(session) -> Node
+
+The page's own account of its load, for the server log (`PAGE_TIMING_ROUTE`):
+when its HTML arrived, its scripts ran, its connection came up and the chat it
+opened showed its rows, and its slowest downloads. Sent once the page is usable,
+or after `give_up` seconds if it never gets there, as a plain HTTP request, which
+gets through when the page's own connection does not. A phone that took minutes
+left no trace on the server before.
+"""
+function page_load_report(session::Bonito.Session; give_up::Real = 60)
+    node = DOM.div(; class = "bt-page-load-report", style = "display:none")
+    Bonito.onload(session, node, js"""() => {
+        const t = {hidden: document.visibilityState !== 'visible'};
+        const mark = k => { if (!(k in t)) { t[k] = Math.round(performance.now()); check(); } };
+        let sent = false;
+        const send = why => {
+            if (sent) return;
+            sent = true;
+            const n = performance.getEntriesByType('navigation')[0];
+            const slow = performance.getEntriesByType('resource')
+                .filter(e => e.duration > 1000).sort((a, b) => b.duration - a.duration).slice(0, 5)
+                .map(e => [e.name.replace(location.origin, '').slice(0, 100), Math.round(e.duration), Math.round(e.transferSize / 1024), {
+                    before_request_ms: e.requestStart ? Math.round(e.requestStart - e.startTime) : null,
+                    response_wait_ms: e.responseStart ? Math.round(e.responseStart - e.requestStart) : null,
+                    download_ms: e.responseStart ? Math.round(e.responseEnd - e.responseStart) : null,
+                    protocol: e.nextHopProtocol, initiator: e.initiatorType
+                }]);
+            navigator.sendBeacon($(PAGE_TIMING_ROUTE), JSON.stringify(Object.assign({
+                why, view: document.querySelector('.bt-main-views')?.dataset.activeView || '',
+                html: Math.round(n ? n.responseEnd : 0), scripts: Math.round(n ? n.domContentLoadedEventEnd : 0),
+                waited: Math.round(performance.now()),
+                status: document.querySelector('.bt-conn-led')?.dataset.status || '', slow}, t)));
+        };
+        // Usable: connected, and a chat on screen shows its rows.
+        const check = () => {
+            const view = document.querySelector('.bt-main-views')?.dataset.activeView || '';
+            const onChat = view !== '' && view !== $(SETTINGS_VIEW);
+            if ('connected' in t && (!onChat || 'chat_settled' in t)) send('ready');
+        };
+        const led = document.querySelector('.bt-conn-led');
+        const watch = () => led && led.dataset.status === 'connected' && mark('connected');
+        led && new MutationObserver(watch).observe(led, {attributes: true, attributeFilter: ['data-status']});
+        window.addEventListener('bt-chat-settled', () => mark('chat_settled'));
+        watch();
+        setTimeout(() => send('gave_up'), $(round(Int, 1000 * give_up)));
+    }""")
+    return node
+end
+
+# Answers only through the login: what `login_guard` asks.
+const LOGIN_CHECK_ROUTE = "/session"
+
+# The login as the tabs of one browser share it. Served on its own route too,
+# for Authelia's login page (`LOGIN_SCRIPT_ROUTE`).
+const LOGIN_JS = joinpath(@__DIR__, "..", "assets", "login.js")
+const LoginLib = Bonito.ES6Module(LOGIN_JS)
+
+"""
+    login_guard(session, auth)
+
+Behind a login, an open tab checks every few minutes (and when it becomes
+visible again) that its login still lets requests through: that keeps the login
+alive while the tab is open, and when it has ended anyway (its time was up, an
+admin disabled the account) the tab says so, with a way to log in again, instead
+of failing on the next thing it loads. A chat opened meanwhile comes up once the
+login is back. Uses the connection guard's card.
+"""
+login_guard(::Bonito.Session, ::OpenAuth) = DOM.div()
+
+function login_guard(session::Bonito.Session, ::LoginAuth)
+    modal = DOM.div(
+        DOM.div(
+            DOM.div(; class = "bt-conn-glyph"),
+            DOM.div("Your login has ended"; class = "bt-conn-title"),
+            # Never a reload: that took whatever was typed with it. The login
+            # happens in a new tab, and this page goes on once it is back.
+            DOM.div("Log in again in a new tab. This page stays as it is and goes on by itself " *
+                    "once you are logged in."; class = "bt-conn-msg"),
+            DOM.button("Log in (new tab)"; class = "bt-btn bt-conn-reload", type = "button",
+                       onclick = js"() => window.open(window.location.origin + '/', '_blank')");
+            class = "bt-conn-card", role = "alertdialog", var"aria-live" = "assertive");
+        class = "bt-conn-modal bt-login-ended", dataStatus = "disconnected")
+    Bonito.onload(session, modal, js"(modal) => $(LoginLib).then(login => login.guard(modal))")
+    return modal
+end
+
+
+# The design tokens (`--bt-*`): the one rule a component used outside the
+# dashboard needs from the base (see MeshViewStyles / MediaStyles).
+const THEME_TOKENS = CSS(":root",
         # `color-scheme` is NOT declared here — see the `html:root` rule in the
         # reset below for why a plain `:root` loses the cascade to BonitoWidgets.
         "--bt-bg"            => "#fafaf9",
@@ -207,33 +508,13 @@ const BASE_CSS = [
         "--bt-status-online"  => "#16a34a",
         "--bt-status-active"  => "#16a34a",
         "--bt-status-offline" => "#dc2626",
-        "--bt-status-update"  => "#f59e0b"),
+        "--bt-status-update"  => "#f59e0b")
 
-    # ── Reset ────────────────────────────────────────────────────────────────
-    # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
-    # whose desktop is in dark mode gets the UA's DARK defaults for every native
-    # control that doesn't set its own colour: the "new project" worker dropdown
-    # rendered white-on-white and read as an empty box, with nothing in any
-    # stylesheet to blame for the white text. It fixes that whole class at once —
-    # selects, inputs, scrollbars, the native pickers — rather than one
-    # hard-coded colour per control (which is what forcing Monaco's "vs" theme in
-    # chat.jl already had to do).
-    #
-    # `html:root` rather than plain `:root`: BonitoWidgets ships
-    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }`, which
-    # has the SAME specificity and lands later in the cascade, so a plain `:root`
-    # here silently loses. The extra type selector wins on specificity instead of
-    # on source order, which no amount of include-order shuffling can undo.
-    CSS("html:root", "color-scheme" => "light"),
-    # Class-toggle helper: collapses an element without removing it from the
-    # DOM, so interactive state (a folder selection, scan results, focus)
-    # survives while it is hidden.
-    CSS(".bt-hidden", "display" => "none !important"),
-
-    # ── Buttons ──────────────────────────────────────────────────────────────
-    # `.bt-btn` is the filled primary; `-secondary` the bordered surface button
-    # (most controls); `-ghost` borderless; `-danger` for the destructive one;
-    # `-sm` the compact size used in headers and cards.
+# `.bt-btn` is the filled primary; `-secondary` the bordered surface button
+# (most controls); `-ghost` borderless; `-danger` for the destructive one;
+# `-sm` the compact size used in headers and cards. Part of BASE_CSS, and of
+# every sheet that is mounted on its own (a shared page).
+const BUTTON_CSS = [
     CSS(".bt-btn",
         "appearance" => "none", "border" => "1px solid transparent",
         "padding" => "6px 12px",
@@ -241,7 +522,7 @@ const BASE_CSS = [
         "background" => "var(--bt-accent)", "color" => "#fff",
         "font" => "inherit", "font-size" => "13px", "font-weight" => "500",
         "line-height" => "18px",
-        "cursor" => "pointer",
+        "cursor" => "pointer", "text-decoration" => "none",
         # Never break the label across lines: a narrow viewport would otherwise
         # let "+ New project" wrap to two lines inside the button.
         "white-space" => "nowrap",
@@ -268,6 +549,33 @@ const BASE_CSS = [
         "opacity" => "0.7", "cursor" => "wait"),
     CSS(".bt-btn-sm",
         "padding" => "3px 9px", "font-size" => "12px"),
+]
+
+const BASE_CSS = [
+    THEME_TOKENS,
+
+    # ── Reset ────────────────────────────────────────────────────────────────
+    # This is a LIGHT app, and it has to SAY so. Without `color-scheme`, a user
+    # whose desktop is in dark mode gets the UA's DARK defaults for every native
+    # control that doesn't set its own colour: the "new project" worker dropdown
+    # rendered white-on-white and read as an empty box, with nothing in any
+    # stylesheet to blame for the white text. It fixes that whole class at once —
+    # selects, inputs, scrollbars, the native pickers — rather than one
+    # hard-coded colour per control (which is what forcing Monaco's "vs" theme in
+    # chat.jl already had to do).
+    #
+    # `html:root` rather than plain `:root`: BonitoWidgets ships
+    # `@media (prefers-color-scheme: dark) { :root { color-scheme: dark } }`, which
+    # has the SAME specificity and lands later in the cascade, so a plain `:root`
+    # here silently loses. The extra type selector wins on specificity instead of
+    # on source order, which no amount of include-order shuffling can undo.
+    CSS("html:root", "color-scheme" => "light"),
+    # Class-toggle helper: collapses an element without removing it from the
+    # DOM, so interactive state (a folder selection, scan results, focus)
+    # survives while it is hidden.
+    CSS(".bt-hidden", "display" => "none !important"),
+
+    BUTTON_CSS...,
 
     # ── Menu: a popover of one-shot actions ──────────────────────────────────
     # `.bt-menu` wraps a trigger button and a `.bt-menu-list`; the trigger
@@ -289,8 +597,6 @@ const BASE_CSS = [
         "z-index" => "60",
         "text-align" => "left"),
     CSS(".bt-menu-open > .bt-menu-list", "display" => "block"),
-    CSS(".bt-chat-icon-menu", "position" => "fixed", "display" => "block",
-        "right" => "auto", "bottom" => "auto", "z-index" => "10000"),
     CSS(".bt-menu-title",
         "font-size" => "11px", "font-weight" => "600",
         "letter-spacing" => "0.06em", "text-transform" => "uppercase",
@@ -306,6 +612,12 @@ const BASE_CSS = [
         "border-radius" => "var(--bt-radius-sm)",
         "cursor" => "pointer", "white-space" => "nowrap"),
     CSS(".bt-menu-item:hover", "background" => "var(--bt-surface-2)"),
+    # The chat's "Export as Markdown" item is an <a download>, not a <button>:
+    # strip the anchor defaults (underline, link colours) so it reads exactly
+    # like its sibling items.
+    CSS(".bt-menu-item.bt-header-export",
+        "text-decoration" => "none", "color" => "var(--bt-text)"),
+    CSS(".bt-menu-item.bt-header-export:visited", "color" => "var(--bt-text)"),
     CSS(".bt-menu-sep",
         "height" => "1px", "background" => "var(--bt-border)", "margin" => "4px 6px"),
     CSS(".bt-menu-danger", "color" => "var(--bt-error)"),
@@ -356,8 +668,10 @@ const BASE_CSS = [
         "z-index" => "9998",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "var(--bt-space-2)",
-        "min-width" => "min(320px, 92vw)",
-        "max-width" => "min(760px, 92vw)",
+        # One fixed width, not a range: sized to its content, the card changed
+        # width with every file path it showed (hundreds a second in a copy).
+        # The path is cut with an ellipsis instead (`.bt-prog-msg`).
+        "width" => "min(600px, 92vw)", "box-sizing" => "border-box",
         "padding" => "8px 10px 8px 12px",
         "background" => "var(--bt-surface)",
         "border" => "1px solid var(--bt-border-strong)",
@@ -381,9 +695,10 @@ const BASE_CSS = [
     CSS(".bt-prog-row",
         "display" => "flex", "align-items" => "center",
         "gap" => "var(--bt-space-2)", "min-width" => "0"),
+    # Wraps rather than overflowing the fixed width: an outcome ("New chat on
+    # …, with the agent's memory. …") can be longer than a line.
     CSS(".bt-prog-title",
-        "font-weight" => "600", "flex" => "0 0 auto",
-        "white-space" => "nowrap"),
+        "font-weight" => "600", "flex" => "0 1 auto", "min-width" => "0"),
     CSS(".bt-prog-pct",
         "font-variant-numeric" => "tabular-nums",
         "color" => "var(--bt-text-muted)",
@@ -394,7 +709,7 @@ const BASE_CSS = [
         "color" => "var(--bt-text-muted)",
         "font-family" => "ui-monospace, monospace",
         "font-size" => "var(--bt-text-xs)",
-        "flex" => "1 1 auto", "min-width" => "0",
+        "flex" => "1 1 0", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
     # Spinner only while something is actually in flight — a still card with a
@@ -406,7 +721,7 @@ const BASE_CSS = [
         "border" => "2px solid var(--bt-border-strong)",
         "border-top-color" => "var(--bt-accent)",
         "border-radius" => "50%",
-        "animation" => "bt-prog-spin 0.7s linear infinite"),
+        "animation" => "bt-prog-spin 0.7s steps(8) infinite"),
     CSS("@keyframes bt-prog-spin",
         CSS("from", "transform" => "rotate(0deg)"),
         CSS("to",   "transform" => "rotate(360deg)")),
@@ -446,6 +761,258 @@ const BASE_CSS = [
     CSS(".bt-prog-close", "flex" => "0 0 auto"),
     CSS(".bt-prog-run .bt-prog-close", "display" => "none"),
 ]
+
+# What each file kind shows (file_view.jl `file_viewer`): in the chat's bubbles
+# and file tabs, and on a shared link's page (shares.jl).
+const FILE_VIEW_CSS = [
+    CSS(".bt-fv-badge",
+        "font-size" => "10px", "text-transform" => "uppercase",
+        "letter-spacing" => "0.04em",
+        "color" => "var(--bt-text-faint)",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "999px", "padding" => "1px 7px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-fv-error", "margin" => "12px"),
+    CSS(".bt-fv-loading",
+        "padding" => "16px", "font-size" => "12.5px",
+        "color" => "var(--bt-text-faint)", "font-style" => "italic"),
+    CSS(".bt-fv-error-title", "font-weight" => "600"),
+    CSS(".bt-fv-error-detail",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "margin-top" => "4px", "opacity" => "0.85"),
+
+    # Image stage: a checkerboard so transparency reads as transparency, and the
+    # image centred + contained rather than pinned to the top-left.
+    CSS(".bt-fv-image-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background-color" => "var(--bt-surface)",
+        "background-image" => string(
+            "linear-gradient(45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(-45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
+            "linear-gradient(45deg, transparent 75%, rgba(15,23,42,0.06) 75%),",
+            "linear-gradient(-45deg, transparent 75%, rgba(15,23,42,0.06) 75%)"),
+        "background-size" => "18px 18px",
+        "background-position" => "0 0, 0 9px, 9px -9px, -9px 0"),
+    # An IMAGE is shown at its own size, shrunk to fit. `max-height: 100%` on the
+    # <img> ALONE does nothing: the percentage resolves against `.bt-media-wrap`,
+    # whose own height comes from its content, so a 1500px-tall image kept every
+    # pixel and ran off the bottom of the tab. The wrap has to be a flex box
+    # that is allowed to shrink (`min-height: 0`) before the image inside it can.
+    CSS(".bt-fv-image-stage .bt-media-wrap",
+        "max-height" => "100%", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-image-stage img.bt-media",
+        "max-height" => "100%", "min-height" => "0", "object-fit" => "contain"),
+    # A VIDEO instead FILLS its stage and letterboxes, the way every video player
+    # behaves. Left at its intrinsic size a small clip renders as a handful of
+    # pixels with the browser's controls collapsed into nothing: you can see the
+    # file but you cannot play it, which is the one thing a video tab is for.
+    # Sized on the WRAP (whose containing block is the stage, and so has a real
+    # size) rather than by a minimum on the video — a percentage minimum there
+    # resolves against the shrink-to-fit wrapper and comes out as zero.
+    CSS(".bt-fv-video-stage .bt-media-wrap", "width" => "100%", "height" => "100%"),
+    CSS(".bt-fv-video-stage video.bt-media",
+        "width" => "100%", "height" => "100%", "object-fit" => "contain"),
+
+    # Video gets a stage of its own: centred, on a dark backdrop (the neutral
+    # surround every video player uses), and CONTAINED — `media_element` caps
+    # width only, so without the max-height here a portrait or 4K clip pushes its
+    # own controls off the bottom of the tab.
+    CSS(".bt-fv-video-stage",
+        "flex" => "1 1 auto", "min-height" => "0",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center",
+        "padding" => "12px", "overflow" => "auto",
+        "background" => "#1b1d21"),
+    CSS(".bt-fv-audio-wrap",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
+        "align-items" => "center", "justify-content" => "center",
+        "padding" => "24px", "flex" => "1 1 auto"),
+    CSS(".bt-fv-audio", "width" => "min(520px, 100%)"),
+    CSS(".bt-fv-audio-name",
+        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace"),
+
+    CSS(".bt-fv-markdown",
+        "padding" => "16px 22px", "overflow" => "auto",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    # Inside a chat bubble the preview is one block among many — no pane padding,
+    # and capped so a 900-line README doesn't bury the rest of the turn.
+    CSS(".bt-tool-body .bt-fv-markdown",
+        "padding" => "0", "max-height" => "420px"),
+
+    # Frames (pdf / html). `border:none` + a surface background so a page that
+    # doesn't set its own doesn't render as a grey void.
+    CSS(".bt-fv-frame-wrap",
+        "flex" => "1 1 auto", "min-height" => "0", "display" => "flex"),
+    CSS(".bt-fv-frame",
+        "flex" => "1 1 auto", "width" => "100%", "border" => "none",
+        "background" => "#fff", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-frame-wrap", "height" => "480px"),
+
+    # ── Table (csv / tsv) ────────────────────────────────────────────────────
+    CSS(".bt-fv-table-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-table-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "10px",
+        "padding" => "6px 10px", "flex-shrink" => "0",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table-filter",
+        "flex" => "0 1 260px", "font-size" => "12px",
+        "padding" => "3px 8px", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
+    CSS(".bt-fv-table-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-table-scroll",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto"),
+    CSS(".bt-tool-body .bt-fv-table-scroll", "max-height" => "420px"),
+    CSS(".bt-fv-table",
+        "border-collapse" => "separate", "border-spacing" => "0",
+        "font-size" => "12px", "font-family" => "ui-monospace, monospace",
+        "width" => "max-content", "min-width" => "100%"),
+    CSS(".bt-fv-table th",
+        # Sticky header: scrolling a 5000-row table without losing the column
+        # names is most of what makes this better than looking at the raw text.
+        "position" => "sticky", "top" => "0", "z-index" => "1",
+        "background" => "var(--bt-surface-2)",
+        "border-bottom" => "1px solid var(--bt-border)",
+        "padding" => "5px 10px", "text-align" => "left",
+        "white-space" => "nowrap", "font-weight" => "600"),
+    CSS(".bt-fv-table td",
+        "padding" => "3px 10px", "white-space" => "nowrap",
+        "border-bottom" => "1px solid var(--bt-border)"),
+    CSS(".bt-fv-table tbody tr:hover td", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-fv-table .bt-fv-num", "text-align" => "right"),
+    CSS(".bt-fv-table .bt-fv-rownum",
+        "color" => "var(--bt-text-faint)", "text-align" => "right",
+        "user-select" => "none",
+        "position" => "sticky", "left" => "0",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-table th.bt-fv-rownum", "background" => "var(--bt-surface-2)", "z-index" => "2"),
+    CSS(".bt-fv-sortable", "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-fv-sort-arrow", "opacity" => "0.35", "margin-left" => "6px"),
+    CSS(".bt-fv-sortable:hover .bt-fv-sort-arrow", "opacity" => "0.8"),
+
+    # ── Notebook ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-notebook",
+        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
+        "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
+        "gap" => "10px"),
+    # Cells keep their height: the notebook scrolls. Shrinkable cells squeezed
+    # every cell of a notebook taller than its panel and clipped their outputs.
+    CSS(".bt-fv-nb-cell",
+        "flex-shrink" => "0",
+        "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
+    CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-source", "background" => "var(--bt-surface-2)", "padding" => "6px 8px"),
+    CSS(".bt-fv-nb-outputs",
+        "border-top" => "1px solid var(--bt-border)", "padding" => "8px 12px",
+        "background" => "var(--bt-surface)"),
+    CSS(".bt-fv-nb-text",
+        "margin" => "0", "font-family" => "ui-monospace, monospace",
+        "font-size" => "11.5px", "white-space" => "pre-wrap",
+        "max-height" => "320px", "overflow" => "auto"),
+    CSS(".bt-fv-nb-image", "max-width" => "100%", "display" => "block"),
+    CSS(".bt-fv-more",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "font-style" => "italic", "padding" => "4px 2px"),
+
+    # ── Hex dump ─────────────────────────────────────────────────────────────
+    CSS(".bt-fv-hex-wrap",
+        "display" => "flex", "flex-direction" => "column",
+        "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-fv-hex-bar",
+        "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "6px 10px", "flex-shrink" => "0"),
+    CSS(".bt-fv-hex-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
+    CSS(".bt-fv-hex",
+        "margin" => "0", "padding" => "0 12px 12px",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
+        "line-height" => "1.5", "color" => "var(--bt-text-muted)",
+        "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
+    CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
+    # Read-only code that fills its box and scrolls itself (a shared link's page);
+    # in a chat bubble it is static code as tall as the text (`CodeView`).
+    CSS(".bt-fv-code", "flex" => "1 1 auto", "min-height" => "0", "height" => "100%"),
+    CSS(".bt-fv-code > div, .bt-fv-code .monaco-editor-div", "height" => "100%", "min-height" => "0"),
+]
+
+# The 3D viewer (file_view.jl `MeshViewer`), in the chat and on shared pages.
+const MESH_VIEW_CSS = [
+    CSS(".bt-mesh-view",
+        "position" => "relative", "flex" => "1 1 auto",
+        "min-height" => "0", "display" => "flex"),
+    # Inline (chat bubble) has no panel to fill, so it needs an explicit box.
+    CSS(""".bt-mesh-view[data-mode="inline"]""", "height" => "360px"),
+    CSS(".bt-mesh-canvas",
+        "flex" => "1 1 auto", "width" => "100%", "height" => "100%",
+        "display" => "block", "touch-action" => "none", "cursor" => "grab"),
+    CSS(".bt-mesh-canvas:active", "cursor" => "grabbing"),
+    CSS(".bt-mesh-toolbar",
+        "position" => "absolute", "top" => "8px", "right" => "8px",
+        "display" => "flex", "gap" => "4px"),
+    CSS(".bt-mesh-btn",
+        "border" => "1px solid var(--bt-border)", "background" => "var(--bt-surface)",
+        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "border-radius" => "var(--bt-radius-sm)", "padding" => "4px", "line-height" => "0"),
+    CSS(".bt-mesh-btn svg", "width" => "14px", "height" => "14px", "display" => "block"),
+    CSS(".bt-mesh-btn:hover", "color" => "var(--bt-text)"),
+    CSS(""".bt-mesh-btn[data-on="1"]""",
+        "background" => "var(--bt-accent)", "color" => "#fff", "border-color" => "var(--bt-accent)"),
+    CSS(".bt-mesh-btn:disabled", "opacity" => "0.4", "cursor" => "default"),
+    CSS(".bt-mesh-status",
+        "position" => "absolute", "left" => "10px", "bottom" => "8px",
+        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "pointer-events" => "none"),
+]
+
+# Pictures and clips (chat.jl `media_element`) with their hover actions and the
+# click-to-enlarge lightbox: in the chat, and on a shared link's page.
+const MEDIA_CSS = [
+    # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
+    # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
+    # of the media and closes on backdrop click or Esc.
+    # `vertical-align: top`: an inline-block sits on the text baseline, with the
+    # descender gap of the line below it; at the top the line is the picture's
+    # height exactly, the height a placeholder reserves for it (`bodyReserve`).
+    CSS(".bt-media-wrap",
+        "position" => "relative", "display" => "inline-block", "max-width" => "100%",
+        "vertical-align" => "top"),
+    # Hover action row (enlarge · copy · download), top-right of the media.
+    CSS(".bt-media-actions",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "display" => "flex", "gap" => "4px",
+        "opacity" => "0", "transition" => "opacity 80ms"),
+    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
+    CSS(".bt-media-action",
+        "appearance" => "none", "border" => "none",
+        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
+        "font-size" => "14px", "line-height" => "1",
+        "padding" => "4px 7px", "border-radius" => "6px",
+        "cursor" => "pointer"),
+    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
+    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+    # Without hover (touch screens) the actions would stay invisible yet take
+    # the taps that land on them: show them. Specific enough to win wherever it
+    # lands: `Styles` merges every "@media (hover: none)" of a sheet into the
+    # place of the first one, which can be before the rule it overrides.
+    CSS("@media (hover: none)", CSS(".bt-media-wrap .bt-media-actions", "opacity" => "1")),
+    CSS(".bt-lightbox-overlay",
+        "position" => "fixed", "inset" => "0", "z-index" => "9999",
+        "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
+        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
+    CSS(".bt-lightbox-media",
+        "max-width" => "95vw", "max-height" => "95vh",
+        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)"),
+]
+
+# Each viewer carries its own sheet, so it renders outside the dashboard too.
+# Bonito renders a CSS object once per session: in the dashboard they cost nothing.
+const MeshViewStyles = Bonito.Styles(THEME_TOKENS, MESH_VIEW_CSS...)
+const MediaStyles    = Bonito.Styles(THEME_TOKENS, MEDIA_CSS...)
+const FileViewStyles = Bonito.Styles(THEME_TOKENS, FILE_VIEW_CSS...)
 
 const ChatStyles = Bonito.Styles(
     BASE_CSS...,
@@ -487,13 +1054,18 @@ const ChatStyles = Bonito.Styles(
         "min-height" => "44px",
         "box-sizing" => "border-box"),
     CSS(".bt-session-notice",
-        "display" => "flex", "justify-content" => "space-between",
+        "display" => "flex", "justify-content" => "space-between", "align-items" => "start",
         "gap" => "var(--bt-space-2)", "padding" => "var(--bt-space-2) var(--bt-space-4)",
         "background" => "var(--bt-surface)", "border-bottom" => "1px solid var(--bt-border)",
         "flex-shrink" => "0", "max-height" => "25vh", "overflow" => "auto"),
     CSS(".bt-session-notice[hidden]", "display" => "none"),
-    CSS(".bt-session-notice-label", "color" => "var(--bt-warning)"),
-    CSS(".bt-session-notice[data-severity='error'] .bt-session-notice-label",
+    CSS(".bt-session-notice-body", "flex" => "1", "min-width" => "0"),
+    CSS(".bt-session-notice-title", "color" => "var(--bt-warning)",
+        "white-space" => "nowrap", "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "cursor" => "pointer"),
+    CSS(".bt-session-notice-body[open] .bt-session-notice-title",
+        "white-space" => "pre-wrap", "overflow-wrap" => "anywhere"),
+    CSS(".bt-session-notice[data-severity='error'] .bt-session-notice-title",
         "color" => "var(--bt-error)"),
     CSS(".bt-session-notice-text", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere"),
     CSS(".bt-header-row",
@@ -511,8 +1083,11 @@ const ChatStyles = Bonito.Styles(
     # `.bt-chatpane`: the dashboard's landing header shares the `.bt-header`
     # class but has none of the collapsible elements.
     CSS(".bt-chatpane .bt-header", "container-type" => "inline-size"),
-    # Collapse toggle (⋯). Checkbox-in-label pattern: no ids, state is
-    # pure CSS via :has(input:checked). Hidden on wide panes.
+    # Collapse toggle (⋯). A checkbox in a label; checking it puts
+    # `bt-header-open` on the header (`more_toggle`, chat.jl), which the rules
+    # below key on. Not `:has(input:checked)`: Chrome checks a `:has()` on every
+    # DOM change under its anchor, and a header rule anchored up there restyled
+    # every button in the chat on each one. Hidden on wide panes.
     CSS(".bt-header-collapse-toggle",
         "display" => "none", "align-items" => "center",
         "justify-content" => "center",
@@ -527,24 +1102,25 @@ const ChatStyles = Bonito.Styles(
         "padding" => "3px 9px",
         "cursor" => "pointer", "user-select" => "none",
         "flex" => "0 0 auto"),
+    # The checkbox covers its label, invisible but for its own keyboard focus
+    # ring, drawn around the whole toggle.
     CSS(".bt-header-collapse-toggle input",
-        "position" => "absolute", "opacity" => "0",
-        "width" => "0", "height" => "0", "pointer-events" => "none"),
+        "position" => "absolute", "inset" => "0", "margin" => "0",
+        "appearance" => "none", "background" => "transparent",
+        "border-radius" => "inherit", "cursor" => "pointer"),
+    CSS(".bt-header-collapse-toggle input:focus-visible",
+        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "1px"),
     CSS(".bt-header-collapse-toggle:hover",
         "background" => "var(--bt-surface-2)"),
-    # The real checkbox is visually hidden but still keyboard-focusable —
-    # surface its focus on the label so tab + space works with a visible ring.
-    CSS(".bt-header-collapse-toggle:has(input:focus-visible)",
-        "outline" => "2px solid var(--bt-accent)", "outline-offset" => "1px"),
-    CSS(".bt-header-collapse-toggle:has(input:checked)",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle",
         "background" => "var(--bt-surface-2)",
         "border-color" => "var(--bt-accent)"),
     # Glyph swap: ⋯ while closed, ✕ while open — the open toggle IS the
     # close button for the panel it revealed.
     CSS(".bt-header-collapse-toggle .bt-toggle-open", "display" => "none"),
-    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-open",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle .bt-toggle-open",
         "display" => "inline"),
-    CSS(".bt-header-collapse-toggle:has(input:checked) .bt-toggle-closed",
+    CSS(".bt-header.bt-header-open .bt-header-collapse-toggle .bt-toggle-closed",
         "display" => "none"),
     # Medium panes: the category prefixes ("model:" / "permissions:" /
     # "effort:") go — the values carry the meaning and each pill keeps its
@@ -571,28 +1147,31 @@ const ChatStyles = Bonito.Styles(
         # `nowrap` + `flex-start` undo the wide strip's wrapping: this is a
         # single vertical stack, and in column direction those two would wrap
         # into extra COLUMNS / bottom-align the stack.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-actions",
             "display" => "flex", "flex-direction" => "column",
             "align-items" => "stretch", "gap" => "8px",
             "flex-wrap" => "nowrap", "justify-content" => "flex-start",
             "flex-basis" => "100%", "margin" => "6px 0 0 0"),
         # The session group stacks too: one cell per row, hairlines between them
         # now on top instead of on the left, labels centered.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-session",
             "flex-direction" => "column", "align-items" => "stretch"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session > *, " *
-            ".bt-header-row:has(.bt-header-more-check:checked) .bt-header-session .bt-header-meta > *",
+        # The cells by class. (As `:has(...) .bt-header-session > *` this rule
+        # made Chrome restyle the whole chat, 15k elements, 65 ms, on every
+        # timer tick, streamed token and Monaco render, even on wide panes where
+        # the container query does not apply: see e2e:style_invalidation.)
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-session :is(.bt-header-usage, .bt-header-meta-item)",
             "border-left" => "0", "margin-left" => "0",
             "border-top" => "1px solid var(--bt-border)", "margin-top" => "-1px",
             "justify-content" => "center"),
         # No menu inside the menu: the expanded panel IS the ⋯ menu. The
         # actions menu's own ⋯ trigger goes, and its popover list lays out in
         # flow as part of the stack, so every action is one tap away.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu",
             "display" => "flex", "flex-direction" => "column"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-trigger",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu > .bt-menu-trigger",
             "display" => "none"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-menu > .bt-menu-list",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-menu > .bt-menu-list",
             "display" => "block", "position" => "static", "min-width" => "0",
             "padding" => "0", "border" => "0", "box-shadow" => "none",
             "background" => "transparent"),
@@ -601,10 +1180,10 @@ const ChatStyles = Bonito.Styles(
         # alignment only make sense in the wide control strip. Descendant
         # selector on purpose: the provider select / meta pills sit inside
         # `display:contents` sub-session fragments, so `> *` can't reach them.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-actions :is(select, button)",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-actions :is(select, button)",
             "max-width" => "none", "text-align" => "center"),
         # Inside the expanded panel the config pills stack like the buttons.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta",
             "flex-direction" => "column", "align-items" => "stretch",
             "white-space" => "normal"),
         # Stacked pills center their content (the pick pills are inline-flex,
@@ -612,13 +1191,13 @@ const ChatStyles = Bonito.Styles(
         # prefixes BACK: the medium-width rule drops "model:"/"permissions:"/
         # "effort:" to save strip space, but in a stacked menu a bare
         # "default" row is ambiguous and there is plenty of width.
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-item",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta-item",
             "justify-content" => "center", "text-align" => "center"),
-        CSS(".bt-header-row:has(.bt-header-more-check:checked) .bt-header-meta-cat",
+        CSS(".bt-header.bt-header-open .bt-header-row .bt-header-meta-cat",
             "display" => "inline"),
-        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-header-env",
+        CSS(".bt-header.bt-header-open .bt-header-env",
             "display" => "block"),
-        CSS(".bt-header:has(.bt-header-more-check:checked) .bt-lens-bar",
+        CSS(".bt-header.bt-header-open .bt-lens-bar",
             "display" => "flex")),
 
     # ── Lens search bar (header) ─────────────────────────────────────────────
@@ -826,13 +1405,19 @@ const ChatStyles = Bonito.Styles(
         "cursor" => "pointer",
         "white-space" => "nowrap",
         "flex" => "0 0 auto"),
-    CSS(".bt-header-restart-dead",
-        "animation" => "bt-restart-pulse 1.4s ease-in-out infinite"),
+    # The pulse is a ring on its own layer whose opacity animates (no repaint;
+    # see bt-pulse-glow).
+    CSS(".bt-header-restart-dead", "position" => "relative"),
+    CSS(".bt-header-restart-dead::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)",
+        "animation" => "bt-restart-pulse 1.4s steps(4, jump-none) infinite"),
     CSS(".bt-header-restart-dead:hover",
         "background" => "#fecaca"),
     CSS("@keyframes bt-restart-pulse",
-        CSS("0%, 100%", "box-shadow" => "0 0 0 0 rgba(220,38,38,0.0)"),
-        CSS("50%",      "box-shadow" => "0 0 0 6px rgba(220,38,38,0.15)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%",      "opacity" => "1")),
     # While a restart is running the chip shows this "working" state instead of
     # the red pulse — it reads as "restarting…", not as a failure to click
     # again; the handler ignores clicks meanwhile.
@@ -842,7 +1427,7 @@ const ChatStyles = Bonito.Styles(
         "color" => "var(--bt-text-muted)",
         "font-weight" => "500",
         "cursor" => "progress",
-        "animation" => "bt-restart-working 1s ease-in-out infinite"),
+        "animation" => "bt-restart-working 1s steps(3, jump-none) infinite"),
     CSS("@keyframes bt-restart-working",
         CSS("0%, 100%", "opacity" => "0.5"),
         CSS("50%",      "opacity" => "0.9")),
@@ -920,9 +1505,8 @@ const ChatStyles = Bonito.Styles(
         "color" => "#b45309", "background" => "rgba(245,158,11,0.10)"),
     CSS(".bt-header-actions .bt-header-session .bt-header-usage-high",
         "color" => "#b91c1c", "background" => "rgba(239,68,68,0.10)", "font-weight" => "600"),
-    # The label is a Bonito string-Observable: it renders as an INNER span
-    # (the fast-path swap node), so the outer node is never `:empty` itself.
-    CSS(".bt-header-usage:has(> span:empty)", "display" => "none !important"),
+    # No usage reported yet: an empty label (`usage_class`).
+    CSS(".bt-header-usage-empty", "display" => "none !important"),
     # (The provider switcher's own rules are gone with its native <select>: it
     # is a `dropdown_pill` now, styled by the `.bt-msearch` / `.bt-header-meta`
     # rules above like every other pill in the strip.)
@@ -1041,7 +1625,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "10px", "height" => "10px", "margin-left" => "6px",
         "border" => "2px solid var(--bt-border-strong)",
         "border-top-color" => "var(--bt-accent)", "border-radius" => "50%",
-        "animation" => "bt-prog-spin 0.7s linear infinite"),
+        "animation" => "bt-prog-spin 0.7s steps(8) infinite"),
     # The <select> is chrome-stripped — the pill wrapper carries the
     # border/background, matching the bare provider <select> (which has no arrow
     # either, so they stay identical).
@@ -1140,9 +1724,20 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bt-status-online)"),
     CSS(".bt-dot-offline", "background" => "var(--bt-status-offline)"),
     CSS(".bt-dot-update", "background" => "var(--bt-status-update)"),
+    # No side margin: the card pads its rows, and these line up with the title.
     CSS(".bt-worker-update-note",
-        "display" => "block", "margin" => "0 14px 8px", "font-size" => "12px",
-        "color" => "#92400e"),
+        "display" => "block", "font-size" => "12px", "color" => "#92400e"),
+    # An update running by itself: nothing to act on.
+    CSS(".bt-worker-update-note-info", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-worker-update-note-error", "color" => "var(--bt-error)"),
+    # The step's elapsed time in its badge; fixed-width digits so it does not jitter.
+    CSS(".bt-update-elapsed",
+        "font-variant-numeric" => "tabular-nums", "opacity" => "0.8"),
+    CSS(".bt-worker-adapters",
+        "display" => "block", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
+    # npm's reason comes as several lines; keep them apart.
+    CSS(".bt-worker-adapters-error",
+        "display" => "block", "color" => "var(--bt-error)", "white-space" => "pre-line"),
 
     # (The old `.bt-banner-error` / `.bt-banner-detail` session-ended banner
     # has been removed: the reconnect chip next to the title is the failure
@@ -1155,25 +1750,52 @@ const ChatStyles = Bonito.Styles(
     # right scrollbar and the shell border. Individual bubbles still cap their
     # own width (see `.bt-user-msg`/`.bt-agent-msg` `max-width: min(…)`) so a
     # very wide viewport doesn't sprawl any single message.
-    # overflow-anchor: NONE — the virtual scroller owns scroll anchoring.
-    # With the browser's native anchoring on, message nodes were anchor
-    # candidates: every spacer resize / node insert made Chromium adjust
-    # scrollTop on its own, concurrently with the scroller's bottom-pin and
-    # spacer compensation — two systems correcting the same scroll position
-    # is jumpy and makes geometry bugs non-deterministic.
+    # overflow-anchor: NONE — the transcript owns scroll anchoring (rows
+    # loaded above the reader, rows changing height above the viewport).
+    # With the browser's native anchoring on as well, two systems would
+    # correct the same scroll position: jumpy, and not deterministic.
+    # No native scrollbar: it only knows the loaded block of messages. The
+    # rail below stands in for it, by message count over the whole chat.
     CSS(".bt-messages",
         "flex" => "1 1 0", "min-height" => "0",
         "overflow-y" => "auto", "overflow-x" => "hidden",
         "-webkit-overflow-scrolling" => "touch",
         "overscroll-behavior-y" => "contain",
         "overflow-anchor" => "none",
+        "scrollbar-width" => "none",
         "padding" => "16px",
         "display" => "flex", "flex-direction" => "column",
         "gap" => "10px",
         "width" => "100%",
         "box-sizing" => "border-box"),
-    CSS(".bt-spacer-top, .bt-spacer-bottom",
-        "flex-shrink" => "0", "overflow-anchor" => "none"),
+    CSS(".bt-messages::-webkit-scrollbar", "display" => "none"),
+    CSS(".bt-rows-end", "flex-shrink" => "0", "overflow-anchor" => "none"),
+    # The rail (bonitoagents.js `setupRail`): a thin thumb at the right edge of
+    # the messages, wider while hovered or dragged, with a label naming the
+    # message a drag would land on. The hit area is wider than the thumb, for
+    # a finger on a phone.
+    CSS(".bt-rail",
+        "position" => "absolute", "top" => "6px", "bottom" => "6px", "right" => "0",
+        "width" => "16px", "z-index" => "5",
+        "touch-action" => "none", "cursor" => "pointer", "user-select" => "none"),
+    CSS(".bt-rail.bt-rail-hidden", "display" => "none"),
+    CSS(".bt-rail-thumb",
+        "position" => "absolute", "top" => "0", "right" => "4px",
+        "width" => "6px", "height" => "40px",
+        "border-radius" => "3px",
+        "background" => "var(--bt-border-strong)",
+        "transition" => "width 120ms ease, background 120ms ease"),
+    CSS(".bt-rail:hover .bt-rail-thumb, .bt-rail.bt-rail-active .bt-rail-thumb",
+        "width" => "9px", "background" => "var(--bt-text-faint)"),
+    CSS(".bt-rail-label",
+        "position" => "absolute", "top" => "8px", "right" => "20px",
+        "white-space" => "nowrap", "font-size" => "12px",
+        "padding" => "4px 8px", "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bt-border)", "box-shadow" => "var(--bt-shadow-sm)",
+        "font-variant-numeric" => "tabular-nums",
+        "pointer-events" => "none", "opacity" => "0", "transition" => "opacity 120ms ease"),
+    CSS(".bt-rail.bt-rail-active .bt-rail-label", "opacity" => "1"),
 
     # Rubberband for the grab-to-pan handler (bonitoagents.js): when the
     # user drags past either edge, JS accumulates an overscroll distance
@@ -1204,7 +1826,7 @@ const ChatStyles = Bonito.Styles(
     # max-width caps the bubble at a comfortable reading width on wide screens.
     # `flex-shrink: 0` is defensive (see .bt-tool-msg note) — even though
     # this rule has no `overflow` today, future styling shouldn't be able to
-    # make message bubbles collapse under spacer pressure.
+    # make message bubbles collapse when the column is over-full.
     CSS(".bt-user-msg",
         "flex-shrink" => "0",
         "align-self" => "flex-end",
@@ -1217,25 +1839,55 @@ const ChatStyles = Bonito.Styles(
         "box-shadow" => "var(--bt-shadow-sm)",
         "position" => "relative",
         "transition" => "opacity 160ms ease"),
-    # Queued state: the user submitted while a prior turn was still running.
-    # Dim the bubble and badge it "queued" until `user_unqueue` promotes it.
-    CSS(".bt-user-msg.bt-queued",
-        "opacity" => "0.65",
-        # Room for the ::after badge, which hangs below the bubble. Without it
-        # consecutive queued bubbles stack tight enough that one bubble's badge
-        # runs into the next one.
-        "margin-bottom" => "18px"),
-    CSS(".bt-user-msg.bt-queued::after",
-        # Position-aware ("next up", "queued · #3"), re-numbered in place as the
-        # queue drains. Falls back to "queued" when no position is known.
-        "content" => "attr(data-queue-label, \"queued\")",
-        "position" => "absolute",
-        "right" => "10px", "bottom" => "-16px",
-        "font-size" => "10px",
-        "font-weight" => "500",
-        "letter-spacing" => "0.04em",
-        "color" => "var(--bt-text-faint)",
-        "text-transform" => "uppercase"),
+    # Pending messages occupy one line each; details/actions expand on demand.
+    CSS(".bt-message-queue", "align-self" => "stretch", "max-height" => "24vh", "overflow-y" => "auto",
+        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)"),
+    CSS(".bt-message-queue:empty, .bt-queue-delivery:empty, .bt-message-queue[hidden], .bt-send-mode-menu[hidden]",
+        "display" => "none"),
+    CSS(".bt-queue-item + .bt-queue-item", "border-top" => "1px solid var(--bt-border)"),
+    CSS(".bt-queue-summary", "display" => "flex", "align-items" => "center",
+        "gap" => "var(--bt-space-2)", "padding" => "var(--bt-space-2)", "cursor" => "pointer",
+        "min-height" => "36px", "box-sizing" => "border-box", "list-style" => "none"),
+    CSS(".bt-queue-summary::-webkit-details-marker", "display" => "none"),
+    CSS(".bt-queue-summary::before", "content" => "'▸'", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-queue-item[open] > .bt-queue-summary::before", "content" => "'▾'"),
+    CSS(".bt-queue-preview", "flex" => "1", "min-width" => "0", "overflow" => "hidden",
+        "text-overflow" => "ellipsis", "white-space" => "nowrap", "font-size" => "13px"),
+    CSS(".bt-queue-badge, .bt-queue-status", "font-size" => "12px", "color" => "var(--bt-text-muted)"),
+    CSS(".bt-queue-badge", "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-queue-item[data-status=paused] .bt-queue-badge, .bt-queue-item[data-status=offline] .bt-queue-badge",
+        "color" => "var(--bt-warning)"),
+    CSS(".bt-queue-text", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
+        "max-height" => "5em", "overflow-y" => "auto"),
+    CSS(".bt-queue-detail", "padding" => "0 var(--bt-space-2) var(--bt-space-2)",
+        "display" => "flex", "flex-direction" => "column", "gap" => "var(--bt-space-1)"),
+    CSS(".bt-queue-actions, .bt-send-mode", "display" => "flex",
+        "align-items" => "center"),
+    CSS(".bt-queue-actions", "gap" => "var(--bt-space-2)"),
+    CSS(".bt-cancel-status", "display" => "flex", "align-self" => "stretch", "align-items" => "center",
+        "justify-content" => "space-between", "gap" => "var(--bt-space-2)",
+        "padding" => "var(--bt-space-2)", "color" => "var(--bt-text-muted)",
+        "font-size" => "13px"),
+    CSS(".bt-cancel-status[hidden]", "display" => "none"),
+    # Announce delivery to screen readers; the delivered message itself is
+    # visible in history. No separate receipt control in the composer.
+    CSS(".bt-queue-delivery", "position" => "absolute", "width" => "1px", "height" => "1px",
+        "overflow" => "hidden", "clip-path" => "inset(50%)", "white-space" => "nowrap"),
+    CSS(".bt-send-mode", "position" => "relative"),
+    CSS(".bt-send-mode-trigger", "min-height" => "36px", "padding" => "0",
+        "font-size" => "11px", "white-space" => "nowrap", "gap" => "var(--bt-space-1)",
+        "justify-content" => "center"),
+    CSS(".bt-send-mode-trigger::after", "content" => "'▾'", "flex-shrink" => "0"),
+    # A narrow phone with a wide font has no room for the whole label: it ends
+    # in an ellipsis instead of running out of the button.
+    CSS(".bt-send-mode-label", "overflow" => "hidden", "text-overflow" => "ellipsis"),
+    CSS(".bt-send-mode-menu", "position" => "absolute", "bottom" => "calc(100% + var(--bt-space-2))",
+        "right" => "0", "max-width" => "calc(100vw - 2 * var(--bt-space-4))",
+        "z-index" => "40", "display" => "flex", "flex-direction" => "column",
+        "background" => "var(--bt-surface)", "border" => "1px solid var(--bt-border)",
+        "border-radius" => "var(--bt-radius-sm)", "box-shadow" => "var(--bt-shadow-sm)"),
+    CSS(".bt-send-mode-option", "white-space" => "nowrap", "text-align" => "left", "min-height" => "40px"),
+    CSS(".bt-send-mode-option[aria-checked=true]", "color" => "var(--bt-accent)"),
     # Yolo auto-continue nudge: an app-generated (not user) bubble. Muted so it
     # reads as a system message — dimmer, desaturated accent, lighter weight.
     CSS(".bt-user-msg.bt-user-msg-auto",
@@ -1249,12 +1901,16 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-user-attachments",
         "display" => "flex", "flex-wrap" => "wrap", "gap" => "6px",
         "margin-top" => "8px"),
+    # One height for every thumbnail, known before the picture loads: the row
+    # has its final height from the start (a max-height grew it from 40 px to
+    # the picture's height when the bytes arrived, under the reader's feet).
+    # Only the width follows the picture. `scale-down` shows a tiny one (a
+    # pasted icon) at its own size, centered, never stretched.
     CSS(".bt-user-att-img",
-        "max-width" => "220px", "max-height" => "180px",
-        # Floor keeps a tiny image (a pasted icon) visible and clickable as a
-        # chip; object-fit centers it without stretching.
-        "min-width" => "40px", "min-height" => "40px",
-        "object-fit" => "contain",
+        "box-sizing" => "border-box",     # the same box as the fallback below
+        "height" => "120px", "width" => "auto", "max-width" => "220px",
+        "min-width" => "40px",
+        "object-fit" => "scale-down",
         "background" => "rgba(255,255,255,0.15)",
         "border-radius" => "8px",
         "border" => "1px solid rgba(255,255,255,0.35)",
@@ -1263,8 +1919,21 @@ const ChatStyles = Bonito.Styles(
     # Fallback when the file is gone (project moved / cleaned): the name in
     # small type instead of a broken-image icon.
     CSS(".bt-user-att-missing",
+        "display" => "inline-flex", "align-items" => "center", "box-sizing" => "border-box",
+        "height" => "120px", "max-width" => "220px", "padding" => "0 10px",
+        "border-radius" => "8px", "border" => "1px dashed rgba(255,255,255,0.35)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
         "font-size" => "11px", "opacity" => "0.8",
         "font-family" => "ui-monospace, monospace"),
+    # A file that is not an image: its name as a link on the bubble.
+    CSS(".bt-user-att-file",
+        "display" => "inline-block", "max-width" => "260px",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "padding" => "4px 10px", "border-radius" => "8px",
+        "background" => "rgba(255,255,255,0.15)",
+        "border" => "1px solid rgba(255,255,255,0.35)",
+        "color" => "inherit", "font-size" => "12px", "text-decoration" => "none"),
+    CSS(".bt-user-att-file:hover", "background" => "rgba(255,255,255,0.25)"),
 
     # ── Agent message ────────────────────────────────────────────────────────
     CSS(".bt-agent-msg",
@@ -1332,9 +2001,10 @@ const ChatStyles = Bonito.Styles(
     # NOTE: `flex-shrink: 0` is load-bearing. `.bt-messages` is a flex column
     # container, and per the CSS Flexbox spec, a flex item with any
     # `overflow` keyword set has its default `min-height` switch from `auto`
-    # (content height) to `0`. Combined with the virtual-scroll spacer-top
-    # whose height runs into the thousands of px, that lets every tool card
-    # shrink down to a 1px slit (border only). Same trap would catch any
+    # (content height) to `0`. Combined with a scroll container whose content
+    # outgrows it (the old virtual scroll's spacer ran into the thousands of
+    # px), that lets every tool card shrink down to a 1px slit (border only).
+    # Same trap would catch any
     # other bubble that grows an `overflow: hidden`, so we apply the same
     # `flex-shrink: 0` to the other message types defensively below.
     CSS(".bt-tool-msg",
@@ -1353,12 +2023,13 @@ const ChatStyles = Bonito.Styles(
         "transition" => "max-width 160ms ease, align-self 160ms ease"),
     # Live app embeds get a wider default cap than text pills: the visuals ARE
     # the content, and a responsive (resize_to = :parent) canvas will actually
-    # use the room.
-    CSS(".bt-tool-msg:has(.bt-embed)",
+    # use the room. `bt-tool-embed` is put on the card by its embed
+    # (`wrap_for_detach`).
+    CSS(".bt-tool-msg.bt-tool-embed",
         "max-width" => "min(98%, 1100px)"),
     # Full-chat-width toggle (`»` header button): span the ENTIRE message
     # column so wide content — the result embed, a plot, a table, a long diff —
-    # gets all the room. Declared AFTER `:has(.bt-embed)` so it wins at equal
+    # gets all the room. Declared AFTER `.bt-tool-embed` so it wins at equal
     # specificity (source order): an embed card's 1100px cap was exactly why
     # the toggle looked "not functional" — it clicked, but the cap held it.
     # `!important` on the width so it also out-ranks any per-element inline cap.
@@ -1515,21 +2186,26 @@ const ChatStyles = Bonito.Styles(
         "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
     # ── Live tool/todo pulse ─────────────────────────────────────────────────
-    # Subtle box-shadow oscillation while a tool is mid-flight. Two layers:
-    # the rest-state shadow keeps `.bt-tool-msg`'s normal lift, the keyframes
-    # add a softly-pulsing ring on top. `prefers-reduced-motion` disables it
-    # for users who don't want movement.
+    # A softly breathing ring while a tool is mid-flight. The ring is drawn once,
+    # on a layer of its own, and only that layer's opacity animates: the
+    # compositor does that without repainting. Animating the box-shadow itself
+    # repainted the card on every frame (three live cards cost the browser 45%
+    # of a core). Inside the border, since the card clips what lies outside it.
+    # `prefers-reduced-motion` leaves the card still.
     CSS("@keyframes bt-pulse-glow",
-        CSS("0%, 100%",
-            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 0 rgba(59,130,246,0.35)"),
-        CSS("50%",
-            "box-shadow" => "var(--bt-shadow-sm), 0 0 0 6px rgba(59,130,246,0.00)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%", "opacity" => "1")),
     CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
-        "animation" => "bt-pulse-glow 1.6s ease-in-out infinite",
+        "position" => "relative",
         "border-color" => "rgba(59,130,246,0.42)"),
+    CSS(".bt-tool-msg.bt-tool-live::after, .bt-plan-msg.bt-plan-live::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "inset 0 0 0 2px rgba(59,130,246,0.35)",
+        "animation" => "bt-pulse-glow 1.6s steps(4, jump-none) infinite"),
     CSS("@media (prefers-reduced-motion: reduce)",
-        CSS(".bt-tool-msg.bt-tool-live, .bt-plan-msg.bt-plan-live",
-            "animation" => "none")),
+        CSS(".bt-tool-msg.bt-tool-live::after, .bt-plan-msg.bt-plan-live::after",
+            "animation" => "none", "opacity" => "0")),
 
     # ── Tool elapsed timer ───────────────────────────────────────────────────
     # Small monospace span next to the status pill. JS sets `data-tool-started`
@@ -1708,6 +2384,7 @@ const ChatStyles = Bonito.Styles(
         "width" => "8px", "height" => "8px",
         "border-radius" => "2px",
         "background" => "var(--bt-error)"),
+    CSS(".bt-task-dismiss::before", "display" => "none"),
     CSS(".bt-stop-mini:hover",
         "background" => "rgba(239,68,68,0.08)",
         "border-color" => "var(--bt-error)"),
@@ -1730,6 +2407,23 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "11px", "font-weight" => "600", "letter-spacing" => "0.02em",
         "padding" => "1px 8px", "border-radius" => "999px",
         "flex-shrink" => "0", "white-space" => "nowrap"),
+    # ↑ chips on a card that waits on an eval (bt_julia_continue /
+    # bt_julia_wait): the eval's run id, a click away from its card. Outlined,
+    # so they don't compete with the filled worker badge.
+    CSS(".bt-tool-jump",
+        "display" => "inline-flex", "align-items" => "center",
+        "background" => "var(--bt-surface)", "color" => "var(--bt-accent)",
+        "border" => "1px solid var(--bt-accent)", "cursor" => "pointer",
+        "font-size" => "11px", "font-weight" => "600", "font-family" => "inherit",
+        "padding" => "0 7px", "border-radius" => "999px", "line-height" => "16px",
+        "flex-shrink" => "0", "white-space" => "nowrap"),
+    CSS(".bt-tool-jump:hover", "background" => "var(--bt-accent)", "color" => "#fff"),
+    # The card a jump landed on lights up briefly, so the eye finds it.
+    CSS("@keyframes bt-jump-flash",
+        CSS("0%",   "box-shadow" => "0 0 0 0 rgba(59,130,246,0.0)"),
+        CSS("20%",  "box-shadow" => "0 0 0 4px rgba(59,130,246,0.45)"),
+        CSS("100%", "box-shadow" => "0 0 0 0 rgba(59,130,246,0.0)")),
+    CSS(".bt-jump-flash", "animation" => "bt-jump-flash 1.6s ease-out"),
     # Per-pill stop (shares .bt-stop-mini for the look). Hidden until the
     # pill is live — stopping a finished tool is meaningless.
     CSS(".bt-tool-stop",
@@ -1794,13 +2488,6 @@ const ChatStyles = Bonito.Styles(
         "margin-left" => "6px", "opacity" => "0.7",
         "font-size" => "10.5px", "font-family" => "ui-monospace, monospace",
         "letter-spacing" => "0.02em"),
-    CSS(".bt-fv-badge",
-        "font-size" => "10px", "text-transform" => "uppercase",
-        "letter-spacing" => "0.04em",
-        "color" => "var(--bt-text-faint)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "999px", "padding" => "1px 7px",
-        "flex-shrink" => "0", "white-space" => "nowrap"),
     CSS(".bt-fv-size, .bt-fv-dims",
         "font-size" => "11px", "color" => "var(--bt-text-faint)",
         "flex-shrink" => "0", "white-space" => "nowrap"),
@@ -1848,6 +2535,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-fv-rendered, .bt-fv-source",
         "flex" => "1 1 auto", "min-height" => "0", "min-width" => "0",
         "display" => "flex", "flex-direction" => "column", "overflow" => "auto"),
+    # The source half holds only Monaco, which scrolls itself. A scrolling parent
+    # makes a resize loop: at a fractional pane size (1201.81px) Monaco lays out
+    # at the rounded 1202px, the 0.19px overflow brings in scrollbars, Monaco
+    # shrinks by their 15px, they go away, and so on every frame. The editor
+    # flickered and lost every click and selection.
+    CSS(".bt-fv-source", "overflow" => "hidden"),
     # The Monaco wrapper chain must pass full height down to the editor div —
     # EVERY link of it. BonitoBook's editor component brings its own unclassed
     # wrapper between `.bt-fv-editor` and `.monaco-editor-div`, and that div was
@@ -1861,191 +2554,11 @@ const ChatStyles = Bonito.Styles(
     # which are fine while the thing you actually read is 5px tall.
     CSS(".bt-fv-source > div, .bt-fv-editor, .bt-fv-editor > div, .bt-fv-source .monaco-editor-div",
         "height" => "100%", "min-height" => "0"),
-    CSS(".bt-fv-error", "margin" => "12px"),
-    CSS(".bt-fv-loading",
-        "padding" => "16px", "font-size" => "12.5px",
-        "color" => "var(--bt-text-faint)", "font-style" => "italic"),
-    CSS(".bt-fv-error-title", "font-weight" => "600"),
-    CSS(".bt-fv-error-detail",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
-        "margin-top" => "4px", "opacity" => "0.85"),
-
-    # Image stage: a checkerboard so transparency reads as transparency, and the
-    # image centred + contained rather than pinned to the top-left.
-    CSS(".bt-fv-image-stage",
-        "flex" => "1 1 auto", "min-height" => "0",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center",
-        "padding" => "12px", "overflow" => "auto",
-        "background-color" => "var(--bt-surface)",
-        "background-image" => string(
-            "linear-gradient(45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
-            "linear-gradient(-45deg, rgba(15,23,42,0.06) 25%, transparent 25%),",
-            "linear-gradient(45deg, transparent 75%, rgba(15,23,42,0.06) 75%),",
-            "linear-gradient(-45deg, transparent 75%, rgba(15,23,42,0.06) 75%)"),
-        "background-size" => "18px 18px",
-        "background-position" => "0 0, 0 9px, 9px -9px, -9px 0"),
-    # An IMAGE is shown at its own size, shrunk to fit. `max-height: 100%` on the
-    # <img> ALONE does nothing: the percentage resolves against `.bt-media-wrap`,
-    # whose own height comes from its content, so a 1500px-tall image kept every
-    # pixel and ran off the bottom of the tab. The wrap has to be a flex box
-    # that is allowed to shrink (`min-height: 0`) before the image inside it can.
-    CSS(".bt-fv-image-stage .bt-media-wrap",
-        "max-height" => "100%", "min-height" => "0", "display" => "flex"),
-    CSS(".bt-fv-image-stage img.bt-media",
-        "max-height" => "100%", "min-height" => "0", "object-fit" => "contain"),
-    # A VIDEO instead FILLS its stage and letterboxes, the way every video player
-    # behaves. Left at its intrinsic size a small clip renders as a handful of
-    # pixels with the browser's controls collapsed into nothing: you can see the
-    # file but you cannot play it, which is the one thing a video tab is for.
-    # Sized on the WRAP (whose containing block is the stage, and so has a real
-    # size) rather than by a minimum on the video — a percentage minimum there
-    # resolves against the shrink-to-fit wrapper and comes out as zero.
-    CSS(".bt-fv-video-stage .bt-media-wrap", "width" => "100%", "height" => "100%"),
-    CSS(".bt-fv-video-stage video.bt-media",
-        "width" => "100%", "height" => "100%", "object-fit" => "contain"),
-
-    # Video gets a stage of its own: centred, on a dark backdrop (the neutral
-    # surround every video player uses), and CONTAINED — `media_element` caps
-    # width only, so without the max-height here a portrait or 4K clip pushes its
-    # own controls off the bottom of the tab.
-    CSS(".bt-fv-video-stage",
-        "flex" => "1 1 auto", "min-height" => "0",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center",
-        "padding" => "12px", "overflow" => "auto",
-        "background" => "#1b1d21"),
-    CSS(".bt-fv-audio-wrap",
-        "display" => "flex", "flex-direction" => "column", "gap" => "8px",
-        "align-items" => "center", "justify-content" => "center",
-        "padding" => "24px", "flex" => "1 1 auto"),
-    CSS(".bt-fv-audio", "width" => "min(520px, 100%)"),
-    CSS(".bt-fv-audio-name",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)",
-        "font-family" => "ui-monospace, monospace"),
-
-    CSS(".bt-fv-markdown",
-        "padding" => "16px 22px", "overflow" => "auto",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    # Inside a chat bubble the preview is one block among many — no pane padding,
-    # and capped so a 900-line README doesn't bury the rest of the turn.
-    CSS(".bt-tool-body .bt-fv-markdown",
-        "padding" => "0", "max-height" => "420px"),
-
-    # Frames (pdf / html). `border:none` + a surface background so a page that
-    # doesn't set its own doesn't render as a grey void.
-    CSS(".bt-fv-frame-wrap",
-        "flex" => "1 1 auto", "min-height" => "0", "display" => "flex"),
-    CSS(".bt-fv-frame",
-        "flex" => "1 1 auto", "width" => "100%", "border" => "none",
-        "background" => "#fff", "min-height" => "0"),
-    CSS(".bt-tool-body .bt-fv-frame-wrap", "height" => "480px"),
-
-    # ── Table (csv / tsv) ────────────────────────────────────────────────────
-    CSS(".bt-fv-table-wrap",
-        "display" => "flex", "flex-direction" => "column",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-fv-table-bar",
-        "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "padding" => "6px 10px", "flex-shrink" => "0",
-        "border-bottom" => "1px solid var(--bt-border)"),
-    CSS(".bt-fv-table-filter",
-        "flex" => "0 1 260px", "font-size" => "12px",
-        "padding" => "3px 8px", "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-text)"),
-    CSS(".bt-fv-table-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
-    CSS(".bt-fv-table-scroll",
-        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto"),
-    CSS(".bt-tool-body .bt-fv-table-scroll", "max-height" => "420px"),
-    CSS(".bt-fv-table",
-        "border-collapse" => "separate", "border-spacing" => "0",
-        "font-size" => "12px", "font-family" => "ui-monospace, monospace",
-        "width" => "max-content", "min-width" => "100%"),
-    CSS(".bt-fv-table th",
-        # Sticky header: scrolling a 5000-row table without losing the column
-        # names is most of what makes this better than looking at the raw text.
-        "position" => "sticky", "top" => "0", "z-index" => "1",
-        "background" => "var(--bt-surface-2)",
-        "border-bottom" => "1px solid var(--bt-border)",
-        "padding" => "5px 10px", "text-align" => "left",
-        "white-space" => "nowrap", "font-weight" => "600"),
-    CSS(".bt-fv-table td",
-        "padding" => "3px 10px", "white-space" => "nowrap",
-        "border-bottom" => "1px solid var(--bt-border)"),
-    CSS(".bt-fv-table tbody tr:hover td", "background" => "var(--bt-surface-2)"),
-    CSS(".bt-fv-table .bt-fv-num", "text-align" => "right"),
-    CSS(".bt-fv-table .bt-fv-rownum",
-        "color" => "var(--bt-text-faint)", "text-align" => "right",
-        "user-select" => "none",
-        "position" => "sticky", "left" => "0",
-        "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-table th.bt-fv-rownum", "background" => "var(--bt-surface-2)", "z-index" => "2"),
-    CSS(".bt-fv-sortable", "cursor" => "pointer", "user-select" => "none"),
-    CSS(".bt-fv-sort-arrow", "opacity" => "0.35", "margin-left" => "6px"),
-    CSS(".bt-fv-sortable:hover .bt-fv-sort-arrow", "opacity" => "0.8"),
-
-    # ── Notebook ─────────────────────────────────────────────────────────────
-    CSS(".bt-fv-notebook",
-        "flex" => "1 1 auto", "min-height" => "0", "overflow" => "auto",
-        "padding" => "12px 16px", "display" => "flex", "flex-direction" => "column",
-        "gap" => "10px"),
-    CSS(".bt-fv-nb-cell",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)", "overflow" => "hidden"),
-    CSS(".bt-fv-nb-md", "padding" => "2px 14px", "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-nb-source", "background" => "var(--bt-surface-2)", "padding" => "6px 8px"),
-    CSS(".bt-fv-nb-outputs",
-        "border-top" => "1px solid var(--bt-border)", "padding" => "8px 12px",
-        "background" => "var(--bt-surface)"),
-    CSS(".bt-fv-nb-text",
-        "margin" => "0", "font-family" => "ui-monospace, monospace",
-        "font-size" => "11.5px", "white-space" => "pre-wrap",
-        "max-height" => "320px", "overflow" => "auto"),
-    CSS(".bt-fv-nb-image", "max-width" => "100%", "display" => "block"),
-    CSS(".bt-fv-more",
-        "font-size" => "11px", "color" => "var(--bt-text-faint)",
-        "font-style" => "italic", "padding" => "4px 2px"),
-
-    # ── Hex dump ─────────────────────────────────────────────────────────────
-    CSS(".bt-fv-hex-wrap",
-        "display" => "flex", "flex-direction" => "column",
-        "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-fv-hex-bar",
-        "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "padding" => "6px 10px", "flex-shrink" => "0"),
-    CSS(".bt-fv-hex-note", "font-size" => "11px", "color" => "var(--bt-text-faint)"),
-    CSS(".bt-fv-hex",
-        "margin" => "0", "padding" => "0 12px 12px",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
-        "line-height" => "1.5", "color" => "var(--bt-text-muted)",
-        "overflow" => "auto", "flex" => "1 1 auto", "min-height" => "0"),
-    CSS(".bt-tool-body .bt-fv-hex", "max-height" => "360px"),
+    # The kinds' bodies (file_view.jl `file_viewer`).
+    FILE_VIEW_CSS...,
 
     # ── 3D geometry ──────────────────────────────────────────────────────────
-    CSS(".bt-mesh-view",
-        "position" => "relative", "flex" => "1 1 auto",
-        "min-height" => "0", "display" => "flex"),
-    # Inline (chat bubble) has no panel to fill, so it needs an explicit box.
-    CSS(""".bt-mesh-view[data-mode="inline"]""", "height" => "360px"),
-    CSS(".bt-mesh-canvas",
-        "flex" => "1 1 auto", "width" => "100%", "height" => "100%",
-        "display" => "block", "touch-action" => "none", "cursor" => "grab"),
-    CSS(".bt-mesh-canvas:active", "cursor" => "grabbing"),
-    CSS(".bt-mesh-toolbar",
-        "position" => "absolute", "top" => "8px", "right" => "8px",
-        "display" => "flex", "gap" => "4px"),
-    CSS(".bt-mesh-btn",
-        "border" => "1px solid var(--bt-border)", "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
-        "border-radius" => "var(--bt-radius-sm)", "padding" => "3px 7px",
-        "font-size" => "13px", "line-height" => "1"),
-    CSS(".bt-mesh-btn:hover", "color" => "var(--bt-text)"),
-    CSS(""".bt-mesh-btn[data-on="1"]""",
-        "background" => "var(--bt-accent)", "color" => "#fff", "border-color" => "var(--bt-accent)"),
-    CSS(".bt-mesh-btn:disabled", "opacity" => "0.4", "cursor" => "default"),
-    CSS(".bt-mesh-status",
-        "position" => "absolute", "left" => "10px", "bottom" => "8px",
-        "font-size" => "11px", "color" => "var(--bt-text-faint)",
-        "pointer-events" => "none"),
+    MESH_VIEW_CSS...,
 
     # ── Change review tab (review.jl) ────────────────────────────────────────
     CSS(".bt-review",
@@ -2323,25 +2836,7 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-embed-close:hover",
         "opacity" => "1", "color" => "var(--bt-text)", "background" => "var(--bt-surface-2)"),
 
-    # Media (bt_show / Read image & video) + click-to-enlarge lightbox. The wrap
-    # is the hover target for the ⤢ button; the fullscreen overlay holds a clone
-    # of the media and closes on backdrop click or Esc.
-    CSS(".bt-media-wrap",
-        "position" => "relative", "display" => "inline-block", "max-width" => "100%"),
-    # Hover action row (enlarge · copy · download), top-right of the media.
-    CSS(".bt-media-actions",
-        "position" => "absolute", "top" => "6px", "right" => "6px",
-        "display" => "flex", "gap" => "4px",
-        "opacity" => "0", "transition" => "opacity 80ms"),
-    CSS(".bt-media-wrap:hover .bt-media-actions", "opacity" => "1"),
-    CSS(".bt-media-action",
-        "appearance" => "none", "border" => "none",
-        "background" => "rgba(0,0,0,0.55)", "color" => "#fff",
-        "font-size" => "14px", "line-height" => "1",
-        "padding" => "4px 7px", "border-radius" => "6px",
-        "cursor" => "pointer"),
-    CSS(".bt-media-action:hover", "background" => "rgba(0,0,0,0.8)"),
-    CSS(".bt-media-enlarge", "cursor" => "zoom-in"),
+    MEDIA_CSS...,
 
     # Code-block hover actions (copy · download), top-right of a fenced <pre>.
     CSS(".bt-code-wrap", "position" => "relative"),
@@ -2356,13 +2851,11 @@ const ChatStyles = Bonito.Styles(
         "font-size" => "13px", "line-height" => "1",
         "padding" => "3px 6px", "border-radius" => "5px", "cursor" => "pointer"),
     CSS(".bt-code-action:hover", "background" => "rgba(0,0,0,0.8)"),
-    CSS(".bt-lightbox-overlay",
-        "position" => "fixed", "inset" => "0", "z-index" => "9999",
-        "background" => "rgba(0,0,0,0.85)", "cursor" => "zoom-out",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center"),
-    CSS(".bt-lightbox-media",
-        "max-width" => "95vw", "max-height" => "95vh",
-        "box-shadow" => "0 8px 40px rgba(0,0,0,0.6)", "cursor" => "default"),
+    # Without hover (touch screens) the actions would stay invisible yet take
+    # the taps that land on them: show them. Merged into MEDIA_CSS's query, which
+    # comes earlier in ChatStyles, so it wins by specificity (see there).
+    CSS("@media (hover: none)",
+        CSS(".bt-code-wrap .bt-code-actions", "opacity" => "1")),
     CSS(".bt-tool-md",
         "font-size" => "13px", "line-height" => "1.5",
         "padding-top" => "8px"),
@@ -2438,13 +2931,13 @@ const ChatStyles = Bonito.Styles(
     # `summary_lines` mean exactly what it says.
     CSS(".bt-subsection-body",
         "padding" => "8px 10px",
-        "overflow-y" => "auto"),
+        "overflow" => "auto"),
     # A console body paints the terminal surface on the BODY, not on the
     # `.bt-console` inside it (see the chrome reset below) — so the padding
     # gutter the scrollbar lives in is the same colour as the text area, and
     # the bar reads as the section's own rather than as a strip floating
     # between two nested boxes.
-    CSS(".bt-subsection-body:has(> .bt-console)",
+    CSS(".bt-subsection-console",
         "background" => "var(--bt-surface-2)"),
     # SUMMARY state: the restricted preview — `summary_lines` tall, scrolls.
     # Sizing is content-box, so `max-height` bounds the CONTENT box and the
@@ -2459,9 +2952,10 @@ const ChatStyles = Bonito.Styles(
         "max-height" => "calc(var(--bt-summary-lines, 4) * 18px)"),
     # FULL state: the whole content, still capped generously so one huge
     # output can't blow up the card — the body scrolls past that. Whole lines
-    # here too (26 × 18px = 468px), so no state ever ends on a half row.
+    # here too (`full_lines`, 26 × 18px = 468px unless the section says), so no
+    # state ever ends on a half row.
     CSS("""details.bt-subsection[data-state="full"] > .bt-subsection-body""",
-        "max-height" => "calc(26 * 18px)"),
+        "max-height" => "calc(var(--bt-full-lines, 26) * 18px)"),
 
     # Console block — wraps a `Bonito.RichText` terminal pane (ANSI → styled
     # HTML). Captured stdout / stderr / error backtraces render here instead
@@ -2503,31 +2997,54 @@ const ChatStyles = Bonito.Styles(
         "white-space" => "pre-wrap", "word-break" => "break-word",
         "margin" => "0"),
 
-    # ── Edit-tool body container ─────────────────────────────────────────────
-    # The body IS the diff preview now — a single (or multi-) Monaco
-    # DiffEditor. Size is driven by Monaco's own height API
-    # (`MonacoDiffEditor.setMaxHeight`), not by an outer CSS clip. The
-    # container just gives it room and a subtle top border so it visually
-    # belongs to its header.
+    # ── Edit-tool body ───────────────────────────────────────────────────────
+    # One section per diff (`diff_section`), headed by its file. Collapsed, the
+    # card shows each at its summary height; expanded, at its full height
+    # (`--bt-full-lines`): the card arrow sizes all of them, every mount path
+    # included, with no script.
     CSS(".bt-edit-tool-body",
-        "border-top" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface)"),
-
-    # ── Diff blocks (multi-edit) ─────────────────────────────────────────────
-    # Single-diff body just shows the editor; multi-edit bodies stack diffs
-    # with subtle separators + monospace path headers so you can tell which
-    # file each chunk belongs to.
-    CSS(".bt-diff-block", "padding-top" => "8px"),
-    CSS(".bt-multi-diff .bt-diff-block + .bt-diff-block",
-        "margin-top" => "12px",
-        "border-top" => "1px solid var(--bt-border)",
-        "padding-top" => "12px"),
-    CSS(".bt-diff-header",
-        "font-family" => "ui-monospace, monospace",
-        "font-size" => "11px",
+        "padding-top" => "8px",
+        "display" => "flex", "flex-direction" => "column", "gap" => "8px"),
+    CSS(""".bt-tool-header[data-expanded="true"] ~ .bt-tool-body .bt-edit-tool-body > details.bt-subsection[data-state="summary"] > .bt-subsection-body""",
+        "max-height" => "calc(var(--bt-full-lines, 26) * 18px)"),
+    CSS(".bt-subsection-path",
+        "font-family" => "ui-monospace, monospace", "font-size" => "11.5px",
         "color" => "var(--bt-text-muted)",
-        "padding" => "2px 0 6px",
-        "word-break" => "break-all"),
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap",
+        "min-width" => "0"),
+
+    # ── Static code views (code_view.jl) ─────────────────────────────────────
+    # One row per line, built in the browser and highlighted by Monaco's
+    # tokenizer. The 18px line is the console's and the section caps' unit, so
+    # a cap of N lines ends between rows. Rows are as wide as the longest, so a
+    # tint spans it when scrolled sideways.
+    CSS(".bt-code",
+        "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
+        "font-size" => "12px", "line-height" => "18px",
+        "overflow-x" => "auto"),
+    # In a section the section's body scrolls, both ways, with its own bar.
+    CSS(".bt-subsection-body > .bt-code", "overflow" => "visible"),
+    CSS(".bt-code-src",
+        "margin" => "0", "font" => "inherit", "white-space" => "pre", "tab-size" => "4"),
+    CSS(".bt-code-lines", "width" => "max-content", "min-width" => "100%",
+        "content-visibility" => "auto",
+        "contain-intrinsic-block-size" => "auto var(--bt-code-height, 0px)"),
+    CSS(".bt-code-chunk", "content-visibility" => "auto",
+        "contain-intrinsic-block-size" => "auto var(--bt-code-height, 0px)"),
+    CSS(".bt-l", "white-space" => "pre", "tab-size" => "4", "min-height" => "18px"),
+    # A diff's gutter: both line numbers and the sign, from `data-g`. Not text,
+    # so copying a diff copies code. It scrolls sideways with the code: a sticky
+    # gutter is a compositor layer per row, and layerizing hundreds of them
+    # took 15 ms of every scroll frame.
+    CSS(".bt-code-diff .bt-l::before",
+        "content" => "attr(data-g)",
+        "padding-right" => "10px",
+        "color" => "var(--bt-text-faint)"),
+    CSS(".bt-l-del", "background" => "rgba(255, 0, 0, 0.12)"),
+    CSS(".bt-l-add", "background" => "rgba(155, 185, 85, 0.22)"),
+    # The characters a changed line changed in.
+    CSS(".bt-l-del .bt-ch", "background" => "rgba(255, 0, 0, 0.22)"),
+    CSS(".bt-l-add .bt-ch", "background" => "rgba(156, 204, 44, 0.45)"),
 
     # ── Search results ───────────────────────────────────────────────────────
     CSS(".bt-search-results",
@@ -2643,38 +3160,19 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-messages-tail",
         "flex-shrink" => "0", "overflow-anchor" => "none"),
 
-    # Off-screen measuring host (`measureNodes`): prefetched message nodes
-    # are laid out here — same width as the messages content box — to get
-    # real heights before they're ever rendered. Hidden but NOT display:none
-    # (children must lay out); zero own height so it never affects the page.
-    # Same formatting context as `.bt-messages` (flex column, same gap):
-    # bubbles are flex items there (`align-self` ⇒ fit-content width); in a
-    # plain block host they'd be measured at fill-width instead. Heights
-    # mostly coincide thanks to the max-width caps, but the contexts must
-    # match so off-screen measurements can never diverge from the live layout.
-    CSS(".bt-measure",
-        "position" => "absolute", "left" => "0", "top" => "0",
-        "height" => "0", "overflow" => "hidden",
-        "visibility" => "hidden",
-        "pointer-events" => "none",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "10px",
-        "z-index" => "-1"),
-
     # (The per-chat mount curtain used to live here — the dashboard's load
-    # overlay now covers the pane until settle; see `chat_waiting_view` in
-    # sidebar.jl and `startSettle` in bonitoagents.js.)
+    # overlay now covers the pane until its first rows show; see
+    # `ChatWaitingView` in sidebar.jl and `markReady` in bonitoagents.js.)
 
     # ── Busy indicator ───────────────────────────────────────────────────────
-    # Lives inside `.bt-messages` (between the bottom spacer and the
-    # overscroll tail) so it shows directly under the last message. The
-    # container already pads 16px, so no own horizontal padding; opted out
-    # of scroll anchoring like the spacers/tail (the chase owns scrollTop).
-    # margin-top -10px cancels the flex row gap that precedes each of the
-    # three indicator children (zero-height or not, every flex item costs a
-    # gap slot — three indicators after the bottom spacer would push the
-    # visible one 30px under the last message). Safe: indicators are plain
-    # content the virtual-scroll height math never tracks.
+    # Lives inside `.bt-messages` (after the rows, before the overscroll
+    # tail) so it shows directly under the last message. The container
+    # already pads 16px, so no own horizontal padding; opted out of scroll
+    # anchoring like the tail (the chase owns scrollTop). margin-top -10px
+    # cancels the flex row gap that precedes each of the three indicator
+    # children (zero-height or not, every flex item costs a gap slot: three
+    # indicators after the rows would push the visible one 30px under the
+    # last message).
     CSS(".bt-busy",
         "flex-shrink" => "0", "height" => "0", "overflow" => "hidden",
         "overflow-anchor" => "none", "margin-top" => "-10px",
@@ -2692,7 +3190,7 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-busy-dot",
         "width" => "7px", "height" => "7px", "border-radius" => "50%",
         "background" => "var(--bt-accent)",
-        "animation" => "bt-pulse 1.2s ease-in-out infinite"),
+        "animation" => "bt-pulse 1.2s steps(3, jump-none) infinite"),
     CSS(".bt-busy-dot:nth-child(2)", "animation-delay" => "0.2s"),
     CSS(".bt-busy-dot:nth-child(3)", "animation-delay" => "0.4s"),
     CSS("@keyframes bt-pulse",
@@ -2840,10 +3338,8 @@ const ChatStyles = Bonito.Styles(
         "display" => "none",
         "position" => "absolute",
         "left" => "50%",
-        # Bottom offset sits above the input area; chosen large enough
-        # that on mobile (where the input area can grow to ~120px with
-        # an expanded textarea + attachments strip) the pill stays clear.
-        "bottom" => "92px",
+        # Anchor to the actual composer, including its queue and attachments.
+        "bottom" => "calc(100% + var(--bt-space-2))",
         "transform" => "translateX(-50%)",
         "z-index" => "20",
         "align-items" => "center", "gap" => "8px",
@@ -2859,8 +3355,13 @@ const ChatStyles = Bonito.Styles(
         "display" => "inline-flex"),
     # The pulse glow is a NEW-MESSAGES nudge only; the plain "Move to bottom"
     # form (shown whenever scrolled away from the last message) stays static.
-    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow",
-        "animation" => "bt-new-msg-pulse 2.5s ease-in-out infinite"),
+    # The glow is a layer of its own whose opacity animates (no repaint; see
+    # bt-pulse-glow).
+    CSS(".bt-new-msg-pill.bt-new-msg-pill-glow::after",
+        "content" => "\"\"", "position" => "absolute", "inset" => "0",
+        "border-radius" => "inherit", "pointer-events" => "none",
+        "box-shadow" => "0 4px 28px rgba(16, 185, 129, 0.85)",
+        "animation" => "bt-new-msg-pulse 2.5s steps(5, jump-none) infinite"),
     CSS(".bt-new-msg-pill:hover",
         "filter" => "brightness(1.08)"),
     CSS(".bt-new-msg-pill:active",
@@ -2868,10 +3369,8 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-new-msg-pill-arrow",
         "font-size" => "16px", "line-height" => "1"),
     CSS("@keyframes bt-new-msg-pulse",
-        CSS("0%, 100%",
-            "box-shadow" => "0 4px 14px rgba(16, 185, 129, 0.45)"),
-        CSS("50%",
-            "box-shadow" => "0 4px 28px rgba(16, 185, 129, 0.85)")),
+        CSS("0%, 100%", "opacity" => "0"),
+        CSS("50%", "opacity" => "1")),
 
     # ── Input area ───────────────────────────────────────────────────────────
     # Outer area spans full width (so the top border + background look right);
@@ -2926,12 +3425,10 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-input-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end",
         "width" => "100%"),
-    # Button column right of the textarea: the Yolo toggle bar on top, the
-    # send/stop pair below. `stretch` makes the bar span the pair's width
-    # (wide-and-short) without hardcoding it.
+    # Controls share one row on both desktop and phone.
     CSS(".bt-input-controls",
-        "display" => "flex", "flex-direction" => "column",
-        "gap" => "6px", "align-items" => "stretch",
+        "display" => "flex", "flex-direction" => "row",
+        "gap" => "var(--bt-space-2)", "align-items" => "center",
         "flex-shrink" => "0"),
     CSS(".bt-input-btn-row",
         "display" => "flex", "gap" => "8px", "align-items" => "flex-end"),
@@ -2942,8 +3439,8 @@ const ChatStyles = Bonito.Styles(
         "border" => "1px solid var(--bt-border)",
         "background" => "var(--bt-surface)",
         "color" => "var(--bt-text-muted)",
-        "font-size" => "11px", "line-height" => "1",
-        "padding" => "3px 0",
+        "font-size" => "11px", "line-height" => "1", "flex-shrink" => "0",
+        "padding" => "6px",
         "border-radius" => "8px",
         "cursor" => "pointer",
         "white-space" => "nowrap",
@@ -3007,9 +3504,20 @@ const ChatStyles = Bonito.Styles(
         "border" => "none",
         "box-shadow" => "none",
         "overflow" => "visible"),
-    CSS(".bt-tool-native .bt-tool-header", "display" => "none"),
-    # Native media has no header, so keep the fullwidth toggle hidden even if a
-    # future layout moves it out of the header.
+    # Its header stays as the picture's caption: what it shows (the agent's
+    # title, or the file's name) and the summary beside it, the full path on
+    # hover; the title opens the file. Only the title takes the pointer: a
+    # click anywhere else on the row would fold the picture away.
+    CSS(".bt-tool-native .bt-tool-header",
+        "background" => "none", "border" => "none", "min-height" => "0",
+        "padding" => "0 0 var(--bt-space-1) 0", "pointer-events" => "none"),
+    CSS(".bt-tool-native .bt-tool-header > :not(.bt-tool-title):not(.bt-tool-summary)",
+        "display" => "none"),
+    CSS(".bt-tool-native .bt-tool-title.bt-path-link", "pointer-events" => "auto"),
+    # A caption is prose (often the agent's own words), not a tool name.
+    CSS(".bt-tool-native .bt-tool-title", "font-family" => "inherit", "font-size" => "13px"),
+    # Keep the fullwidth toggle hidden even if a future layout moves it out of
+    # the header.
     CSS(".bt-tool-native .bt-tool-fullwidth, " *
         ".bt-tool-native .bt-tool-header[data-expanded=\"true\"] .bt-tool-fullwidth",
         "display" => "none"),
@@ -3057,6 +3565,25 @@ const ChatStyles = Bonito.Styles(
         "width" => "100%", "height" => "100%",
         "object-fit" => "cover",
         "display" => "block"),
+    # A file being uploaded (or done): name, size or progress, and a bar.
+    CSS(".bt-attachment-file",
+        "position" => "relative",
+        "width" => "180px", "height" => "64px",
+        "padding" => "8px 28px 8px 10px", "box-sizing" => "border-box",
+        "border" => "1px solid var(--bt-border-strong)", "border-radius" => "8px",
+        "background" => "var(--bt-bg)", "overflow" => "hidden", "flex-shrink" => "0",
+        "display" => "flex", "flex-direction" => "column", "justify-content" => "center", "gap" => "2px"),
+    CSS(".bt-attachment-file-name",
+        "font-size" => "12px", "font-weight" => "500",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-attachment-file-status",
+        "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
+    CSS(".bt-attachment-file[data-state=error] .bt-attachment-file-status", "color" => "var(--bt-error)"),
+    CSS(".bt-attachment-file-bar",
+        "position" => "absolute", "left" => "0", "bottom" => "0", "height" => "3px",
+        "background" => "var(--bt-accent)", "transition" => "width 120ms linear"),
+    CSS(".bt-attachment-file[data-state=done] .bt-attachment-file-bar", "opacity" => "0"),
     CSS(".bt-attachment-remove",
         "position" => "absolute",
         "top" => "2px", "right" => "2px",
@@ -3083,20 +3610,16 @@ const ChatStyles = Bonito.Styles(
     # drop zone is "the whole chat", not just one nested element.
     CSS(".bt-app.bt-drag-over",
         "box-shadow" => "inset 0 0 0 3px var(--bt-accent)"),
-    CSS(".bt-text-input",
-        "flex" => "1 1 auto", "min-width" => "0",
+    CSS(".bt-text-input, .bt-input-measure",
+        "flex" => "1 1 auto", "min-width" => "0", "width" => "0",
         "border" => "1px solid var(--bt-border-strong)",
         "border-radius" => "20px",
         "padding" => "10px 14px",
         "font-size" => "16px",                          # iOS no-zoom threshold
-        # min-height matches the FULL controls column beside it: send/stop 40px
-        # + 6px gap + the Yolo bar (~18px) = 64px. With the old 40px the
-        # textarea only lined up with the button pair and the Yolo strip's
-        # height was dead space above it. min-height (not height) because the
-        # auto-resize oninput writes an explicit style.height from scrollHeight:
-        # CSS min-height clamps that inline value, so the box grows past 64 up
-        # to the 120 cap and shrinks back to 64 — without touching the JS.
-        "min-height" => "64px", "max-height" => "120px",
+        # Let the browser size text without collapsing the focused editor on
+        # every keystroke. The JS mirror is only for older browsers.
+        "field-sizing" => "content",
+        "min-height" => "44px", "max-height" => "min(320px, 45dvh)",
         "font-family" => "inherit",
         "color" => "var(--bt-text)",
         "background" => "var(--bt-bg)",
@@ -3104,6 +3627,13 @@ const ChatStyles = Bonito.Styles(
         "resize" => "none", "overflow-y" => "auto",
         "line-height" => "1.4",
         "transition" => "border-color 120ms, box-shadow 120ms"),
+    CSS(".bt-text-input[data-bt-sizing-fallback]", "field-sizing" => "fixed"),
+    CSS(".bt-input-measure",
+        "position" => "fixed", "left" => "0", "top" => "0",
+        "visibility" => "hidden", "pointer-events" => "none",
+        "height" => "0", "min-height" => "0", "max-height" => "none",
+        "border" => "0", "overflow" => "hidden", "field-sizing" => "fixed",
+        "contain" => "layout style paint"),
     CSS(".bt-text-input::placeholder",
         "color" => "var(--bt-text-faint)"),
     CSS(".bt-text-input:focus",
@@ -3136,15 +3666,12 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-text-input::-webkit-scrollbar-button, .bt-subsection-body::-webkit-scrollbar-button",
         "display" => "none"),
 
-    # Send / stop buttons — circles, big enough for thumb. `box-sizing:
-    # border-box` is load-bearing: stop has a 1px border, send doesn't, so
-    # without it the buttons end up 42x42 vs 40x40 and the row baselines
-    # disagree by a pixel.
+    # Keep Send and Stop equally sized circles despite Stop's border.
     CSS(".bt-send-btn, .bt-stop-btn",
         "border" => "none", "border-radius" => "50%",
-        "width" => "40px", "height" => "40px",
+        "width" => "36px", "height" => "36px",
         "box-sizing" => "border-box",
-        "font-size" => "20px",                       # larger glyph fills the circle
+        "font-size" => "18px",                       # larger glyph fills the circle
         "line-height" => "1",
         "cursor" => "pointer", "flex-shrink" => "0",
         "display" => "flex", "align-items" => "center",
@@ -3173,12 +3700,11 @@ const ChatStyles = Bonito.Styles(
 
     # ── Attach ───────────────────────────────────────────────────────────────
     # Sits at the START of the input row, left of the text field, where every
-    # chat app puts it. 40px square: below ~40 a touch target is a coin toss,
-    # and this button exists FOR touch — paste and drag-drop already cover the
-    # desktop, and neither exists on a phone.
+    # chat app puts it. Keep its square target aligned with Send and Stop;
+    # phones use this picker instead of desktop paste and drag-drop.
     CSS(".bt-attach-btn",
         "flex" => "0 0 auto", "align-self" => "flex-end",
-        "width" => "40px", "height" => "40px",
+        "width" => "36px", "height" => "36px",
         "display" => "flex", "align-items" => "center", "justify-content" => "center",
         "background" => "transparent", "border" => "1px solid transparent",
         "border-radius" => "999px", "cursor" => "pointer", "padding" => "0",
@@ -3194,13 +3720,19 @@ const ChatStyles = Bonito.Styles(
         "opacity" => "0", "pointer-events" => "none"),
 
     # ── Spinner (used by bt_show preview while streaming from worker) ────────
+    # Per-side borders, never the `border` shorthand plus `border-top-color`:
+    # a rule's properties come out in no fixed order, and with the shorthand
+    # last it repainted the top grey. Every spinner in the app was a still grey
+    # ring (this rule loads after the dashboard's, which it overrode).
     CSS(".bt-spinner",
         "width" => "14px", "height" => "14px",
-        "border-radius" => "50%",
-        "border" => "2px solid var(--bt-border)",
-        "border-top-color" => "var(--bt-accent)",
+        "border-radius" => "50%", "box-sizing" => "border-box",
+        "border-top" => "2px solid var(--bt-accent)",
+        "border-right" => "2px solid var(--bt-border)",
+        "border-bottom" => "2px solid var(--bt-border)",
+        "border-left" => "2px solid var(--bt-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
-        "animation" => "bt-spin 0.7s linear infinite",
+        "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0",
         "display" => "inline-block"),
     # Explicit `from` so it's an angle interpolation (0°→360°); `to` alone
@@ -3248,7 +3780,11 @@ const ChatStyles = Bonito.Styles(
         # Yolo/send/stop controls drop to a second row. In the single wrapped
         # row the flex-shrink:0 button column (~110px) squeezed a 390px phone's
         # textarea to ~200px — an awkward typing target.
-        CSS(".bt-input-row", "flex-wrap" => "wrap", "row-gap" => "8px"),
+        CSS(".bt-input-row", "flex-wrap" => "wrap", "gap" => "var(--bt-space-1)", "row-gap" => "8px"),
+        CSS(".bt-input-controls, .bt-input-btn-row", "min-width" => "0", "gap" => "var(--bt-space-1)"),
+        CSS(".bt-input-btn-row", "flex" => "1"),
+        CSS(".bt-send-mode", "flex" => "1", "min-width" => "0"),
+        CSS(".bt-send-mode-trigger", "width" => "100%"),
         CSS(".bt-text-input", "flex" => "1 1 100%"),
         # DOM order is attach, input, controls; wrap puts the 100%-basis input
         # on its own row but strands attach ABOVE it. order fixes the rows:
@@ -3256,13 +3792,15 @@ const ChatStyles = Bonito.Styles(
         CSS(".bt-attach-btn", "order" => "1", "flex" => "0 0 auto"),
         CSS(".bt-input-controls",
             "order" => "2",
-            "flex" => "1 1 auto",
+            "flex" => "1 1 0",
             "flex-direction" => "row",
             "align-items" => "center",
             "justify-content" => "flex-end",
-            "gap" => "10px"),
-        # The bar's `padding: 3px 0` assumes the desktop column layout
-        # stretches it wide; in a row that collapses to bare "Yolo" text
-        # glued to the Send circle.
-        CSS(".bt-yolo-bar", "padding" => "8px 12px")),
+            "gap" => "var(--bt-space-1)")),
+    CSS("@media (max-width: 360px)",
+        CSS(".bt-input-area", "padding-left" => "var(--bt-space-2)", "padding-right" => "var(--bt-space-2)"),
+        CSS(".bt-input-row, .bt-input-controls, .bt-input-btn-row", "gap" => "2px"),
+        CSS(".bt-attach-btn, .bt-stop-btn, .bt-send-btn", "width" => "32px", "height" => "32px"),
+        CSS(".bt-yolo-bar", "padding" => "6px"),
+        CSS(".bt-send-mode-trigger", "font-size" => "10px", "min-height" => "32px", "gap" => "2px")),
 )
