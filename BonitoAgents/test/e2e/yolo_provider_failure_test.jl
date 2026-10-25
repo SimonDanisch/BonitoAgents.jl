@@ -74,7 +74,7 @@
         @test TK.wait_for(s, "the failure is shown as a provider error",
             "(() => { const n = $(visible(".bt-session-notice"));
                       return !!n && n.dataset.severity === 'error' &&
-                             n.textContent.includes('Provider error') &&
+                             n.getAttribute('aria-label') === 'Agent error' &&
                              n.textContent.includes('usage limit'); })()"; timeout = 10)
         # The failed turn was the last one: no auto-continue was ever sent.
         @test TK.eval_js(s, auto_prompts_js) == 0

@@ -60,6 +60,7 @@ include("chat.jl")             # message types (UserMsg, AgentMsg, ...)
 include("chat_export.jl")      # "Export as Markdown": the chat as a .md that is also a BonitoBook notebook
 include("measured_sizes.jl")   # body heights + media sizes the browser measured, sent with later renders
 include("chat_queue.jl")       # pending submissions and delivery modes
+include("session_notices.jl")  # recovery and durable dismissal of provider notices
 include("file_view.jl")        # FileView / FilePanel — the one rich file renderer (bt_show + file tabs)
 include("review.jl")           # change-review tab: git diff + per-line ask / batched feedback
 include("lens.jl")             # lens search: parse + fuzzy filter + saved lenses

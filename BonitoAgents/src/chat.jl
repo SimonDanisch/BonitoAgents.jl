@@ -455,6 +455,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
         BgNotes(),                             # bg_notes
         load_body_heights(chat_dir),           # body_heights
     )
+    load_session_notice!(model)
     load_pending_sends!(model)
     # Re-parent history-loaded messages: load_history builds `UserMsg(text)`
     # with `chat = nothing` (the model doesn't exist yet while parsing), but
@@ -4261,6 +4262,12 @@ wire_final(m::SummaryMsg) = Dict{String,Any}("type" => "summary_final", "id" => 
 # into that bubble via `process_update!`, from the cursor the commit stopped at.
 # Only tools/plan override `process_update!`; text messages use the default.
 function process!(chat::ChatModel, m::AgentClientProtocol.Message)
+    # New reply/tool activity proves a transient retry recovered. History replay
+    # has no open turn; compaction or reply text alone cannot clear a quota error.
+    if m isa Union{AgentClientProtocol.AgentMessage,AgentClientProtocol.ToolCall} &&
+       !isempty(AgentClientProtocol.open_turns(chat))
+        resolve_session_notice!(chat; warnings_only = true)
+    end
     # Commit what the message says RIGHT NOW, then stream from exactly that
     # point. The cursor is not decoration: a text message keeps its chunks, so a
     # bubble built from the first `n` and then fed the stream from 0 would print
@@ -4268,16 +4275,6 @@ function process!(chat::ChatModel, m::AgentClientProtocol.Message)
     rendered = length(m.stream.items[])
     b = send!(chat, to_message(chat, m, rendered))
     return process_update!(b, m; from = rendered)
-end
-
-function process!(chat::ChatModel, m::AgentClientProtocol.SessionNotice)
-    notice = shared(chat).session_notice
-    previous = notice[]
-    if get(previous, "id", nothing) == m.record["id"]
-        get(previous, "revision", -1) >= m.record["revision"] && return nothing
-    end
-    notice[] = copy(m.record)
-    return nothing
 end
 
 # Thoughts get special handling. This agent redacts the plaintext reasoning
@@ -6302,6 +6299,7 @@ function finish_turn!(chat::ChatModel, turn;
     stop_reason = ""
     failure = ""
     connection_lost = false
+    recovered = false
     try
         # The span settling (end_turn / cancelled) says the agent is done
         # talking. It does NOT say we are done showing it — that is the barrier
@@ -6315,6 +6313,7 @@ function finish_turn!(chat::ChatModel, turn;
             # record is the one the chat shows as a notice mid-turn, so it is
             # shown the same way, and an error ends the turn as failed.
             record = AgentClientProtocol.session_notice_record(result)
+            recovered = stop_reason == "end_turn" && record === nothing
             if record !== nothing
                 process!(chat, AgentClientProtocol.SessionNotice(record))
                 if record["severity"] == "error"
@@ -6340,6 +6339,12 @@ function finish_turn!(chat::ChatModel, turn;
         # injecting one, so nothing that arrives after it is swept into this
         # turn's last bubble.
         wait_rendered!(chat, turn.flush)
+        # A successful response without a remaining failure is positive recovery,
+        # including after a quota reset. Stop and failed turns prove no recovery.
+        # A newer turn may already be running after a steering handoff.
+        if recovered && isempty(AgentClientProtocol.open_turns(chat))
+            resolve_session_notice!(s)
+        end
         outcome = TurnOutcome(stop_reason, errored, failure, nstore0, connection_lost)
         # Published on the SHARED model: the per-tab `busy_active` is a
         # session-scoped child (parent→child only), so writing that one left the
@@ -6885,7 +6890,6 @@ function bring_up_once!(model::ChatModel)
         # the new client can emit against it.
         chat_emit(s, Dict{String,Any}("type" => "session_reset"))
 
-        s.session_notice[] = Dict{String,Any}()
         start_chat_client!(model)      # brings up a fresh client[]; consumer keeps running
         s.session_alive[] = true
         s.last_error[] = ""
@@ -8750,6 +8754,8 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
             send_mode(get(msg, "mode", "done")))
     elseif type == "queue.action"
         return QueueActionCommand(String(get(msg, "id", "")), String(get(msg, "action", "")))
+    elseif type == "notice.dismiss"
+        return DismissNoticeCommand(String(get(msg, "id", "")))
     elseif type == "cancel"
         return CancelCommand(Int(get(msg, "seq", -1)), get(msg, "force", false) === true)
     elseif type == "stop_tool"
@@ -9488,23 +9494,28 @@ end
 # The DOM of a `ChatNotice`.
 function chat_notice(session::Bonito.Session, model::ChatModel)
     box = DOM.div(
-        DOM.div(DOM.strong(; class="bt-session-notice-label"),
-                DOM.div(; class="bt-session-notice-text")),
+        DOM.details(DOM.summary(; class="bt-session-notice-title"),
+                    DOM.div(; class="bt-session-notice-text"); class="bt-session-notice-body"),
         DOM.button("×"; class="bt-btn bt-btn-ghost bt-btn-sm", type="button",
                    title="Dismiss notice");
         class="bt-session-notice", role="status", hidden=true)
     Bonito.onload(session, box, js"""(el) => {
         const notice = $(model.session_notice);
         const render = info => {
-            el.hidden = !info.id;
+            if (el.dataset.noticeId !== info.id) el.querySelector('details').open = false;
+            el.hidden = !info.id || info.dismissed === true || info.resolved === true;
             el.dataset.noticeId = info.id || '';
             el.dataset.severity = info.severity || '';
-            el.querySelector('.bt-session-notice-label').textContent =
-                info.severity === 'error' ? 'Provider error' : 'Provider warning';
+            el.setAttribute('aria-label', info.severity === 'error' ? 'Agent error' : 'Agent warning');
+            el.querySelector('summary').textContent = info.title || '';
+            el.querySelector('summary').title = info.title || '';
             el.querySelector('.bt-session-notice-text').textContent =
-                (info.title || '') + (typeof info.details === 'string' ? '\n' + info.details : '');
+                typeof info.details === 'string' && info.details !== info.title ? info.details : '';
         };
-        el.querySelector('button').onclick = () => { el.hidden = true; };
+        el.querySelector('button').onclick = () => {
+            el.hidden = true;
+            $(model.comm).notify({type: 'notice.dismiss', id: el.dataset.noticeId});
+        };
         notice.on(render);
         render(notice.value);
     }""")
