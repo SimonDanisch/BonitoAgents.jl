@@ -752,11 +752,16 @@ function share_result!(state::ServerState, project_id::AbstractString, payload::
 end
 
 const ShareControlStyles = Bonito.Styles(
+    # Output controls also travel with detached results. Carry the shared
+    # tokens and button rules rather than depending on the dashboard sheet.
+    THEME_TOKENS, BUTTON_CSS...,
     CSS(".bt-share-control", "display" => "flex", "align-items" => "center",
-        "gap" => "var(--bt-space-2)", "flex-wrap" => "wrap"),
+        "gap" => "var(--bt-space-2)", "flex-wrap" => "wrap",
+        "margin-bottom" => "var(--bt-space-2)", "font-size" => "var(--bt-text-sm)"),
     CSS(".bt-share-control [hidden]", "display" => "none"),
-    CSS(".bt-share-link", "overflow-wrap" => "anywhere", "user-select" => "text"),
-    CSS(".bt-share-error", "white-space" => "pre-wrap"))
+    CSS(".bt-share-error", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
+        "color" => "var(--bt-error)"),
+    CSS(".bt-share-error:empty", "display" => "none"))
 
 struct ShareControl{F}
     create::F
@@ -797,7 +802,8 @@ function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
     button = DOM.button("Share"; type = "button", disabled = true,
                         class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-result",
                         title = control.hint, ariaLabel = "Share this output")
-    link = DOM.a(; class = "bt-share-link", target = "_blank", rel = "noopener noreferrer")
+    link = DOM.a("Open link ↗"; class = "bt-btn bt-btn-sm bt-btn-ghost bt-share-link",
+                 hidden = true, target = "_blank", rel = "noopener noreferrer")
     copy = DOM.button("Copy link"; type = "button", hidden = true,
                       class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-copy")
     error = DOM.span(; class = "bt-share-error", role = "status")
@@ -818,8 +824,8 @@ function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
         });
         answer.on(value => {
             if (value.startsWith('link:')) {
-                link.href = value.slice(5); link.textContent = value.slice(5);
-                copy.hidden = false; button.hidden = true;
+                link.href = value.slice(5); link.title = value.slice(5);
+                link.hidden = false; copy.hidden = false; button.hidden = true;
             } else if (value.startsWith('error:')) {
                 error.textContent = value.slice(6); button.disabled = false;
             }
