@@ -488,6 +488,14 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     on(model.taskbar.stop_request) do id
         isempty(id) || handle_command!(model, nothing, StopToolCommand(id))
     end
+    on(model.yolo) do enabled
+        enabled && return
+        lock(model.lock) do
+            drop_idle_sends!(model)
+            save_pending_sends!(model)
+            emit_queue!(model)
+        end
+    end
     busy_seen = Ref(busy_active[])
     on(busy_active) do b
         b == busy_seen[] && return
@@ -5931,6 +5939,13 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
             try
                 turn = lock(s.lock) do
                     submission !== nothing && submission.status != :sending && return nothing
+                    if submission !== nothing && submission.mode === :idle &&
+                       (!s.yolo[] || s.stopped[] || !isempty(AgentClientProtocol.open_turns(s)))
+                        drop_idle_sends!(s)
+                        save_pending_sends!(s)
+                        emit_queue!(s)
+                        return nothing
+                    end
                     cancelling(chat) &&
                         error("The agent is still stopping; message has not been sent.")
                     payload = submission === nothing ? (message = user_msg, text = "") : submission_payload(submission)
@@ -6182,9 +6197,9 @@ function yolo_decide(y::YoloState, t::YoloTurn)
         #
         # `streak` is how many times we have asked: 0 on the turn that started
         # the loop, incremented once per auto-continue. So `streak > 0` is
-        # exactly "this reply answers a question we asked". In Yolo the composer
-        # is the reminders editor and no user message can slip through, so every
-        # turn past the first IS an answer to our nudge.
+        # exactly "this reply answers a question we asked". Incoming work,
+        # including peer messages and completed-job notifications, resets the
+        # protocol rather than answering a superseded confirmation question.
         y.phase === :work && y.streak > 0 && return dec(:confirm)
     end
 
@@ -6421,45 +6436,49 @@ does_work(::CompactionToolMsg) = false
 # with a visible reason, not a silent return.
 function continue_yolo!(chat::ChatModel, o::TurnOutcome)
     s = shared(chat)
-    (s.yolo[] && !was_cancelled(o)) || return nothing
-    y = s.yolo_state
-    # This turn's messages are msgs_store[nstore0+1:end]: the LAST AgentMsg among
-    # them is the agent's final reply, and any message that `does_work` means it
-    # did real work rather than just answering.
-    #
-    # A missing reply is NOT a bail: a turn ending on a tool call has no closing
-    # text, which used to stop Yolo silently.
-    reply, worked = lock(s.lock) do
-        turn = @view s.msgs_store[(o.nstore0+1):end]
-        i = findlast(m -> m isa AgentMsg, turn)
-        (i === nothing ? "" : turn[i].text), any(does_work, turn)
+    lock(s.lock) do
+        (s.yolo[] && !was_cancelled(o)) || return nothing
+        # Real queued work already continues the chat. Do not add a second nudge,
+        # advance the confirmation protocol, or count that turn as an idle retry.
+        # Provider failures still go through the stop/disarm protection below.
+        (!o.errored && o.stop_reason != "refusal" && !yolo_ready(s)) && return nothing
+        y = s.yolo_state
+        # This turn's messages are msgs_store[nstore0+1:end]: the LAST AgentMsg among
+        # them is the agent's final reply, and any message that `does_work` means it
+        # did real work rather than just answering.
+        #
+        # A missing reply is NOT a bail: a turn ending on a tool call has no closing
+        # text, which used to stop Yolo silently.
+        reply, worked = lock(s.lock) do
+            turn = @view s.msgs_store[(o.nstore0+1):end]
+            i = findlast(m -> m isa AgentMsg, turn)
+            (i === nothing ? "" : turn[i].text), any(does_work, turn)
+        end
+        t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason,
+                     o.failure, o.connection_lost)
+        d = yolo_decide(y, t)
+        yolo_apply!(y, d, t)
+        if d.action === :stop
+            # Off means off: a disarming stop must not be undone by the next
+            # message, so the toggle itself flips (every tab sees it).
+            d.disarm && (s.yolo[] = false)
+            # Every stop is VISIBLE. A loop that just goes quiet reads as a hang;
+            # saying why is the difference between "it finished" and "it gave up".
+            # Confirming the sentinel is the one silent case — the agent's own last
+            # message already says it.
+            label = o.connection_lost ? "paused" : "stopped"
+            isempty(d.reason) || close(send!(chat, AgentMsg(chat,
+                "_Yolo $label: $(d.reason)$(d.disarm ? " — Yolo switched off" : "")._")))
+            # Logged too: the loop runs unattended for hours, and "why did it stop"
+            # is asked long after the bubble has scrolled away.
+            @info "yolo loop stopped" project_id = chat.project_id disarmed = d.disarm reason =
+                isempty(d.reason) ? "the agent confirmed it was finished" : d.reason
+            return nothing
+        end
+        # Enqueue within the same lock as the decision: a deferred task used to race
+        # background completion notes and pile up a new nudge behind each one.
+        send_message!(s, yolo_user_msg(s, d.action; repeated = d.repeated); mode = :idle)
     end
-    t = YoloTurn(reply, said_something(chat, o), worked, o.errored, o.stop_reason,
-                 o.failure, o.connection_lost)
-    d = yolo_decide(y, t)
-    yolo_apply!(y, d, t)
-    if d.action === :stop
-        # Off means off: a disarming stop must not be undone by the next
-        # message, so the toggle itself flips (every tab sees it).
-        d.disarm && (s.yolo[] = false)
-        # Every stop is VISIBLE. A loop that just goes quiet reads as a hang;
-        # saying why is the difference between "it finished" and "it gave up".
-        # Confirming the sentinel is the one silent case — the agent's own last
-        # message already says it.
-        label = o.connection_lost ? "paused" : "stopped"
-        isempty(d.reason) || close(send!(chat, AgentMsg(chat,
-            "_Yolo $label: $(d.reason)$(d.disarm ? " — Yolo switched off" : "")._")))
-        # Logged too: the loop runs unattended for hours, and "why did it stop"
-        # is asked long after the bubble has scrolled away.
-        @info "yolo loop stopped" project_id = chat.project_id disarmed = d.disarm reason =
-            isempty(d.reason) ? "the agent confirmed it was finished" : d.reason
-        return nothing
-    end
-    Base.errormonitor(@async try
-        send_message!(chat, yolo_user_msg(chat, d.action; repeated = d.repeated))
-    catch e
-        @warn "yolo auto-continue send failed" project_id = chat.project_id exception = (e, catch_backtrace())
-    end)
     return nothing
 end
 

@@ -76,6 +76,33 @@ end
 
 send_mode(s) = s == "interrupt" ? :interrupt : s == "next" ? :next : :done
 
+# Continuations are idle work, unlike user/peer input or a completed job's
+# notification. They are disposable as soon as there is something else to do.
+function yolo_ready(model)
+    s = shared(model)
+    return s.yolo[] && !s.stopped[] && isempty(AgentClientProtocol.open_turns(s)) &&
+        !any(e -> e isa PendingSend && e.status in (:waiting, :offline, :sending), s.pending_sends)
+end
+
+# Caller holds the chat lock and persists/broadcasts the resulting queue.
+function drop_idle_sends!(model)
+    for e in model.pending_sends
+        e isa PendingSend && e.mode === :idle && e.status !== :sent || continue
+        e.status = :superseded
+    end
+    filter!(e -> !(e isa PendingSend && e.status === :superseded), model.pending_sends)
+    return nothing
+end
+
+# Migration for queues written before continuations had their own delivery mode.
+# Match our complete generated prompt, and only on an auto message, not prose.
+function persisted_idle_send(row)
+    get(row, "mode", "done") == "idle" && return true
+    get(row, "auto", false) || return false
+    text = get(row, "text", "")
+    return startswith(text, YOLO_CONTINUE_PROMPT) || startswith(text, YOLO_CONFIRM_PROMPT)
+end
+
 struct SendModeCommand <: ChatCommand
     command::SendCommand
     mode::Symbol
@@ -109,7 +136,13 @@ end
 function load_pending_sends!(model)
     path = pending_path(model)
     isfile(path) || return nothing
+    dropped_idle = false
     for row in JSON.parsefile(path)
+        # A continuation of an old turn is stale after restoring the chat.
+        if persisted_idle_send(row)
+            dropped_idle = true
+            continue
+        end
         bubble = UserMsg(model, String(row["text"]))
         bubble.auto = get(row, "auto", false)
         riders = UserMsg[]
@@ -132,6 +165,7 @@ function load_pending_sends!(model)
             kept === :waiting ? "" : String(get(row, "detail", "")), nothing,
             origin_from_wire(get(row, "origin", nothing))))
     end
+    dropped_idle && save_pending_sends!(model)
     wake_outbox!(model)
     return nothing
 end
@@ -166,11 +200,18 @@ emit_queue!(model) = chat_emit(model, queue_event(model))
 # the stop.
 function enqueue_message!(model, msg; images, mode, origin = nothing)
     s = shared(model)
-    msg.auto || reset!(s.yolo_state)
     mode == :interrupt && handle_command!(s, nothing, CancelCommand())
     bubble = UserMsg(s, msg.text)
     bubble.auto = msg.auto
     entry = lock(s.lock) do
+        if mode === :idle
+            yolo_ready(s) || return nothing
+        else
+            # A new task/result supersedes any pending "are you done?" question,
+            # even when it is an automatic job notification or peer message.
+            reset!(s.yolo_state)
+            drop_idle_sends!(s)
+        end
         held = msg.auto && s.stopped[]
         riders = UserMsg[]
         if !msg.auto
@@ -187,6 +228,7 @@ function enqueue_message!(model, msg; images, mode, origin = nothing)
         save_pending_sends!(s)
         e
     end
+    entry === nothing && return nothing
     @info "message queued" project_id=s.project_id message_id=entry.id mode status=entry.status riders=length(entry.riders)
     emit_queue!(s)
     entry.status === :held || wake_outbox!(s)
@@ -272,8 +314,8 @@ function run_submission!(model, entry)
         else
             # Asked again after each wait: a "next" message steered in
             # meanwhile is a new prompt this one must also wait for.
-            while entry.mode == :done && entry.status == :sending
-                ahead = prompts_ahead(model)
+            while entry.mode in (:done, :idle) && entry.status == :sending
+                ahead = entry.mode === :idle ? AgentClientProtocol.open_turns(model) : prompts_ahead(model)
                 isempty(ahead) && break
                 entry.detail = "Waiting until the agent finishes"
                 emit_queue!(model)
@@ -347,6 +389,7 @@ function drop_queued_sends!(model::ChatModel)
             end
             n += 1
         end
+        drop_idle_sends!(s)
         save_pending_sends!(s)
         n
     end

@@ -128,3 +128,86 @@
         close(state.srv)
     end
 end
+
+@testitem "unit:yolo_queue" tags=[:unit] begin
+    using BonitoAgents, JSON
+    const BT = BonitoAgents
+    state = BT.ServerState(; state_dir=mktempdir(), working_dir=mktempdir())
+    cwd = mktempdir()
+    model() = BT.ChatModel(state, cwd; project_id="idle-queue",
+        agent=BT.WorkerAgent(state, "offline", cwd))
+    m = model()
+    models = [m]
+    function finish_work()
+        close(BT.send!(m, BT.AgentMsg(m, "Useful work finished")))
+        BT.continue_yolo!(m, BT.TurnOutcome("end_turn", false, "", 0))
+    end
+    try
+        m.yolo[] = true
+        finish_work()
+        @test only(m.pending_sends).mode === :idle
+        @test m.yolo_state.streak == 1
+        finish_work() # a second completion cannot stack another continuation
+        @test length(m.pending_sends) == 1
+        @test m.yolo_state.streak == 1
+
+        stale = BT.next_submission(m) # selected, but not handed to ACP yet
+        note = BT.UserMsg(m, "Background Julia run finished: r1")
+        note.auto = true
+        BT.send_message!(m, note)
+        @test stale.status === :superseded
+        @test only(m.pending_sends).bubble.text == note.text
+        finish_work()
+        @test length(m.pending_sends) == 1
+        @test m.yolo_state.streak == 0
+        @test m.yolo[] # waiting on real work does not disarm the mode
+
+        empty!(m.pending_sends)
+        finish_work()
+        m.yolo[] = false
+        @test isempty(m.pending_sends)
+        m.yolo[] = true
+        finish_work()
+        BT.user_ended!(m)
+        BT.drop_queued_sends!(m)
+        @test isempty(m.pending_sends) # a stopped nudge cannot become a rider
+        finish_work()
+        @test isempty(m.pending_sends)
+
+        m.stopped[] = false
+        BT.reset!(m.yolo_state)
+        finish_work()
+        @test only(m.pending_sends).mode === :idle
+        restored = model()
+        push!(models, restored)
+        @test isempty(restored.pending_sends) # obsolete continuation after restart
+
+        # Old versions persisted YOLO as ordinary auto messages. Upgrade drops
+        # only the generated nudges, preserving completed-job notifications.
+        rows = [Dict("id"=>"legacy-yolo", "text"=>BT.YOLO_CONTINUE_PROMPT,
+                     "auto"=>true, "mode"=>"done"),
+                Dict("id"=>"legacy-note", "text"=>note.text, "auto"=>true, "mode"=>"done")]
+        BT.atomic_write_json(BT.pending_path(m), rows)
+        legacy = model()
+        push!(models, legacy)
+        @test only(legacy.pending_sends).bubble.text == note.text
+        @test only(JSON.parsefile(BT.pending_path(m)))["id"] == "legacy-note"
+
+        empty!(m.pending_sends)
+        m.yolo[] = true
+        BT.reset!(m.yolo_state)
+        m.yolo_state.streak = 1
+        close(BT.send!(m, BT.AgentMsg(m, BT.YOLO_DONE_SENTINEL)))
+        BT.continue_yolo!(m, BT.TurnOutcome("end_turn", false, "", length(m.msgs_store)-1))
+        @test m.yolo_state.phase === :confirm
+        @test startswith(only(m.pending_sends).message.text, BT.YOLO_CONFIRM_PROMPT)
+        BT.send_message!(m, note)
+        @test m.yolo_state.phase === :work # it never answered that confirmation
+        @test only(m.pending_sends).bubble.text == note.text
+        BT.continue_yolo!(m, BT.TurnOutcome("end_turn", true, "Usage limit", 0))
+        @test !m.yolo[] # queued work cannot bypass failure protection
+        @test only(m.pending_sends).bubble.text == note.text
+    finally
+        foreach(close, models)
+    end
+end
