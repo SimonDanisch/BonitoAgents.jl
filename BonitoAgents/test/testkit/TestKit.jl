@@ -152,6 +152,8 @@ end
 By default, a tool simulator that runs the BonitoMCP handler in the test
 process. This does NOT test agent/MCP launch or environment propagation.
 Pass `real_process=true` to launch MCP from the worker-supplied ACP config.
+Use `arguments=Dict(...)` for tool arguments named `id`, since `id` here names
+the tool call card.
 The simulator uses: Malt worker per `env_path`,
 real `--project` activation, real captured stdout/value/errors. The
 dispatcher executes it in the test process and pipes the resulting MCP
@@ -901,8 +903,9 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
     tool = String(get(ev, "tool", "bt_julia_eval"))
     # Everything besides the event bookkeeping IS the tool's argument dict —
     # `mcp_call` sugar (bt_eval / bt_continue) puts args at the top level.
-    args = Dict{String,Any}(String(k) => v for (k, v) in ev
-                            if String(k) ∉ ("type", "tool", "id"))
+    args = get(ev,"arguments",nothing)
+    args === nothing && (args = Dict{String,Any}(String(k) => v for (k, v) in ev
+                            if String(k) ∉ ("type", "tool", "id")))
 
     tool_id = String(get(ev, "id", "te_$(rand(UInt32))"))
     # Real claude opens the tool bubble BEFORE the MCP call runs, streams the

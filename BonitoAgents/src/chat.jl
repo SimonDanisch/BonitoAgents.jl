@@ -9722,5 +9722,7 @@ function chat_transcript(session::Session, model::ChatModel)
     # The messages area + the taskbar share a positioning context so the
     # taskbar floats over the MESSAGES, anchored below the (variable-height)
     # header instead of on top of it. The rail positions itself in it too.
-    return DOM.div(messages_container, taskbar, init_script; class = "bt-messages-wrap")
+    return DOM.div(messages_container, taskbar,
+        job_progress_view(session,job_book(model.state,model.project_id)),
+        init_script; class = "bt-messages-wrap")
 end

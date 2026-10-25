@@ -527,6 +527,9 @@ function accept_worker_channel(state::ServerState, worker_id::String, ch::Worker
     if kind == "mcp"
         accept_channel(ch)
         serve_mcp_channel(state, MCPChannel(state, ch, project_id, host ? worker_id : ""))
+    elseif kind == "progress"
+        accept_channel(ch)
+        serve_progress_channel(state, ch, project_id, worker_id)
     elseif kind == "eval"
         serve_eval_bridge(state, ch, eval_bridge_key(project_id, host ? worker_id : ""),
                           String(get(header, "prefix", "")))
@@ -693,6 +696,7 @@ function worker_link_changed!(state::ServerState, worker_id::String,
             note_interrupted_turns!(state, worker_id)
         end
         w.online[] = online
+        progress_worker_connected!(state,worker_id,online)
         notify_workers!(state)
         if online
             @info "Worker connected" worker_id name = w.name

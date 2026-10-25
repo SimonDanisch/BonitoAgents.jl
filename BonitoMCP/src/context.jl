@@ -23,6 +23,8 @@ mutable struct MCPServer
     inflight_lock::ReentrantLock                # guards `inflight` and `remote_inflight`
     out_lock::ReentrantLock                     # serialises one-line-per-frame stdout writes
     waits::AgentWaits                           # voluntary waits released by incoming messages
+    progress_jobs::Dict{String,BonitoProgress.Job}
+    progress_lock::ReentrantLock
 end
 
 const SERVER = MCPServer(
@@ -34,6 +36,8 @@ const SERVER = MCPServer(
     ReentrantLock(),
     ReentrantLock(),
     AgentWaits(),
+    Dict{String,BonitoProgress.Job}(),
+    ReentrantLock(),
 )
 
 # The eval-session manager. An accessor, not a bare field read: it's the one part

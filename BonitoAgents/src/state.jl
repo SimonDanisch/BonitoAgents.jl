@@ -515,6 +515,7 @@ mutable struct ServerState
     # `Any` like `chat_models` above and for the same reason: review.jl is
     # included after this file, so the concrete type isn't known here.
     review_states :: Dict{String,Any}
+    job_progress :: Dict{String,Any}   # per-chat progress books, independent of agent turns
 
     # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
     # entry. `chat_models` is a plain Dict (not an Observable), but the
@@ -720,6 +721,7 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
         Dict{String,Any}(),                       # review_states
+        Dict{String,Any}(),                       # job_progress
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
         Dict{String,Float64}(),                   # turns_ended
@@ -797,6 +799,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             map(identity, session, s.projects),
             s.chat_models,
             s.review_states,           # shared: the point is surviving a session
+            s.job_progress,
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
             s.turns_ended,             # shared: one record per server

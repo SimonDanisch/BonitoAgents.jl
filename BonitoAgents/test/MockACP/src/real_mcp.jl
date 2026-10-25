@@ -54,7 +54,8 @@ function emit_real_mcp_call(ev)
     # same id claude-agent-acp gives the ACP tool call); `anonymous = true` plays
     # an agent that sends nothing of the kind.
     anonymous = get(ev, "anonymous", false) === true
-    args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id", "anonymous"))
+    args = get(ev,"arguments",nothing)
+    args === nothing && (args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id", "anonymous")))
     meta = Dict("claudeCode" => Dict("toolName" => "mcp__btworker__" * tool))
     upd("tool_call", Dict("toolCallId" => tid, "kind" => "other",
         "title" => "mcp__btworker__" * tool, "status" => "pending",

@@ -196,6 +196,7 @@ struct SidebarChat
     group   :: Observable{String}
     # Persistent image identity, shared with the dashboard.
     image   :: Observable{Any}
+    progress::JobBook
     tree    :: Union{Nothing,WorkerFileTree}
     active0 :: Bool        # first paint only; the nav handler owns it afterwards
 end
@@ -208,12 +209,21 @@ function render_part(session::Bonito.Session, c::SidebarChat)   # timed: diagnos
     icon_node = DOM.div(
         map(session, c.tag, c.wname, c.image, c.color) do t, wn, img, col
             project_icon_for(c.pid, c.name, c.hue_key, t, wn; image = img, color = col)
-        end;
+        end,
+        job_progress_view(session,c.progress;icon=true);
         class = map(session, c.status) do st; "bt-side-icon-wrap bt-glow-$(st)" end,
         # The ring colour rides `style`, which does track: a string assigned to
         # `el.style` is forwarded to `cssText`.
         style = map(session, c.color) do col; "--bt-worker:$(col)" end,
         title = map(session, c.status) do st; string(st) end)
+    Bonito.onload(session,icon_node,js"""el => {
+        el.addEventListener('click',()=>{
+            if (!el.closest('.bt-side-item')?.classList.contains('bt-side-active')) return;
+            const pane=document.querySelector('.bt-chatpane[data-pane-pid="'+$(c.pid)+'"]');
+            const details=pane?.querySelector('.bt-job-progress');
+            if (details && !details.hidden) details.open=!details.open;
+        });
+    }""")
     item = DOM.div(
         icon_node,
         DOM.span(c.label; class = "bt-side-name"),
@@ -521,6 +531,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                 SidebarChat(p.id, p.name, folder_hue_key(p),
                             Observable(label), Observable(tooltip), Observable(t), Observable(wn),
                             Observable(col), Observable(st), Observable(""), Observable{Any}(nothing),
+                            job_book(state,p.id),
                             pane === nothing ? nothing : WorkerFileTree(state, p.id, pane),
                             active_pid == p.id)
             end

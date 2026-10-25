@@ -47,6 +47,7 @@ bonito_asset(parts::AbstractString...) =
 
 include("identity.jl")         # User, LocalAuth/ProxyAuth: who is on the other end (the proxy authenticates)
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
+include("job_progress.jl")     # durable job telemetry and its compact chat/sidebar views
 include("tunnel.jl")           # behind a tunnel: the login gate before every route
 include("progress.jl")         # notify_progress + the window's ONE progress card (BusyState)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
