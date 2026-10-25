@@ -79,12 +79,12 @@ const MENU_CLOSE_JS = """
     }"""
 
 """
-    action_menu(items...; title = "More actions") -> Node
+    action_menu(items...; title = "More actions", label = "⋯") -> Node
 
 A `⋯` button that opens `items` (`.bt-menu-item` buttons) in a popover.
 """
-action_menu(items...; title::AbstractString = "More actions") = DOM.div(
-    DOM.button("⋯"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger",
+action_menu(items...; title::AbstractString = "More actions", label="⋯") = DOM.div(
+    DOM.button(label; class = "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger",
                title = title, onclick = MENU_TOGGLE_JS),
     DOM.div(items; class = "bt-menu-list");
     class = "bt-menu")
@@ -978,7 +978,7 @@ const MEDIA_CSS = [
     # descender gap of the line below it; at the top the line is the picture's
     # height exactly, the height a placeholder reserves for it (`bodyReserve`).
     CSS(".bt-media-wrap",
-        "position" => "relative", "display" => "inline-block", "max-width" => "100%",
+        "position" => "relative", "display" => "inline-flex", "flex-direction"=>"column", "max-width" => "100%",
         "vertical-align" => "top"),
     # Hover action row (enlarge · copy · download), top-right of the media.
     CSS(".bt-media-actions",
@@ -2454,12 +2454,6 @@ const ChatStyles = Bonito.Styles(
         "display" => "flex", "flex-direction" => "column",
         "height" => "100%", "min-height" => "0",
         "background" => "var(--bt-surface)"),
-    CSS(".bt-file-editor-header",
-        "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "padding" => "6px 10px",
-        "border-bottom" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface-2)",
-        "flex-shrink" => "0"),
     CSS(".bt-fv-icon",
         "color" => "var(--bt-text-faint)", "font-size" => "13px",
         "flex-shrink" => "0", "line-height" => "1"),
@@ -2497,17 +2491,6 @@ const ChatStyles = Bonito.Styles(
         "flex-shrink" => "0",
         "white-space" => "nowrap",
         "max-width" => "40%", "overflow" => "hidden", "text-overflow" => "ellipsis"),
-    CSS(".bt-fv-actions",
-        "display" => "flex", "align-items" => "center", "gap" => "4px",
-        "flex-shrink" => "0", "margin-left" => "auto"),
-    CSS(".bt-fv-act",
-        "border" => "1px solid transparent", "background" => "transparent",
-        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
-        "font-size" => "13px", "line-height" => "1",
-        "padding" => "3px 6px", "border-radius" => "var(--bt-radius-sm)"),
-    CSS(".bt-fv-act:hover",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-text)",
-        "border-color" => "var(--bt-border)"),
     # Segmented Preview|Source switch. The active half is filled, so which view
     # you're in is readable without hunting for a highlight.
     CSS(".bt-fv-segmented",

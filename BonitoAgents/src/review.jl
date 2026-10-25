@@ -831,30 +831,19 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         "  ·  + comments on a line; shift-click a second + to cover a block."
     end
 
-    header = DOM.div(
-        DOM.span("⑂"; class = "bt-fv-icon"),
-        path_span(repo_txt; class = "bt-file-editor-path bt-rv-repo"),
-        # The badge carries its own padding and background, so an EMPTY one is
-        # still a visible 15×3px stub — a stray dash next to the icon. Harmless
-        # while it only flickered during a load; the "pick a folder" state holds
-        # it indefinitely, so hide it when there is no branch to name. (The other
-        # header spans collapse to 0×0 on their own; this one doesn't.)
-        DOM.span(branch_txt; class = "bt-fv-badge",
-                 style = map(b -> isempty(b) ? "display:none" : "", session, branch_txt)),
-        DOM.span(stat_txt; class = "bt-rv-stat"),
-        DOM.span(st.status; class = "bt-file-editor-status"),
-        DOM.div(
-            folder_select,
-            base_input,
+    header = FileToolbar(
+        path_span(repo_txt;class="bt-file-editor-path bt-rv-repo");
+        metadata=(DOM.span(branch_txt;class="bt-fv-badge",
+            style=map(b->isempty(b) ? "display:none" : "",session,branch_txt)),
+            DOM.span(stat_txt;class="bt-rv-stat")),
+        actions=(DOM.span(st.status;class="bt-file-editor-status"),folder_select,base_input,
             DOM.div(
-                DOM.button("Ask"; class = "bt-fv-seg", type = "button", dataRvMode = "ask"),
-                DOM.button("Feedback"; class = "bt-fv-seg", type = "button", dataRvMode = "feedback");
-                class = "bt-fv-segmented"),
-            DOM.button("⟳"; class = "bt-fv-act", type = "button",
-                       title = "Re-read the diff from the worker", dataRvAction = "reload"),
-            send_btn;
-            class = "bt-fv-actions");
-        class = "bt-file-editor-header bt-rv-header")
+                DOM.button("Ask";class="bt-fv-seg",type="button",dataRvMode="ask"),
+                DOM.button("Feedback";class="bt-fv-seg",type="button",dataRvMode="feedback");
+                class="bt-fv-segmented"),
+            DOM.button("⟳";class="bt-btn bt-btn-ghost bt-btn-sm bt-fv-act",type="button",
+                title="Re-read the diff from the worker",dataRvAction="reload"),send_btn),
+        class="bt-file-editor-header bt-rv-header")
 
     node = DOM.div(
         header,

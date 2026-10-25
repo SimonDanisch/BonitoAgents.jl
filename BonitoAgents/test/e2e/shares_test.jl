@@ -112,11 +112,11 @@
             {type: 'edit_file', path: $(TK.json(notes))}); return true; })()""")
         # Wired once the panel's script ran (it marks the active view button).
         @test TK.wait_for(z, "the notes panel with its share button, wired",
-            "!!document.querySelector('$(panel) .bt-fv-act[data-fv-action=share]') && " *
+            "!!document.querySelector('$(panel) .bt-share-result') && " *
             "!!document.querySelector('$(panel) .bt-fv-seg[data-active=\"1\"]')"; timeout = 60) == true
-        TK.eval_js(z, "document.querySelector('$(panel) .bt-fv-act[data-fv-action=share]').click(); true")
+        TK.eval_js(z, "document.querySelector('$(panel) .bt-share-result').click(); true")
         notes_url = TK.wait_for(z, "the panel names the link",
-            "((document.querySelector('$(panel) .bt-fv-status')?.textContent || '').match(/https:\\/\\/\\S+?\\/s\\/[0-9a-f]{32}\\//) || [false])[0]";
+            "document.querySelector('$(panel) .bt-share-link')?.href || false";
             timeout = 60)
         @test startswith(notes_url, z.h.url * "/s/")
         @test length(state.shares.links[]) == 3
@@ -125,7 +125,7 @@
             {type: 'edit_file', path: $(TK.json(joinpath(cwd, "secret.txt")))}); return true; })()""")
         secret_panel = ".bw-ws-panel[data-panel-id=\"file:$(joinpath(cwd, "secret.txt"))\"]"
         @test TK.wait_for(z, "the text file's panel, with its share button",
-            "!!document.querySelector('$(secret_panel) .bt-fv-act[data-fv-action=share]')"; timeout = 60) == true
+            "!!document.querySelector('$(secret_panel) .bt-share-result')"; timeout = 60) == true
 
         # ── 2. the markdown page, for someone not logged in ─────────────────
         b = TK.another_browser(z)

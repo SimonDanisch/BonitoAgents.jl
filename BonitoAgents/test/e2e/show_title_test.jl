@@ -20,7 +20,8 @@
     P = ".bt-chatpane[data-pane-pid=\"$(pid)\"]"
     # [title text, its tooltip, the path it opens, the summary, title shown, status shown]
     head(id) = """(() => { const c = document.querySelector('$(P) .bt-tool-msg[data-msg-id*="$(id)"]');
-        const t = c && c.querySelector('.bt-tool-title'), s = c && c.querySelector('.bt-tool-summary');
+        const framed=c?.classList.contains('bt-output-framed');
+        const t=c?.querySelector(framed ? '.bt-file-toolbar-title' : '.bt-tool-title'), s=c?.querySelector(framed ? '.bt-file-toolbar-meta' : '.bt-tool-summary');
         const st = c && c.querySelector('.bt-tool-status');
         return t ? [t.textContent, t.title, t.dataset.path || '', s ? s.textContent : '',
                     t.checkVisibility(), !!st && st.checkVisibility()] : null; })()"""

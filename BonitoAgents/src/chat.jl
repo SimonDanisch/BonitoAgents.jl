@@ -2924,8 +2924,8 @@ function eval_result_node(m::JuliaEvalCall, v)
                       progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
             share_result!(chat.state, chat.project_id, v.payload)
         end,)
-    return wrap_for_detach(tool_id(m), DOM.div(controls,
-        remote_result(chat.state, v.payload, chat.project_id)))
+    return wrap_for_detach(tool_id(m), DOM.div(FileToolbar("Julia result";actions=controls),
+        remote_result(chat.state, v.payload, chat.project_id);class="bt-output-card"))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -3146,19 +3146,24 @@ end
 # would swap in its own opaque placeholder (and the bt_show body would never
 # carry the `.bt-tool-error` the UI/tests key on).
 function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
+    controls = isempty(st.project_id) ? () :
+        (ShareControl(; hint="Share this file with anyone who has the link while its worker is online.") do
+            share_project_file!(st.state,st.project_id,st.path)
+        end,)
     body = try
-        render_show_file(st, session)
+        kind=file_kind(st.path)
+        if kind isa Union{ImageFile,VideoFile}
+            render_file(kind,InlineView(),FileView(st,InlineView()),session;controls)
+        else
+            DOM.div(FileToolbar(basename(st.path);actions=controls,caption=true),render_show_file(st,session);
+                class="bt-output-card")
+        end
     catch e
         @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
             class = "bt-tool-error")
     end
-    controls = isempty(st.project_id) ? () :
-        (ShareControl(; hint = "Share this file with anyone who has the link while its worker is online. " *
-                                     "Manage passwords and end links in Settings.") do
-            share_project_file!(st.state, st.project_id, st.path)
-        end,)
-    return Bonito.jsrender(session, DOM.div(controls, body))
+    return Bonito.jsrender(session,body)
 end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
@@ -3336,7 +3341,7 @@ const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg
 const LIGHTBOX_OPEN_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const wrap = event.currentTarget.closest('.bt-media-wrap') || event.currentTarget.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     if (!media) return;
     if (media.tagName === 'VIDEO') {
@@ -3356,8 +3361,10 @@ const COPY_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
     const btn = event.currentTarget;
-    const img = btn.closest('.bt-media-wrap')?.querySelector('img.bt-media');
-    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = '⧉'; }, 1200); };
+    const wrap = btn.closest('.bt-media-wrap') || btn.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
+    const img = wrap?.querySelector('img.bt-media');
+    const label=btn.textContent;
+    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = label; }, 1200); };
     if (!img || !img.complete || !navigator.clipboard?.write || !window.ClipboardItem) return say('✕');
     const png = new Promise((resolve, reject) => {
         const cv = document.createElement('canvas');
@@ -3400,7 +3407,7 @@ event => {
 const DOWNLOAD_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const wrap = event.currentTarget.closest('.bt-media-wrap') || event.currentTarget.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
     const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
@@ -3411,6 +3418,22 @@ event => {
     document.body.appendChild(a); a.click(); a.remove();
 }
 """
+
+# The same menu items run in chat, workspace and public-viewer toolbars.
+function media_menu_items(is_video::Bool; worker_path="",download=true)
+    close_then(handler)=js"""event => { $(Bonito.JSString(MENU_CLOSE_JS)) ($(handler))(event); }"""
+    items=Any[DOM.button("Enlarge";class="bt-menu-item bt-media-enlarge",type="button",
+        title="Enlarge",onclick=close_then(LIGHTBOX_OPEN_JS))]
+    is_video || push!(items,DOM.button("Copy image";class="bt-menu-item bt-media-copy",type="button",
+        title="Copy image",onclick=close_then(COPY_MEDIA_JS)))
+    download && push!(items,DOM.button("Download";class="bt-menu-item bt-media-download",type="button",
+        title="Download",onclick=close_then(DOWNLOAD_MEDIA_JS)))
+    if !is_video && !isempty(worker_path)
+        push!(items,DOM.button("Set as chat icon";class="bt-menu-item bt-media-chat-icon",type="button",
+            title="Set as chat icon",var"aria-label"="Set as chat icon"))
+    end
+    return items
+end
 
 # A media element (image / video) with click-to-enlarge. `src` can be a streamed
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
@@ -3423,7 +3446,7 @@ event => {
 # its size before the bytes arrive, so nothing below it moves when they do.
 function media_element(src, mime::AbstractString, is_video::Bool;
                        filename::AbstractString = "", worker_path::AbstractString = "",
-                       size::Union{NTuple{2,Int},Nothing} = nothing)
+                       size::Union{NTuple{2,Int},Nothing} = nothing, controls=(), toolbar=true)
     dims = size === nothing ? (;) : (; width = size[1], height = size[2])
     inner = is_video ?
         # `playsinline` is not cosmetic: without it iOS Safari force-enters its
@@ -3437,20 +3460,9 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             style = Styles("max-width" => "100%", "height" => "auto", "display" => "block")) :
         DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS, dims...,
             style = Styles("max-width" => "100%", "height" => "auto", "display" => "block", "cursor" => "zoom-in"))
-    # Hover action row (Signal-style): enlarge · copy · download. Copy is
-    # image-only (no clipboard-image for video). All revealed on wrap hover.
-    actions = DOM.div(
-        DOM.button("⤢"; class = "bt-media-action bt-media-enlarge", type = "button",
-            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS),
-        (is_video ? () :
-            (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
-                title = "Copy image", onclick = COPY_MEDIA_JS),)),
-        DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
-            title = "Download", onclick = DOWNLOAD_MEDIA_JS),
-        (!is_video && !isempty(worker_path) ?
-            (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
-                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ());
-        class = "bt-media-actions")
+    heading = toolbar ? FileToolbar(isempty(filename) ? (is_video ? "Video" : "Image") : filename;
+        actions=(controls,DOM.div(action_menu(media_menu_items(is_video;worker_path);title="File actions");
+            class="bt-media-actions")),caption=true) : ()
     # The error can come before its handler is attached: the session that
     # attaches it starts once its payload is fetched, and a missing file's 404
     # can be back sooner, leaving a broken image where the note belongs. So a
@@ -3464,8 +3476,8 @@ function media_element(src, mime::AbstractString, is_video::Bool;
     })($(inner))"""
     # Its own styles, so it renders the same outside the dashboard (a shared
     # link's page, an app of your own).
-    return DOM.div(MediaStyles, inner, actions, replay_error;
-        class = "bt-media-wrap",
+    return DOM.div(MediaStyles, heading, inner, replay_error;
+        class = "bt-media-wrap" * (toolbar ? " bt-output-card" : ""),
         (isempty(filename) ? (;) : (; dataFilename = String(filename)))...,
         (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
 end

@@ -54,6 +54,7 @@ include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
 include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)
 include("styles.jl")
+include("file_widgets.jl")     # shared file heading and actions on every surface
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("code_view.jl")        # CodeView / DiffView: read-only code as static DOM, highlighted by Monaco
