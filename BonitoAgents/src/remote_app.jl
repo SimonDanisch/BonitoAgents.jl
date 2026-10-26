@@ -592,7 +592,7 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
         input = false
         for i in length(s.msgs_store):-1:(baseline + 1)
             msg = s.msgs_store[i]
-            if msg isa MCPToolMsg && tool_key(msg) == "bt_wait" &&
+            if msg isa MCPToolMsg && tool_key(msg) in ("bt_wait","bt_process") &&
                     (isempty(id) || tool_id(msg) == id)
                 return input
             end
@@ -780,7 +780,8 @@ const INJECTED_MCP_NAME = "btworker"
 # is handed to the MCP process or anything it spawns.
 function mcp_env(state::ServerState, project_id::AbstractString)
     env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id),
-        "BONITOAGENTS_INSTRUCTIONS" => agents_prompt_appendix(state, project_id))
+        "BONITOAGENTS_INSTRUCTIONS" => agents_prompt_appendix(state, project_id),
+        "BONITOAGENTS_PROCESS_EPOCH" => managed_process_epoch(state,project_id))
     # The ONE thing that turns on the `bt_dev_*` server-introspection tools in
     # that chat's MCP process. Keyed on the project's persisted `dev_mode` flag,
     # so a normal chat can never see them — not even one whose cwd happens to be

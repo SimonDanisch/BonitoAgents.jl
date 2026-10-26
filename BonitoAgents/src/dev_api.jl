@@ -184,7 +184,7 @@ jsonable(x) = string(x)
 # `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
 const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console, :wait_input,
                           :remote_eval, :remote_workers, :sync_folder, :share,
-                          :app_tools, :app_call)
+                          :app_tools, :app_call, :managed_process)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :continue_project, :set_title)

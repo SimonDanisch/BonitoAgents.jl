@@ -13,6 +13,7 @@ const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagent
 # nothing` and are never appended to. Mirrors the existing `ChatModel.parent`
 # back-ref pattern, so it's idiomatic here.
 abstract type ChatMsg end
+abstract type SupervisedTask <: ChatMsg end
 
 # A user's submission, pushed onto `ChatModel.user_messages` by the browser send
 # handler and consumed by the `run_chat!` loop. Distinct from `ACP.UserMessage`
@@ -1484,7 +1485,7 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
-function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
+function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg,SupervisedTask})
     added = false
     lock(bar.lock) do
         if !any(t -> t === m, bar.items[])
@@ -1500,7 +1501,7 @@ end
 
 # Leave the bar (become done): finalize the bubble (persist + emit, per type),
 # then drop from the live set and clear membership. Idempotent.
-function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg}; reason::String = "finished")
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg,SupervisedTask}; reason::String = "finished")
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
@@ -5411,6 +5412,7 @@ function Base.close(model::ChatModel)
     # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
     # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
     close(s.taskbar)
+    detach_process_tasks!(s)
     return nothing
 end
 
@@ -6867,6 +6869,7 @@ function register_chat_model!(model::ChatModel)
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
+        attach_process_tasks!(s)
         notify_chats!(model.state)
     end
     return nothing
@@ -9154,6 +9157,7 @@ handle_command!(model::ChatModel, ::Any, cmd::QuestionSkipCommand) =
 
 function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
     isempty(cmd.tool_id) && return nothing
+    managed_process_control!(model, cmd.tool_id) && return nothing
     target = lock(model.lock) do
         idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]

@@ -87,6 +87,7 @@ mutable struct Worker
     const harness::HarnessState
     const sessions::Dict{WorkerLink.LinkChannel,AgentSession}   # by the channel it runs on
     const eval_hosts::Dict{String,Base.Process}                 # by project id
+    const jobs::ProcessSupervisor
     control::Union{WorkerLink.LinkChannel,Nothing}   # the control channel being served
     closed::Bool
     # Last: the link's handlers need the worker. The relay opens its channels on
@@ -97,9 +98,13 @@ mutable struct Worker
         w = new(config, ReentrantLock(), UpdateState(),
                 HarnessState(nothing, nothing, false, false, 0),
                 Dict{WorkerLink.LinkChannel,AgentSession}(), Dict{String,Base.Process}(),
+                ProcessSupervisor(joinpath(config.projects_root, ".bonitoagents-jobs", config.worker_id)),
                 nothing, false)
         w.link = new_link(w)
         w.relay = start_mcp_relay(w.link)
+        w.jobs.publish = d -> publish_worker_process!(w, d)
+        restore_process_jobs!(w.jobs)
+        w.jobs.monitor = Base.errormonitor(@async monitor_processes!(w.jobs))
         return w
     end
 end
@@ -134,7 +139,8 @@ end
 updating(w::Worker) = lock(() -> w.update.pending, w.lock)
 
 # What runs for the server: agents and eval hosts. A patient update waits for none.
-worker_load(w::Worker) = lock(() -> length(w.sessions) + length(w.eval_hosts), w.lock)
+worker_load(w::Worker) = lock(() -> length(w.sessions) + length(w.eval_hosts), w.lock) +
+    lock(() -> count(j -> j.record["status"] in PROCESS_ACTIVE, values(w.jobs.jobs)), w.jobs.lock)
 worker_idle(w::Worker) = worker_load(w) == 0
 
 """
@@ -223,7 +229,7 @@ function hello(w::Worker)
         # The requests this worker knows beyond the original set: the server
         # sends a request only to a worker that lists it, so an older one is
         # skipped instead of waited on (it ignores an unknown request unanswered).
-        "capabilities"  => ["kill_processes", "watch_file"],
+        "capabilities"  => ["kill_processes", "watch_file", "managed_process"],
     )
 end
 
@@ -245,6 +251,7 @@ function connected!(w::Worker, ack::AbstractDict)
         report_update!(w)
     spec = harness_spec_from_wire(get(ack, "harnesses", nothing))
     spec === nothing || schedule_harness_sync!(w, spec)
+    announce_process_jobs!(w)
     return nothing
 end
 
@@ -366,6 +373,9 @@ function reap!(w::Worker, reason::AbstractString)
 end
 
 function Base.close(w::Worker)
+    close_process_jobs!(w.jobs)
+    timedwait(() -> lock(() -> all(j -> !(j.record["status"] in PROCESS_ACTIVE), values(w.jobs.jobs)), w.jobs.lock), 10.0)
+    w.jobs.closed = true
     lock(() -> (w.closed = true; w.control = nothing), w.lock)
     WorkerLink.kill!(w.link, "worker closed")          # reaps, see `link_state!`
     close(lock(() -> w.relay, w.lock))
@@ -433,6 +443,8 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_close_eval_host(w, ws, cmd)
     elseif t == "kill_processes"
         @async handle_kill_processes(ws, cmd)
+    elseif t == "managed_process"
+        @async handle_managed_process(w, ws, cmd)
     elseif t == "stage_session"
         @async handle_stage_session(ws, cmd)
     elseif t == "install_session"

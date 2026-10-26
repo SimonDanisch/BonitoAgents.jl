@@ -103,6 +103,10 @@ every step to the guide behind it.
   reporting, worker file links, previews, sharing and background work. Add your
   own rules in Settings → Agent instructions. See the
   [workflow and progress guide](docs/src/mcp-tools.md).
+- **Supervised background commands.** `bt_process` launches jobs owned by the
+  worker, with bounded logs and taskbar controls for interruption, termination
+  and forced killing. Jobs survive agent turns and MCP reconnects; chat restart
+  and close request cleanup.
 - **Your files, your history.** Projects are ordinary folders and git checkouts
   on your machines. Transcripts are markdown files in the server's state
   directory. **Discover** imports the Claude Code and Codex sessions you already

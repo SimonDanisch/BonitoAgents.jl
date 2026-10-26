@@ -516,6 +516,7 @@ mutable struct ServerState
     # included after this file, so the concrete type isn't known here.
     review_states :: Dict{String,Any}
     job_progress :: Dict{String,Any}   # per-chat progress books, independent of agent turns
+    process_jobs :: Dict{String,Any}   # worker-owned jobs and their taskbar sources
 
     # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
     # entry. `chat_models` is a plain Dict (not an Observable), but the
@@ -722,6 +723,7 @@ function ServerState(; state_dir::String,
         Dict{String,Any}(),                       # chat_models
         Dict{String,Any}(),                       # review_states
         Dict{String,Any}(),                       # job_progress
+        Dict{String,Any}(),                       # process_jobs
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
         Dict{String,Float64}(),                   # turns_ended
@@ -800,6 +802,7 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             s.chat_models,
             s.review_states,           # shared: the point is surviving a session
             s.job_progress,
+            s.process_jobs,
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
             s.turns_ended,             # shared: one record per server
@@ -944,8 +947,10 @@ const BUILTIN_AGENT_RULES = BonitoMCP.AGENT_WORKFLOW * "\n\n" * """
 Every kind of long work has a tool that this app TRACKS — it shows in the task \
 bar while it runs, and you are notified automatically when it finishes:
 
-  * a shell command — the agent's tracked command tool; with Claude, `Bash` \
-    with `run_in_background: true`
+  * an external command — `bt_process(action="start", id="build-1", \
+    argv=["make"], label="Build")`. The worker owns it and its taskbar \
+    controls; this works across providers. Use `bt_process` wait/status/output \
+    and interrupt/terminate/kill for that job, never raw PID guessing.
   * a whole sub-task — the agent's native delegation tool when available and \
     authorized; with Claude, `Task`/`Agent` with `run_in_background: true`
   * Julia — `bt_julia_eval` with `background: true`. It returns a run id \
@@ -963,11 +968,13 @@ Never start a long command detached and then poll for it from a second watcher \
 task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, and the like) — \
 such monitors routinely never terminate (PID reuse keeps `kill -0` succeeding) \
 and pile up as zombie background tasks. Run the long command itself as ONE \
-background task (`run_in_background`) with any post-processing (grep/summary) \
+managed job (`bt_process`) with any post-processing (grep/summary) \
 appended after it in the same command.
 
-## Waiting for it: `bt_wait`, never a sleeper
-The tools above START work; none of them WAIT for it. `run_in_background` \
+## Waiting for it: use a bounded wait, never a sleeper
+Use `bt_process(action="wait", id="build-1", seconds=600)` for a managed \
+command, or `bt_julia_wait` for Julia runs. A launch STARTS work; it does not \
+wait for completion. A background launch \
 returns immediately, so if you have nothing else to do the turn simply ends and \
 you are called again seconds later. Turns fire far faster than wall-clock, so \
 "start a `sleep` and check next turn" spawns one orphaned sleeper per cycle — \

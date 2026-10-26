@@ -36,6 +36,68 @@ the spaces. Check that a file exists before linking it; a link cannot repair an
 invented path. Use `bt_show` for an inline preview and `bt_share` for a public
 link. Avoid `sandbox:` URLs and paths to the server's internal cache.
 
+## `bt_process`, supervised background commands
+
+Use this for long external commands, independently of the agent provider:
+
+```json
+{"action":"start","id":"encode-1","argv":["ffmpeg","-i","input.mov","out.mp4"],"label":"Encode video"}
+{"action":"wait","id":"encode-1","seconds":600}
+{"action":"output","id":"encode-1","offset":0,"max_bytes":8192}
+```
+
+These are separate MCP calls. The **worker** owns the command, its process
+group or Windows Job Object, output capture and exit record. Agent turns and
+MCP reconnects do not own its lifetime. A launch appears in the existing chat
+taskbar, including its label, worker, PID and directory. Expand the row to see
+output. Its Stop button requests an interrupt; the same menu offers Terminate
+and Force kill. Controls act directly on the worker, without prompting the LLM.
+
+| Action | Meaning |
+|---|---|
+| `start` | Requires a stable `id` for this attempt and an `argv` array. Optional `cwd`, `label` and `env`. The directory defaults to the chat's worker directory. |
+| `list` | This chat's retained jobs on its worker, including completed jobs. |
+| `status` | Lifecycle, command, PID, exit code, signal and a bounded output tail. |
+| `output` | Read from a byte `offset`; continue with `next_offset`. `max_bytes` is 1–65536. |
+| `wait` | Requires `id` and `seconds`, at most 3600. Returns on exit, timeout or an incoming message, with `wait_reason`. It does not stop the job. |
+| `interrupt` | Request SIGINT for the process group. Windows does not support this action; use terminate or kill. |
+| `terminate` | Request graceful termination, SIGTERM on Unix. |
+| `kill` | Force termination of the managed process group or Windows Job Object. |
+
+`argv` is passed as arguments, not interpreted as shell syntax. If a shell is
+needed, invoke it explicitly, for example `["sh","-c","make && make test"]`.
+Do not add `&`, `nohup` or another detached watcher outside the supervisor.
+Start is idempotent: repeating the same `id` returns its existing job rather
+than launching another command. Use a **new id** for a new attempt.
+
+A signal request produces `interrupting`, `terminating` or `killing`; the row
+stays until the worker confirms exit. A failed control request remains visible.
+Completed jobs report `succeeded`, `failed`, `interrupted`, `killed` or `lost`.
+The worker continues tracking the group when the original Unix process exits
+but leaves children running. Job Objects provide descendant ownership on
+Windows. Processes that deliberately escape Unix process groups require stronger
+OS containment; this API is not a sandbox for full-access code.
+
+Closing or restarting a chat requests cleanup of its old session's jobs. A
+session fence prevents delayed cleanup from killing replacement jobs, and
+prevents the old session from launching new work. Disconnection does not imply
+exit: the worker re-announces state on reconnect, and pending cleanup is retried.
+A worker restart reaps its persisted running groups and records those jobs as
+lost. Their retained output remains readable; `output_cursor_reset=true` means
+to restart reading from offset zero. The supervisor captures ownership before
+allowing a command to execute.
+
+Output is a bounded rolling log, up to 8 MiB per job, with up to 256 job records
+per worker and at most 64 active jobs. `output_truncated` reports dropped old
+bytes. Environment overrides are not included in returned records. Progress-only
+context and `BONITOAGENTS_PROCESS_ID` are supplied to launched programs, so a
+coordinator can report progress using the same job id. `bt_progress` measures
+work; it does not replace process supervision.
+
+Use `bt_julia_eval(background=true)` and its run controls for ordinary Julia
+work. Stopping an agent turn leaves managed background jobs running; use the
+job's controls, or restart/close its chat, to end them.
+
 ## `bt_progress`, progress in the chat and sidebar
 
 ```

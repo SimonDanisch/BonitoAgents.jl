@@ -34,6 +34,10 @@ go. Home and End jump to the first and the last message.
   including jobs that keep running between agent turns. Unknown totals show
   indeterminate progress. Agents use `bt_progress` or the Julia
   `BonitoProgress` API; see [Julia Tools & Live Apps](@ref).
+- **Managed commands** (`bt_process`) stay in the taskbar while their process
+  group runs, even between agent turns. Expand a row for worker, PID, command
+  and output. Stop requests interruption; its menu offers Terminate and Force
+  kill. The row remains until the worker confirms exit.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
 - **Subagents** (for example Claude Code's Task tool) get their own activity

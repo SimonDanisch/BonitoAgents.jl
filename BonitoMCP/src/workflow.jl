@@ -49,8 +49,17 @@ for the underlying computation, and it does not change YOLO or agent busy state.
 Use `bt_julia_eval` with this project's absolute `env_path` for Julia work;
 sessions retain variables, packages and compiled methods, and Revise picks up
 source edits. For long work use `background=true`, keep the returned run id and
-collect it with `bt_julia_wait(runs=[...], seconds=...)`. Use the agent's native
-tracked command/background tools for other languages, when available.
+collect it with `bt_julia_wait(runs=[...], seconds=...)`.
+For external background commands use
+`bt_process(action="start", id="build-1", argv=["make"], label="Build")`.
+The worker owns the process tree, captures output and exposes it in the taskbar.
+Use `list`, `status`, `output` and `wait` to inspect it, and `interrupt`,
+`terminate` or `kill` to stop it. Repeating start with the same id returns the
+original job; use a new id for a retry. Never spawn detached shell work outside
+this supervisor. A signal request is not an exit: keep the task visible until
+the worker confirms termination. `wait` requires bounded `seconds` and wakes
+on incoming messages. Agent turns and MCP reconnects preserve jobs; closing or
+restarting the chat requests cleanup. For Julia work keep using persistent eval.
 Wait with `bt_wait(seconds=..., reason=...)`, optionally with an `until` shell
 condition, rather than starting sleep/poll watcher tasks. Incoming messages can
 wake a wait; read them and then continue the original work as appropriate.
