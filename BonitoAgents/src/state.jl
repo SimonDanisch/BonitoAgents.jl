@@ -534,10 +534,10 @@ mutable struct ServerState
     turn_signal :: Observable{Int}
 
     # When each chat's last turn ended (`time()`, by project id), as the server
-    # saw it since it started: the sidebar lists the chats that just went quiet
+    # saw it: the sidebar lists the chats that just went quiet
     # first among the inactive ones, next to the active chats they came from.
     # Kept here, not on the chat, because an idle chat's model can be closed.
-    # Guarded by `lock`; runtime only.
+    # Guarded by `lock`; persisted with each project in projects.json.
     turns_ended :: Dict{String,Float64}
 
     # One link per worker (worker id → link), connected or waiting out its grace
@@ -1341,7 +1341,11 @@ notify_turn!(s::ServerState) = timed(() -> safe_notify!(root_state(s).turn_signa
 
 # A chat's turn ended now: the sidebar's order among the inactive chats.
 function turn_ended!(s::ServerState, project_id::AbstractString)
-    lock(() -> (s.turns_ended[String(project_id)] = time()), s.lock)
+    s = root_state(s)
+    lock(s.lock) do
+        s.turns_ended[String(project_id)] = time()
+        save_projects!(s)
+    end
     return nothing
 end
 
@@ -1553,6 +1557,7 @@ function save_projects!(s::ServerState)
         data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
                      "server_path" => p.server_path, "worker_path" => p.worker_path,
                      "created" => string(p.created),
+                     "last_turn_ended" => get(s.turns_ended, p.id, 0.0),
                      "owner" => p.owner,
                      # `:syncing` is a runtime state — persist as `:stale` so a
                      # crash mid-sync doesn't leave the next start-up reporting
@@ -1623,6 +1628,10 @@ function load_projects!(s::ServerState)
                 end
             end
             track_project!(s, p)
+            ended = get(d, "last_turn_ended", 0.0)
+            if ended isa Real && isfinite(ended) && ended > 0
+                s.turns_ended[p.id] = Float64(ended)
+            end
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
         end

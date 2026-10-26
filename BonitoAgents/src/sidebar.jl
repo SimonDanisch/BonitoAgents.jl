@@ -399,8 +399,8 @@ const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 
 # A chat's place in the sidebar: by group, then the chats whose turn ended most
 # recently (a chat that just went quiet stays next to the active ones it left),
-# then the rest by name. `ended` is 0.0 for a chat with no turn since the server
-# started.
+# then the rest by name. `ended` is persisted, so reloading or restarting keeps
+# the hot list. It is 0.0 for a chat without a recorded turn.
 sidebar_rank(group::Symbol, ended::Float64, p::ProjectInfo) =
     (SIDEBAR_GROUP_RANK[group], -ended, lowercase(p.name))
 

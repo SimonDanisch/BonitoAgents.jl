@@ -22,7 +22,7 @@
 
     # Among the other chats, the one whose turn ended last comes first: a chat
     # that just went quiet stays next to the active ones instead of dropping to
-    # its name's place. Chats without a turn since the server started follow by
+    # its name's place. Chats without a recorded turn follow by
     # name.
     q(name) = BT.ProjectInfo(name, name, "w", "/s", "/w", BT.now(BT.UTC))
     chats = [q("alpha"), q("beta"), q("gamma"), q("delta")]
@@ -42,4 +42,35 @@
     @test !haskey(st.turns_ended, "proj")
     model.busy_active[] = false
     @test 0 <= time() - st.turns_ended["proj"] < 5
+
+    # Idle re-broadcasts and tab reloads must not count as new activity.
+    last_ended = st.turns_ended["proj"]
+    restarted = BT.ServerState(; state_dir = st.state_dir, working_dir = st.working_dir)
+    @test restarted.turns_ended["proj"] == last_ended
+    model.busy_active[] = false
+    @test st.turns_ended["proj"] == last_ended
+
+    # Restarting restores the hot list, including the exact completion times.
+    # Entries from before this feature have no timestamp and still load.
+    for c in chats
+        st.projects[][c.id] = c
+    end
+    merge!(st.turns_ended, ended)
+    BT.save_projects!(st)
+    restored = BT.ServerState(; state_dir = st.state_dir, working_dir = st.working_dir)
+    @test restored.turns_ended == st.turns_ended
+    order = sort(collect(values(restored.projects[]));
+        by = c -> BT.sidebar_rank(:other, get(restored.turns_ended, c.id, 0.0), c))
+    @test [c.id for c in order] == ["proj", "gamma", "beta", "alpha", "delta"]
+
+    # Older projects.json files remain compatible.
+    import JSON
+    entries = JSON.parsefile(BT.projects_file(st))
+    for entry in entries
+        delete!(entry, "last_turn_ended")
+    end
+    BT.atomic_write_json(BT.projects_file(st), entries)
+    legacy = BT.ServerState(; state_dir = st.state_dir, working_dir = st.working_dir)
+    @test Set(keys(legacy.projects[])) == Set(keys(st.projects[]))
+    @test isempty(legacy.turns_ended)
 end
