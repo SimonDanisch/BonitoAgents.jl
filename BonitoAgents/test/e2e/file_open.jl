@@ -20,6 +20,7 @@ const TK = TestKit
 const CWD = mktempdir()
 write(joinpath(CWD, "hello.jl"),  "println(\"hi from hello\")\n")
 write(joinpath(CWD, "second.jl"), "const SECOND = 42\n")
+write(joinpath(CWD, "relative file.jl"), "const RELATIVE_MARKDOWN = 73\n")
 # Regression case from the VideoEditor chat: a real Markdown link to an
 # absolute worker-side video path used to navigate to a dashboard HTTP route.
 write(joinpath(CWD, "clip.mp4"), UInt8[0x00, 0x00, 0x00, 0x18,
@@ -57,7 +58,9 @@ agent_script(prompt) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl")
                                  content = [TK.text_block("```julia\nprintln(\"hi from hello\")\n```")]),
                         TK.text("Video: [absolute clip]($(joinpath(CWD, "clip.mp4"))) " *
                                 "or [relative clip](clip.mp4). External: " *
-                                "[Julia](https://julialang.org). I wrote `Mantle/docs/examples.jl`.")]
+                                "[Julia](https://julialang.org). " *
+                                "[relative source](./relative%20file.jl). " *
+                                "I wrote `Mantle/docs/examples.jl`.")]
 
 function run_suite(server)
     server.agent_fn[] = agent_script
@@ -258,6 +261,19 @@ function run_suite(server)
             @test TK.eval_js(server,
                 "document.querySelector('.bt-agent-msg a[href=\"clip.mp4\"]').dataset.path") ==
                   "clip.mp4"
+
+            relative = "document.querySelector('.bt-agent-msg a[href=\"./relative%20file.jl\"]')"
+            @test TK.eval_js(server, "$(relative).dataset.path") == "./relative file.jl"
+            TK.eval_js(server, "$(relative).click()")
+            @test TK.wait_for(server, "dot-relative Markdown opens the worker file with spaces",
+                "(document.querySelector('$(panel_sel("relative file.jl")) .monaco-editor-div')?.__btEditor?.getValue() || '').includes('RELATIVE_MARKDOWN = 73')";
+                timeout = 36)
+            TK.eval_js(server, open_file(joinpath(CWD, "relative file.jl")))
+            @test TK.wait_for(server, "absolute and dot-relative links reuse one file tab",
+                "document.querySelectorAll('$(panel_sel("relative file.jl"))').length === 1 && " *
+                "[...document.querySelectorAll('.bw-tab-label')].filter(t => t.textContent === 'relative file.jl').length === 1";
+                timeout = 10)
+            TK.screenshot(server, joinpath(tempdir(), "bonitoagents-relative-markdown.png"))
         end
 
         @testset "a relative path that isn't there opens the one file ending in it" begin

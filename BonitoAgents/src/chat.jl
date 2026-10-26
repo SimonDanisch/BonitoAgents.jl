@@ -3203,10 +3203,12 @@ end
 # resolved against the project's worker root (NOT the server mirror's cwd —
 # those two only coincide because the mirror shadows the tree).
 function show_worker_path(st::ShowTool)
-    isabspath(st.path) && return String(st.path)
+    isabspath(st.path) && return normpath(st.path)
     proj = get(st.state.projects[], st.project_id, nothing)
-    proj === nothing && return String(st.path)
-    return joinpath(proj.worker_path, st.path)
+    proj === nothing && return normpath(st.path)
+    # Markdown's ./ spelling and file-tree paths must identify the same tab,
+    # mirror and progress operation rather than opening duplicate views.
+    return normpath(joinpath(proj.worker_path, st.path))
 end
 
 # Is our mirror copy the CURRENT version, given the worker's stamp right now?
