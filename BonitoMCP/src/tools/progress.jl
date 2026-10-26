@@ -60,7 +60,9 @@ For running Julia code, use BonitoProgress.progress/update!/finish!/fail! instea
 of repeated tool calls; ProgressLogging events in bt_julia_eval are forwarded
 automatically. action=context returns the stdlib-only Julia client path and a
 progress-only local worker context for detached programs. Other languages can
-call this MCP tool with the same fields.
+call this MCP tool with the same fields. Call bt_help for the workflow and a
+Julia integration example. In bt_julia_eval, BonitoProgress is already available;
+no using/import or new project dependency is needed.
 """, Dict{String,Any}("type"=>"object", "properties"=>Dict{String,Any}(
     "action"=>Dict("type"=>"string","enum"=>["start","update","finish","fail","cancel","context"]),
     "id"=>Dict("type"=>"string"), "label"=>Dict("type"=>"string"),

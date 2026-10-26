@@ -49,6 +49,7 @@ end
 "The tools this process currently offers — the registry minus every gated-off one."
 available_tools() = [t for t in TOOLS if t.available()]
 
+include("workflow.jl")         # agent-independent briefing, MCP instructions + bt_help
 include("server.jl")
 include("BonitoProgress.jl")   # stdlib-only API, also bootstrapped into eval workers
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)

@@ -779,7 +779,8 @@ const INJECTED_MCP_NAME = "btworker"
 # (BonitoWorker's `inject_mcp_grant`), so neither a server address nor a secret
 # is handed to the MCP process or anything it spawns.
 function mcp_env(state::ServerState, project_id::AbstractString)
-    env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id))
+    env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id),
+        "BONITOAGENTS_INSTRUCTIONS" => agents_prompt_appendix(state, project_id))
     # The ONE thing that turns on the `bt_dev_*` server-introspection tools in
     # that chat's MCP process. Keyed on the project's persisted `dev_mode` flag,
     # so a normal chat can never see them — not even one whose cwd happens to be

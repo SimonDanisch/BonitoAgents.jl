@@ -99,6 +99,10 @@ every step to the guide behind it.
   files, share links and the to-do list are MCP tools, and they render as the
   same cards whichever agent calls them, even though every agent reports tool
   calls differently on the wire.
+- **A shared agent workflow.** MCP instructions and `bt_help` explain progress
+  reporting, worker file links, previews, sharing and background work. Add your
+  own rules in Settings → Agent instructions. See the
+  [workflow and progress guide](docs/src/mcp-tools.md).
 - **Your files, your history.** Projects are ordinary folders and git checkouts
   on your machines. Transcripts are markdown files in the server's state
   directory. **Discover** imports the Claude Code and Codex sessions you already

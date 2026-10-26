@@ -63,6 +63,7 @@ function dispatch!(out, req::AbstractDict)
             "protocolVersion" => PROTOCOL_VERSION,
             "capabilities" => Dict("tools" => Dict("listChanged" => false)),
             "serverInfo" => Dict("name" => SERVER_NAME, "version" => SERVER_VERSION),
+            "instructions" => workflow_instructions(),
         ))
     elseif method == "notifications/initialized"
         # Notification, no response

@@ -914,9 +914,9 @@ end
 """
     global_agents_md(state) -> String
 
-The server-wide agent instructions (`<state_dir>/AGENTS.md`). Appended to the
-system prompt of EVERY agent session brought up through this server — across
-all workers and projects (see `session_meta_params` in transport.jl). ""
+The server-wide agent instructions (`<state_dir>/AGENTS.md`). Composed into the
+MCP briefing for every agent session across all workers and projects, and into
+Claude's native system-prompt append (see `session_meta` in transport.jl). ""
 when the file doesn't exist. Editable from the dashboard, or directly on
 disk (read per session bring-up, so edits apply to the next chat opened —
 no restart needed).
@@ -934,18 +934,20 @@ function set_global_agents_md!(s::ServerState, text::AbstractString)
     return nothing
 end
 
-# Built-in house rules BonitoAgents itself appends to EVERY Claude session's
-# system prompt, ahead of the user's editable AGENTS.md. Product-level guidance
+# Built-in house rules delivered through MCP to every provider, and appended to
+# Claude's system prompt, ahead of the user's editable AGENTS.md. Product guidance
 # for footguns we keep seeing across agents — keep it short, it rides on every
 # session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
 # rules are composed in at session bring-up via `agents_prompt_appendix`.)
-const BUILTIN_AGENT_RULES = """
+const BUILTIN_AGENT_RULES = BonitoMCP.AGENT_WORKFLOW * "\n\n" * """
 ## Long-running work: use the tool, never shell backgrounding
 Every kind of long work has a tool that this app TRACKS — it shows in the task \
 bar while it runs, and you are notified automatically when it finishes:
 
-  * a shell command — `Bash` with `run_in_background: true`
-  * a whole sub-task — `Task`/`Agent` with `run_in_background: true`
+  * a shell command — the agent's tracked command tool; with Claude, `Bash` \
+    with `run_in_background: true`
+  * a whole sub-task — the agent's native delegation tool when available and \
+    authorized; with Claude, `Task`/`Agent` with `run_in_background: true`
   * Julia — `bt_julia_eval` with `background: true`. It returns a run id \
     (`r4`) at once; the run shows in the task bar, and you are told when it \
     finishes. Start one per worker/env to run several at once (e.g. a test \
@@ -1007,8 +1009,8 @@ A few julia rules:
 * never ever use `try; xxx; catch; end;` its absolutely horrible to blanket catch errors and not report them. Even `@debug err` is bad, since its not printing by default.
 """
 
-# What actually rides on the `_meta.systemPrompt.append` for a session: the
-# built-in rules plus the user's AGENTS.md (when present).
+# The MCP briefing and Claude's `_meta.systemPrompt.append` share one source:
+# the built-in rules plus the user's AGENTS.md (when present).
 function agents_prompt_appendix(s::ServerState)
     user = global_agents_md(s)
     return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user

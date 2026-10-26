@@ -2419,9 +2419,9 @@ end
 """
     agents_md_section(session, state)
 
-The global agent instructions (AGENTS.md): a system-prompt appendix every agent
-session gets, on every worker (state_dir/AGENTS.md; see `system_prompt_meta`).
-Read at session bring-up, so a save applies to the NEXT chat opened.
+The global agent instructions (state_dir/AGENTS.md), included in the MCP
+briefing and Claude's native system-prompt append. Read at session bring-up,
+so a save applies to new or restarted agent sessions.
 """
 function agents_md_section(session::Bonito.Session, state::ServerState)
     status = Observable("")
@@ -2439,8 +2439,8 @@ function agents_md_section(session::Bonito.Session, state::ServerState)
     return DOM.div(
         DOM.div(DOM.h2("Agent instructions"); class = "bt-section"),
         DOM.div(
-            DOM.div("AGENTS.md, appended to the system prompt of every agent session " *
-                    "on every worker: shared conventions, house rules, tool guidance.";
+            DOM.div("Shared instructions for every worker, applied when an agent session " *
+                    "starts or restarts alongside the built-in workflow guidance.";
                     class = "bt-agents-hint"),
             DOM.textarea(global_agents_md(state);
                 class = "bt-agents-textarea", rows = 6,

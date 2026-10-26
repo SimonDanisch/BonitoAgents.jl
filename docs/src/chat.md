@@ -30,6 +30,10 @@ go. Home and End jump to the first and the last message.
   its call returned, gets a task-bar row until it ends, and shows ✓ or ✗ when
   it does.
 - **Questions** (ACP elicitations) render as forms you answer inline.
+- **Job progress** shows measured work in the chat and in its sidebar icon,
+  including jobs that keep running between agent turns. Unknown totals show
+  indeterminate progress. Agents use `bt_progress` or the Julia
+  `BonitoProgress` API; see [Julia Tools & Live Apps](@ref).
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
 - **Subagents** (for example Claude Code's Task tool) get their own activity
@@ -42,6 +46,10 @@ you return. Sending is never blocked: messages typed during an agent restart
 or reconnect are queued rather than dropped.
 
 ## Files and the editor
+
+Agent Markdown links such as `[source](./src/app.jl)` open files on the chat's
+worker, relative to that chat's working directory. Absolute worker paths also
+work. These are workspace links; use Share for a link other people can open.
 
 Every file path in the transcript is a link, and the sidebar has a lazy,
 searchable project file tree (hover a chat, then "▾ files"). Clicking **any**

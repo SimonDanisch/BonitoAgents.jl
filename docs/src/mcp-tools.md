@@ -8,6 +8,105 @@ agent shares with you, where the result of an eval isn't a screenshot or a text
 dump but the **live value**, rendered into the chat and still wired to the code
 that produced it.
 
+## Agent workflow and discovery
+
+Every chat has a built-in workflow covering worker-side files, previews,
+sharing, progress reporting, persistent Julia sessions, background work and
+waiting. It is delivered through the MCP initialization `instructions` field
+for all providers. The discoverable `bt_help()` tool returns the same briefing
+when an agent needs to reread it after resuming or compacting. MCP clients
+decide how to surface initialization instructions; `bt_help` remains available
+as a tool. Each tool also describes its own arguments and limits.
+
+Add your own server-wide rules in **Settings → Agent instructions**. They are
+stored in the server's `AGENTS.md`, composed with the built-in workflow and any
+app or development briefing, and read on agent session bring-up. Restart an
+existing agent session to receive edits. Claude also receives the briefing via
+its native system-prompt append; other providers use the common MCP path. This
+does not write or replace the project's own `AGENTS.md` or `CLAUDE.md`.
+
+### Worker file links
+
+An agent can write `[source](./src/app.jl)` in its reply. Clicking it opens a
+workspace tab for that file **on the chat's worker**, relative to the chat's
+working directory. It is not relative to the browser URL or an earlier shell
+`cd`. Absolute worker paths work too. For spaces, use an angle-bracket
+destination, such as `[report](<./reports/render notes.md>)`, or percent-encode
+the spaces. Check that a file exists before linking it; a link cannot repair an
+invented path. Use `bt_show` for an inline preview and `bt_share` for a public
+link. Avoid `sandbox:` URLs and paths to the server's internal cache.
+
+## `bt_progress`, progress in the chat and sidebar
+
+```
+bt_progress(action, id; label?, completed?, total?, unit?, detail?, parent?, primary?, status?)
+```
+
+Progress belongs to a job, independently of whether the agent is busy. A render
+or test batch can keep reporting while the agent waits or works on something
+else. The chat shows the job, and its sidebar icon shows progress for the
+primary job. Updates change the existing display instead of adding messages.
+
+From any MCP client, use a stable job id and report actual completed units:
+
+```json
+{"action":"start","id":"render","label":"Render frames","total":240,"unit":"frames"}
+{"action":"update","id":"render","completed":60,"detail":"Worker 2 finished its batch"}
+{"action":"finish","id":"render"}
+```
+
+These are three separate tool calls. Use `fail` with an error `detail`, or
+`cancel`, when appropriate. An unknown `total` is `null` and shows indeterminate
+progress. Set `status="paused"` on an update to retain a paused job. A new
+`start` with the same id starts a new generation. Use `primary=false` for
+secondary jobs and `parent` to associate child jobs with a parent's id. Do not
+derive percentages from token counts, elapsed time or the act of launching a
+command. The meter reports the underlying job; ending a meter does not stop a
+render, and it does not change YOLO or the agent's busy state.
+
+### Julia code and callbacks
+
+Inside `bt_julia_eval`, `BonitoProgress` is already bound and needs no new
+project dependency or `using` statement. For example, where `render_frame` is
+your application's rendering function:
+
+```julia
+BonitoProgress.progress("Render frames"; id="render", total=240, unit="frames") do job
+    for frame in 1:240
+        render_frame(frame)
+        BonitoProgress.update!(job, frame)
+    end
+end
+```
+
+The do-block finishes on return, reports exceptions as failures and reports an
+interrupt as cancellation, then rethrows. If an API accepts a
+`(completed, total)` callback, a job handle is itself callable:
+
+```julia
+job = BonitoProgress.progress("Render farm"; id="render-farm", unit="frames")
+renderfarm!(...; progress=job) # your existing API's callback
+BonitoProgress.finish!(job)   # after validating the result
+```
+
+With a manually managed handle, call `fail!`, `cancel!` or
+`update!(job, completed; total, status="paused")` for other outcomes. Updates
+are coalesced to at most five per second. Existing ProgressLogging events in
+an eval are forwarded automatically; ProgressMeter is not integrated. The
+repository's `examples/renderfarm_progress.jl` shows pause, failure and flush
+handling for a render coordinator.
+
+For a separate Julia process on the same worker, call
+`bt_progress(action="context")`. It returns `env`, containing progress-only
+environment variables, and `julia_client`, a stdlib-only file. Pass `env` into
+the process environment and load the helper with `julia -L <julia_client>`;
+this is a reporter for an existing external coordinator, not a reason to
+replace `bt_julia_eval` for normal Julia work. Before exiting, call
+`BonitoProgress.flush_progress(job)` and check its Boolean result. Keep the
+context local; it grants progress reporting for this chat and must not appear
+in public output. Other languages can call `bt_progress` over MCP; there is
+currently no equivalent standalone language SDK.
+
 ## `bt_julia_eval`, a shared live REPL
 
 ```
