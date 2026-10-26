@@ -671,7 +671,10 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
                       prompt_queueing::Bool = true,
+                      prompt_receipts::Bool = true,
+                      receipt_delay_ms::Int = 0,
                       active_steering::Bool = false,
+                      steering_idle_behavior::String = "",
                       scenario::Union{String,Nothing} = nothing,
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
@@ -739,6 +742,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
     agent_env["BT_MOCK_ACP_PROMPT_QUEUEING"] = string(prompt_queueing)
+    agent_env["BT_MOCK_ACP_PROMPT_RECEIPTS"] = string(prompt_receipts)
+    agent_env["BT_MOCK_ACP_RECEIPT_DELAY_MS"] = string(receipt_delay_ms)
+    agent_env["BT_MOCK_ACP_STEERING_IDLE_BEHAVIOR"] = steering_idle_behavior
     agent_env["BT_MOCK_ACP_ACTIVE_STEERING"] = string(active_steering)
     # Opt-in: run a BUILT-IN MockACP scenario instead of the dispatcher. The
     # dispatcher is scripted from the test process and is therefore always a

@@ -49,6 +49,13 @@ stops following, with a "move to bottom" control and an unread indicator until
 you return. Sending is never blocked: messages typed during an agent restart
 or reconnect are queued rather than dropped.
 
+**Queue after message** sends input into a running agent when it supports
+steering or acknowledged prompt queueing. With receipts, the message stays in
+the outbox until the agent confirms it was consumed. Stop can discard input
+still waiting inside an adapter: an unconfirmed message stays paused in the
+queue, including after reload, with **Queue again** and **Remove** actions.
+Agents without either capability wait until the current turn finishes.
+
 ## Files and the editor
 
 Agent Markdown links such as `[source](./src/app.jl)` open files on the chat's

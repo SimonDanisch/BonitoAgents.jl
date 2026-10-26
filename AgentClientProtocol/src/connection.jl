@@ -62,6 +62,7 @@ abstract type Handler end
 
 # Default: warn on agent→client RPCs.
 on_request(::Handler, method::AbstractString, ::Any) = warn_unhandled_request(method)
+on_notification(::Handler, ::AbstractString, ::Any) = nothing
 
 function warn_unhandled_request(method)
     @warn "ACP: unhandled agent request" method
@@ -674,7 +675,10 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
 
             main_thread!(conn, update)
         end
-        # Other notifications silently ignored.
+        # Optional agent extensions, dispatched in the same order as updates
+        # and prompt responses. A receipt must precede the output it confirms.
+        method == "session/update" ||
+            on_notification(conn.handler, method, get(msg, "params", Dict{String,Any}()))
 
     elseif has_id
         # Response to one of our outgoing requests. Because the dispatcher

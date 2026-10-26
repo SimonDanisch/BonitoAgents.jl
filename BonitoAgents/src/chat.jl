@@ -5965,9 +5965,14 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
                     cancelling(chat) &&
                         error("The agent is still stopping; message has not been sent.")
                     payload = submission === nothing ? (message = user_msg, text = "") : submission_payload(submission)
+                    receipts = submission !== nothing && get(cli.session_result, "bonitoPromptReceipts", false)
+                    receipt_id = receipts ? string(uuid4()) : nothing
                     span = AgentClientProtocol.prompt!(cli, with_prelude(chat, payload.message.text);
-                        images=payload.message.images)
-                    submission === nothing || submission_sent!(s, submission, span; text = payload.text)
+                        images=payload.message.images, receipt_id)
+                    if submission !== nothing
+                        receipts ? submission_submitted!(s, submission, span; text=payload.text, receipt_id) :
+                            submission_sent!(s, submission, span; text=payload.text)
+                    end
                     span
                 end
                 break
@@ -6579,6 +6584,16 @@ end
 struct ChatPermissionHandler <: AgentClientProtocol.Handler
     fs::AgentClientProtocol.FSRequestHandler
     chat::ChatModel                      # the SHARED parent model
+end
+
+function AgentClientProtocol.on_notification(h::ChatPermissionHandler, method::AbstractString, params)
+    method == "_bonito/prompt_received" || return nothing
+    params isa AbstractDict || return nothing
+    c = client(h.chat.agent)
+    c === nothing && return nothing
+    get(params, "sessionId", nothing) == c.session_id || return nothing
+    confirm_submission!(h.chat, get(params, "messageId", nothing))
+    return nothing
 end
 
 function AgentClientProtocol.on_request(h::ChatPermissionHandler,

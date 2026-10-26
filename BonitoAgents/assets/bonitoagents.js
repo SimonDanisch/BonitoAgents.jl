@@ -5032,6 +5032,7 @@ class BonitoChat {
                 item.status === 'held' ? 'Goes out with your next message' :
                 item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
                 item.status === 'sending' ? 'Connecting · not sent yet' :
+                item.status === 'submitted' ? 'Waiting for agent receipt' :
                 item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
                 item.mode === 'next' ? 'Waiting for the next message boundary' :
                 'Waiting until the agent finishes');
@@ -5042,9 +5043,10 @@ class BonitoChat {
             preview.textContent = item.text;
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
-            badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+            badge.textContent = item.status === 'paused' ? 'Paused' :
                 item.status === 'held' ? 'With your next message' :
                 item.status === 'offline' ? 'Agent offline · queued' :
+                item.status === 'submitted' ? 'Awaiting receipt' :
                 item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
                 item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;

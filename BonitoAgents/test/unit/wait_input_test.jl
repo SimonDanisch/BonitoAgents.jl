@@ -25,6 +25,11 @@
         @test input("current-wait") === true
         @test input("old-wait") === false
         @test input("missing") === false
+        BT.send_message!(m, BT.UserMsg("overlapping prompt"))
+        newer = last(m.pending_sends)
+        newer.status = :sent
+        newer.span = (turn=nothing, nstore0=length(m.msgs_store))
+        @test input("current-wait") === true
         @test BT.dev_request(state, "wait_input", Dict{String,Any}(), "another-chat") === false
         push!(m.msgs_store, wait_card("later-wait"))
         @test input() === false

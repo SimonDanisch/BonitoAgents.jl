@@ -585,10 +585,15 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
     s = shared(model)
     id = String(get(args, "tool_id", ""))
     return lock(s.lock) do
+        any(e -> e isa PendingSend && e.status === :submitted && e.mode === :next,
+            s.pending_sends) && return true
         # An older turn's wait cannot consume this turn's initial prompt as
         # new input if its tool card has not been rendered yet.
-        baseline = maximum((e.span.nstore0 for e in s.pending_sends
-            if e isa PendingSend && e.status === :sent && e.span !== nothing); init = 0)
+        # An overlapping prompt must not hide input from the earlier turn's
+        # wait. Its newer baseline includes the correction we need to notice.
+        baseline = minimum((e.span.nstore0 for e in s.pending_sends
+            if e isa PendingSend && e.status === :sent && e.span !== nothing); init = typemax(Int))
+        baseline == typemax(Int) && (baseline = 0)
         input = false
         for i in length(s.msgs_store):-1:(baseline + 1)
             msg = s.msgs_store[i]
