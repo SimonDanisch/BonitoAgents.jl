@@ -585,7 +585,8 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
     s = shared(model)
     id = String(get(args, "tool_id", ""))
     return lock(s.lock) do
-        any(e -> e isa PendingSend && e.status === :submitted && e.mode === :next,
+        any(e -> e isa PendingSend && e.status === :submitted && e.mode === :next &&
+                has_other_turn(s, e.span.turn),
             s.pending_sends) && return true
         # An older turn's wait cannot consume this turn's initial prompt as
         # new input if its tool card has not been rendered yet.

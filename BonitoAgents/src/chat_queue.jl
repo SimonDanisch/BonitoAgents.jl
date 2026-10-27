@@ -285,6 +285,8 @@ function next_submission(model)
     end
 end
 
+has_other_turn(model, turn) = any(t -> t !== turn, AgentClientProtocol.open_turns(model))
+
 function submission_submitted!(model, e, span; text, receipt_id)
     e.status = :submitted
     e.detail = "Waiting for the agent to receive this message"
@@ -293,8 +295,9 @@ function submission_submitted!(model, e, span; text, receipt_id)
     emit_queue!(model)
     @info "message awaiting agent receipt" project_id=model.project_id message_id=e.id receipt_id
     # Let a voluntary wait return so the agent can consume this queued input.
-    # This is a wakeup, not a claim that the prompt has already been received.
-    wake_agent_waits!(model)
+    # A fresh prompt can start its own wait before this control frame arrives.
+    # Only input to an already running turn should release a wait.
+    has_other_turn(model, span) && wake_agent_waits!(model)
     return span
 end
 
