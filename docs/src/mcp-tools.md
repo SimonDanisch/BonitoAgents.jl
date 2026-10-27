@@ -382,6 +382,35 @@ The route: the session connects to its worker's relay over loopback TCP, the
 server checks the switch, has the chat's eval host on the other worker connect
 the session asked for, and pipes the two together; it never reads the values.
 
+## `bt_chat`, opt-in coordination
+
+```julia
+bt_chat(action="list")
+bt_chat(action="send", project_id="<peer id>", text="The render is ready.")
+```
+
+Chat messaging is **off by default**, including after upgrading existing chats.
+The user enables **Chat messaging** in the ⋯ menus of **both** chats before
+agents can exchange messages. Only opted-in chats owned by the same user appear
+in the list. Use this tool when the user has authorized coordination.
+
+The permission is independent of dev mode and takes effect without restarting
+the agent. Turning either chat's switch off immediately rejects new sends and
+pauses queued peer input that has not been handed over. It remains paused across
+reloads and re-enabling; the user can queue it again or remove it. Messages already
+handed to an agent remain part of its conversation.
+
+Sending returns `status="queued"`, a message id and a server UTC timestamp.
+Acceptance is not confirmation that the receiving agent has received/read it or
+finished work. Peer messages follow the existing queue-after-current-message
+delivery path, including supported steering and wakeups during `bt_wait` or
+managed-process waits. Sender chat/worker identity and send/dispatch timestamps
+are attached automatically. The receiving agent can use the same tool to reply.
+
+The legacy `bt_dev_control(op="send_message")` uses the same opt-in checks. Dev
+mode does not grant messaging, and stale dev-tool calls are refused by the server
+as soon as dev mode is switched off.
+
 ## `bt_share`, a link for anyone
 
 ```

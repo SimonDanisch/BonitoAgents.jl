@@ -217,6 +217,9 @@ enumerates.
   `paths` batches selected files and recursive subfolders in one call. Repeated
   calls transfer only changes and preserve destination-only files. Transfers
   report progress automatically in the chat and sidebar.
+- `bt_chat`: discover and message your opted-in chats. Chat messaging is off
+  by default and must be enabled in both chats' menus, independently of dev
+  mode. Disabling it blocks new sends and pauses undelivered peer input.
 - `bt_share`: a link anyone can open while the worker is online: a markdown
   file as a page with its images and videos, or a Julia file's Bonito app, live
   from a share host on the worker. Optional password; listed and ended in

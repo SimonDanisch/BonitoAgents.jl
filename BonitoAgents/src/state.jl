@@ -191,6 +191,9 @@ mutable struct ProjectInfo
     # Persisted: a granted capability must survive a server restart, and must
     # never be derived from anything else.
     remote_eval::Bool
+    # Independent, explicit opt-in to sending AND receiving peer messages.
+    # Dev mode never grants this capability. Checked live, including dispatch.
+    chat_messaging::Bool
     # The app this chat belongs to (`app_id` of one of `ServerState.apps`), or ""
     # for an ordinary chat. An app chat's pane is what the app renders
     # (`chat_pane`), and its agent gets the app's own tools. Persisted, and never
@@ -216,6 +219,7 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 Dict{String,String}(),   # desired_config
                 false,                   # dev_mode
                 false,                   # remote_eval
+                false,                   # chat_messaging
                 "",                      # app
                 ProjectFileIndex())      # file_index
 
@@ -1116,7 +1120,9 @@ You have `bt_dev_*` tools that read the **running process**:
   test-suite run). Clean counters here do not mean "no leak" — for that class,
   count the processes on the machine.
 - `bt_dev_control` — drive the server the way a user would (open a chat, send a
-  message, restart a session, move a project between machines).
+  message, restart a session, move a project between machines). Messaging still
+  requires the independent Chat messaging switches in both chats; use `bt_chat`
+  for ordinary coordination.
 """
 
 const DEV_MODE_RULES_SOURCE = """
@@ -1580,6 +1586,7 @@ function save_projects!(s::ServerState)
                      "dismissed"     => p.dismissed,
                      "dev_mode"      => p.dev_mode,
                      "remote_eval"   => p.remote_eval,
+                     "chat_messaging" => p.chat_messaging,
                      "app"           => p.app,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
@@ -1628,6 +1635,7 @@ function load_projects!(s::ServerState)
             # Absent ⇒ false: running code on other machines is granted per chat,
             # never assumed.
             p.remote_eval = get(d, "remote_eval", false) === true
+            p.chat_messaging = get(d, "chat_messaging", false) === true
             app = get(d, "app", "")
             p.app = app isa AbstractString ? String(app) : ""
             dc = get(d, "desired_config", nothing)

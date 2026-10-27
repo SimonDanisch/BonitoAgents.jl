@@ -72,6 +72,10 @@ live.
   streams folders between workers through the link. Use `direction="pull"`
   to retrieve results or `paths` to batch selected files and recursive folders
   in one call. Transfers automatically report progress in the chat and sidebar.
+- Peer coordination uses `bt_chat` and a separate **Chat messaging** switch,
+  off by default in both chats. Dev mode never grants messaging. The server
+  immediately enforces permission revocation, including stale dev-tool calls;
+  queued peer input is paused until explicitly retried.
 - **Continue on** another worker: a new chat there with the project's files and
   the agent's own record of the conversation.
 - A worker that crashed mid-turn tells exactly the chats it cut off to carry on

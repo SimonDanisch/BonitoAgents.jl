@@ -52,7 +52,7 @@ end
     agent(p) = startswith(p, "wait for") ?
         [TK.mcp_call("bt_wait"; real_process=true, seconds=60, reason=p,
             id=replace(p," "=>"-")), TK.text("Wait released: $p")] : p == "coordinate" ?
-        [TK.mcp_call("bt_dev_control"; real_process=true, op="send_message",
+        [TK.mcp_call("bt_chat"; real_process=true, action="send",
             project_id=target[], text="peer wakes receipt wait"), TK.text("Coordination sent")] :
         [TK.text("Received: $p")]
     s = TK.dev_server(; agent, receipt_delay_ms=1500)
@@ -62,11 +62,9 @@ end
     try
         TK.open_browser(s)
         sender = TK.new_chat(s; title="Receipt coordinator")
-        TK.eval_js(s, "window.confirm=()=>true; $pane.querySelector('.bt-header-menu .bw-menu-trigger').click(); " *
-            "$pane.querySelector('.bt-header-devmode').click()")
-        @test TK.wait_for(s, "coordinator tools enabled",
-            "$pane.querySelector('.bt-header-devmode').classList.contains('bt-cap-on')"; timeout=60)
+        TK.set_chat_messaging(s)
         target[] = TK.new_chat(s; title="Acknowledged queue receiver")
+        TK.set_chat_messaging(s)
         TK.send_message(s, "wait for user receipt")
         @test TK.wait_for(s, "voluntary wait is running", waiting("wait-for-user-receipt"); timeout=60)
         TK.eval_js(s, "$pane.querySelector('.bt-send-mode-trigger').click(); " *

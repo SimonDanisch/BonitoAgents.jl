@@ -8,7 +8,7 @@
     else
         target = Ref("")
         correction = "Keep running both sleep commands already requested. Change only your final reply to exactly CODEX_STEER_OK."
-        agent(p) = [TK.mcp_call("bt_dev_control"; real_process = true, op = "send_message",
+        agent(p) = [TK.mcp_call("bt_chat"; real_process = true, action = "send",
             project_id = target[], text = correction, id = "real-peer-send"), TK.text("Coordination sent")]
         s = TK.dev_server(; agent)
         pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
@@ -21,11 +21,9 @@
         try
             TK.open_browser(s)
             sender = TK.new_chat(s; title = "Coordination sender")
-            TK.eval_js(s, "window.confirm=()=>true; $pane.querySelector('.bt-header-menu .bw-menu-trigger').click(); " *
-                "$pane.querySelector('.bt-header-devmode').click()")
-            @test TK.wait_for(s, "sender has coordination tools",
-                "$pane.querySelector('.bt-header-devmode').classList.contains('bt-cap-on')"; timeout = 60)
+            TK.set_chat_messaging(s)
             target[] = TK.new_chat(s; title = "Real Codex receiver")
+            TK.set_chat_messaging(s)
             TK.switch_agent(s, "Codex")
             @test TK.wait_for(s, "Codex connected", "$pane.querySelector('.bt-header-provider-pick .bt-msearch-value')?.textContent === 'Codex' && " *
                 "$pane.querySelector('.bt-msearch-item[data-label*=\"agent-full-access\"]') !== null"; timeout = 120)

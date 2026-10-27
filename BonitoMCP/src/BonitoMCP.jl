@@ -62,6 +62,7 @@ include("eval_host.jl")        # run_eval_host — serve another worker's chat t
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 include("tools/dev.jl")        # bt_dev_* — server introspection; only in a debug chat
+include("tools/chat.jl")       # explicitly opted-in coordination, without dev tools
 include("tools/progress.jl")   # job progress from any agent/language
 include("tools/wait.jl")       # bt_wait  — the one way to actually pause a turn
 include("tools/process.jl")    # worker-owned supervised background commands

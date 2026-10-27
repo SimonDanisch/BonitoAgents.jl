@@ -77,7 +77,11 @@ condition, rather than starting sleep/poll watcher tasks. Incoming messages can
 wake a wait; read them and then continue the original work as appropriate.
 Cross-chat messages are delivered according to their requested queue mode;
 sending one is not evidence that the other agent has read it or finished work.
-Only contact another chat when the user authorized coordination. Use the
+Only contact another chat when the user authorized coordination. Use `bt_chat`
+to list available peers and send messages. Chat messaging is OFF by default;
+the user must enable it in BOTH chats' ⋯ menus. Dev mode does not grant it.
+If it is off, ask the user; never bypass the switch. A queued response is not
+delivery confirmation. Use the
 available tools' descriptions for arguments and capability limits; remote Julia
 and development controls are granted per chat, never assumed.
 """

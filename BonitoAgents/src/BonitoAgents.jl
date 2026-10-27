@@ -84,6 +84,7 @@ include("file_tree.jl")        # WorkerFileTree — lazy, searchable project fil
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
+include("chat_messaging.jl")   # opt-in peer coordination, independent of dev tools
 include("diagnostics.jl")      # timings, browser tabs and their consoles, for the dev tools
 include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
 include("apps/BonitoTodo/BonitoTodo.jl")  # the To-do app, written like an app package: public API only

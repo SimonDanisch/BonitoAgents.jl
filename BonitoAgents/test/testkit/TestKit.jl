@@ -1417,6 +1417,20 @@ function click(s::TestServer, selector::AbstractString)
     return s
 end
 
+"Toggle the current chat's messaging permission through its actual menu."
+function set_chat_messaging(s::TestServer, enabled::Bool = true)
+    pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
+    menu = "$pane.querySelector('.bt-header-menu')"
+    item = "$menu.querySelector('.bt-header-messaging')"
+    wait_for(s, "messaging switch ready", "!!$item")
+    eval_js(s, "$item.classList.contains('bt-cap-on')") == enabled && return nothing
+    eval_js(s, "if (!$menu.classList.contains('bw-menu-open')) $menu.querySelector('.bw-menu-trigger').click(); true")
+    wait_for(s, "chat menu open", "$menu.classList.contains('bw-menu-open')")
+    eval_js(s, "$item.click(); true")
+    wait_for(s, "messaging switch applied", "$item.classList.contains('bt-cap-on') === $(enabled)")
+    return nothing
+end
+
 """
     real_click(s, css_selector)
 

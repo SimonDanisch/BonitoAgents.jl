@@ -5,7 +5,7 @@
         [TK.mcp_call("bt_wait"; real_process = true, seconds = 60, reason = p,
             id = replace(p, " " => "-")),
          TK.text("Wait released: $p"), TK.delay(3000)] : p == "coordinate" ?
-        [TK.mcp_call("bt_dev_control"; real_process = true, op = "send_message",
+        [TK.mcp_call("bt_chat"; real_process = true, action = "send",
             project_id = target[], text = "peer wakes the wait"), TK.text("Peer sent")] :
         [TK.text("Received: $p"), TK.delay(3000)]
     s = TK.dev_server(; agent, prompt_queueing = false, active_steering = true)
@@ -15,9 +15,9 @@
     try
         TK.open_browser(s)
         sender = TK.new_chat(s; title = "Wait sender")
-        TK.eval_js(s, "window.confirm=()=>true; $pane.querySelector('.bt-header-menu .bw-menu-trigger').click(); $pane.querySelector('.bt-header-devmode').click()")
-        @test TK.wait_for(s, "peer tools enabled", "$pane.querySelector('.bt-header-devmode').classList.contains('bt-cap-on')"; timeout = 60)
+        TK.set_chat_messaging(s)
         target[] = TK.new_chat(s; title = "Wait receiver")
+        TK.set_chat_messaging(s)
         TK.send_message(s, "wait for user")
         @test TK.wait_for(s, "user wait running", waiting("wait-for-user"); timeout = 60)
         TK.eval_js(s, "$pane.querySelector('.bt-send-mode-trigger').click(); $pane.querySelector(\"[data-send-mode='next']\").click()")

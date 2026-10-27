@@ -55,6 +55,28 @@ origin_from_wire(o::AbstractDict) = PeerMessageOrigin(String(o["id"]), String(o[
     String(o["title"]), String(o["worker_id"]), String(o["worker_name"]), DateTime(o["sent_at"]))
 
 const HELD_DETAIL = "You pressed Stop: this goes out with your next message."
+const PEER_DISABLED_DETAIL = "Not sent: Chat messaging was turned off. Enable it in both chats, then send again or remove this message."
+
+function pause_disallowed_peer_sends!(model; revoked_project = "")
+    lock(model.lock) do
+        changed = false
+        for entry in model.pending_sends
+            entry isa PendingSend && entry.origin !== nothing &&
+                entry.status in (:waiting, :offline, :sending) || continue
+            revoked = !isempty(revoked_project) &&
+                (entry.origin.project_id == revoked_project || model.project_id == revoked_project)
+            !revoked && peer_messaging_allowed(model.state, entry.origin.project_id, model.project_id) && continue
+            entry.status = :paused
+            entry.detail = PEER_DISABLED_DETAIL
+            changed = true
+        end
+        if changed
+            save_pending_sends!(model)
+            emit_queue!(model)
+        end
+    end
+    return nothing
+end
 
 # The prompt of a message with riders: theirs first, as they happened before it.
 with_riders(riders::Vector{UserMsg}, text::AbstractString) =
@@ -250,6 +272,7 @@ end
 function next_submission(model)
     s = shared(model)
     lock(s.lock) do
+        pause_disallowed_peer_sends!(s)
         # Already-steered spans must settle before a new ordinary turn starts.
         for ready in (in((:sent, :submitted)), in((:waiting, :offline)))
             i = findfirst(e -> e isa PendingSend && ready(e.status), s.pending_sends)
@@ -455,6 +478,7 @@ function deliver_boundary_message!(model)
     cancelling(s) && return nothing
     native = get(c.session_result, "bonitoActiveSteering", false)
     entry = lock(s.lock) do
+        pause_disallowed_peer_sends!(s)
         i = findfirst(e -> e isa PendingSend && e.status == :waiting && e.mode == :next, s.pending_sends)
         i === nothing && return nothing
         e = s.pending_sends[i]

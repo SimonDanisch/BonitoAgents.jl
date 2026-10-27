@@ -5953,6 +5953,7 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
             # the span: a one-shot response channel that settles with the stopReason.
             try
                 turn = lock(s.lock) do
+                    pause_disallowed_peer_sends!(s)
                     submission !== nothing && submission.status != :sending && return nothing
                     if submission !== nothing && submission.mode === :idle &&
                        (!s.yolo[] || s.stopped[] || !isempty(AgentClientProtocol.open_turns(s)))
@@ -7944,20 +7945,20 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # Gated behind a JS `confirm()` for the same reason as the worker card's
     # remove ✕ — the call must never fire without an explicit OK. It earns that
     # because `bt_dev_control` is NOT scoped to the calling chat: the agent here
-    # can send messages into, restart or close any chat on this server, and move
+    # can inspect, restart or close any chat on this server, and move
     # chats between machines.
     #
-    # Flipping the flag alone would do nothing visible: `dev_mode` is read at
-    # session bring-up (see `set_dev_mode!`), so the session is restarted to
-    # respawn the MCP process with the new environment. A chat with no project
+    # The server revokes access immediately. Restarting also refreshes tool
+    # discovery by respawning MCP with the new environment (`set_dev_mode!`).
+    # A chat with no project
     # has nowhere to persist the flag, so it gets no item. While ON, the menu
     # trigger itself turns red: that this chat's agent can drive the whole
     # server should be legible at a glance, not something you discover by opening
     # the menu.
     # ── Per-chat capability switches (the ⋯ menu) ────────────────────────────
-    # "Dev mode" and "Remote julia" are the same widget: a capability this
-    # chat's agent is granted, off by default, flipped rarely and read almost
-    # never. ONE implementation, because both of them shipped broken in
+    # Dev mode, Remote julia and Chat messaging share one capability widget:
+    # granted to this chat's agent, off by default and flipped rarely.
+    # ONE implementation, because the first two shipped broken in
     # DIFFERENT ways while they were two hand-rolled copies, and neither failure
     # was visible from the UI.
     #
@@ -8040,6 +8041,14 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 "the evals running there.")
     remote_item = remote.item
 
+    messaging = capability_item("Chat messaging", q -> q.chat_messaging,
+        want -> set_chat_messaging!(viewer, project_id, want);
+        hook = "bt-header-messaging",
+        title = "Allow this agent to send and receive messages with your other opted-in chats. " *
+                "Both chats must enable it. Off by default; disabling pauses messages not yet handed over. " *
+                "Takes effect immediately without restarting the agent.")
+    messaging_item = messaging.item
+
     dev = capability_item("Dev mode", q -> q.dev_mode,
         function (want)
             safe_set!(header_status, want ? "Enabling dev mode…" : "Disabling dev mode…")
@@ -8054,7 +8063,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         hook = "bt-header-devmode",
         danger = true,
         confirm_text = "Enable dev mode for this chat?\n\nIts agent gets tools that " *
-                       "read AND DRIVE this server: it can send messages into, restart " *
+                       "read AND DRIVE this server: it can inspect, restart " *
                        "or close ANY chat here, and move chats between machines.\n\n" *
                        "This restarts the chat session.",
         title = "Dangerous: give this chat's agent live introspection into " *
@@ -8110,6 +8119,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                     title = "Open a chat on BonitoAgents' own source on this worker, with live " *
                             "introspection into the server running this window"),
             remote_item,
+            messaging_item,
             devmode_item,
         ];
         title = "More actions", class = "bt-header-menu", trigger_class = menu_trigger_class)
