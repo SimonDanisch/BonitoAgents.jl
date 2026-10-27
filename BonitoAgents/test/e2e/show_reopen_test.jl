@@ -31,7 +31,12 @@
         @test TK.wait_for(s, "preview loads after reopening chat", loaded; timeout=30)
         TK.navigate(s, "/?pid=$pid")
         @test TK.wait_for(s, "preview loads after page reload", loaded; timeout=60)
-        @test TK.eval_js(s, "document.querySelector('.bt-tool-body[data-tool-id=\"late-show\"] img').getAttribute('src')") == src
+        @test TK.eval_js(s, """(() => {
+            const before=new URL($(TK.json(src)),location.href);
+            const after=new URL(document.querySelector('.bt-tool-body[data-tool-id="late-show"] img').getAttribute('src'),location.href);
+            before.searchParams.delete('view');after.searchParams.delete('view');
+            return before.href===after.href;
+        })()""")
 
         # Force an uncached browser load of the ORIGINAL address after all the
         # session teardown above. naturalWidth catches a 404/broken image; merely

@@ -3493,7 +3493,7 @@ end
 function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     proj = get(st.state.projects[], st.project_id, nothing)
     proj === nothing && return mirror_src(st, session)
-    return worker_file_url(st.state, proj.worker_id, show_worker_path(st))
+    return worker_file_url(st.state, proj.worker_id, show_worker_path(st); fresh = session !== nothing)
 end
 
 # A chat with no project has no worker to link to: the server's copy, fetched
@@ -3545,7 +3545,7 @@ function read_image_element(state::ServerState, project_id::AbstractString,
                 # content holds: the element has its size before it loads.
                 size = something(media_size(state, proj.worker_id, info.path),
                                  image_size(c), Some(nothing))
-                return media_element(worker_file_url(state, proj.worker_id, info.path),
+                return media_element(worker_file_url(state, proj.worker_id, info.path; fresh = true),
                     c.mime_type, is_video; filename = fname, worker_path = info.path, size)
             end
         catch e
