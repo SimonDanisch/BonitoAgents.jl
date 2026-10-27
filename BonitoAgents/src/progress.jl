@@ -235,7 +235,7 @@ function progress_overlay(session::Bonito.Session, busy::Observable)
     # ("Could not continue on Bosgame"), the detail is the exception and its
     # stack. Pasting one without the other loses half the report.
     copy_btn = DOM.button("Copy";
-        class = "bt-btn bt-btn-secondary bt-btn-sm bt-prog-copy",
+        class = "bw-btn bw-btn-secondary bw-btn-sm bt-prog-copy",
         title = "Copy this message to the clipboard",
         onclick = js"""event => {
             const card = event.currentTarget.closest('.bt-prog');
@@ -246,7 +246,7 @@ function progress_overlay(session::Bonito.Session, busy::Observable)
             ($(COPY_TEXT_JS))((head + '\n' + body).trim()).then(() => say('Copied'), () => say('Copy failed'));
         }""")
     close_btn = DOM.button("✕";
-        class = "bt-btn bt-btn-ghost bt-btn-sm bt-prog-close",
+        class = "bw-btn bw-btn-ghost bw-btn-sm bt-prog-close",
         title = "Dismiss",
         onclick = js"event => $(dismiss).notify('x')")
 

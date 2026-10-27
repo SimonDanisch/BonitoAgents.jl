@@ -35,12 +35,13 @@ AgentProviders = {path = "../AgentProviders"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "../BonitoMCP"}
-BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
+BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "sd/shared-ui-widgets"}
 BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
 WorkerLink = {path = "../WorkerLink"}
 
 [compat]
+BonitoWidgets = "0.1.3"
 Colors = "0.12, 0.13"
 HTTP = "2"
 JSON = "1"

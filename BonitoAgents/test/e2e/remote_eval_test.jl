@@ -48,8 +48,8 @@
     # off the item's own class rather than driving a <select>'s value.
     remote_item  = "$VP?.querySelector('.bt-header-menu .bt-header-remote')"
     remote_state = "($(remote_item)?.classList.contains('bt-cap-on') ? 'on' : 'off')"
-    open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"
-    menu_open = "$VP?.querySelector('.bt-header-menu')?.classList.contains('bt-menu-open') === true"
+    open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bw-menu-trigger'); if(!t) return false; t.click(); return true; })()"
+    menu_open = "$VP?.querySelector('.bt-header-menu')?.classList.contains('bw-menu-open') === true"
     set_switch(v) = """(() => { const b = $(remote_item); if (!b) return false;
         const on = b.classList.contains('bt-cap-on');
         if ((on ? 'on' : 'off') !== $(repr(v))) b.click();

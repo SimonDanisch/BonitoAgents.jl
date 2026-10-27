@@ -41,8 +41,8 @@
         }
         return (c.querySelector('.bt-tool-body')?.innerText || '').includes($(repr(text))); })()"""
     remote_item = "$VP?.querySelector('.bt-header-menu .bt-header-remote')"
-    open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bt-menu-trigger'); if(!t) return false; t.click(); return true; })()"
-    menu_open = "$VP?.querySelector('.bt-header-menu')?.classList.contains('bt-menu-open') === true"
+    open_menu = "(() => { const p=$VP; const t=p && p.querySelector('.bt-header-menu .bw-menu-trigger'); if(!t) return false; t.click(); return true; })()"
+    menu_open = "$VP?.querySelector('.bt-header-menu')?.classList.contains('bw-menu-open') === true"
     set_switch(v) = """(() => { const b = $(remote_item); if (!b) return false;
         const on = b.classList.contains('bt-cap-on');
         if ((on ? 'on' : 'off') !== $(repr(v))) b.click();

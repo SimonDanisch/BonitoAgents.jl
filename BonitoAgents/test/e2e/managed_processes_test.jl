@@ -59,8 +59,8 @@
                     "$(task()).getBoundingClientRect().right <= innerWidth+1 && $(task()).scrollWidth <= $(task()).clientWidth+1";timeout=10)
                 TK.screenshot(s,joinpath(tempdir(),"bonitoagents-managed-process-phone.png"))
             end
-            TK.eval_js(s,"$(task()).querySelector('.bt-menu-trigger').click(); true")
-            TK.eval_js(s,"[...$(task()).querySelectorAll('.bt-menu-item')].find(b => b.textContent==='Force kill').click(); true")
+            TK.eval_js(s,"$(task()).querySelector('.bw-menu-trigger').click(); true")
+            TK.eval_js(s,"[...$(task()).querySelectorAll('.bw-menu-item')].find(b => b.textContent==='Force kill').click(); true")
             @test TK.wait_for(s,"confirmed kill removes the live task","!$(task())";timeout=30)
             TK.send_message(s,"inspect managed")
             @test TK.wait_for(s,"status confirms the forced exit",result_says("process-status","killed");timeout=30)
@@ -68,8 +68,8 @@
 
             TK.send_message(s,"restart fixture")
             @test TK.wait_for(s,"second command runs", "!!$(task("restart-1")) && !$vp.querySelector('.bt-busy-active')";timeout=30)
-            TK.eval_js(s,"$vp.querySelector('.bt-header-menu .bt-menu-trigger').click(); true")
-            TK.eval_js(s,"[...$vp.querySelectorAll('.bt-header-menu .bt-menu-item')].find(b => b.textContent.trim().startsWith('Restart session')).click(); true")
+            TK.eval_js(s,"$vp.querySelector('.bt-header-menu .bw-menu-trigger').click(); true")
+            TK.eval_js(s,"[...$vp.querySelectorAll('.bt-header-menu .bw-menu-item')].find(b => b.textContent.trim().startsWith('Restart session')).click(); true")
             @test TK.wait_for(s,"restart confirms cleanup before dropping the job", "!$(task("restart-1"))";timeout=60)
             TK.send_message(s,"inspect restarted")
             @test TK.wait_for(s,"replacement session sees actual cleanup result",result_says("process-after-restart","killed");timeout=60)

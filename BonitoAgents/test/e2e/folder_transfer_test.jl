@@ -38,8 +38,8 @@
             timeout = 30)
         TK.open_chat(server, pid)
         menu = "$VP?.querySelector('.bt-header-menu')"
-        @test TK.eval_js(server, "$menu.querySelector('.bt-menu-trigger').click(); true")
-        @test TK.wait_for(server, "remote menu open", "$menu.classList.contains('bt-menu-open')")
+        @test TK.eval_js(server, "$menu.querySelector('.bw-menu-trigger').click(); true")
+        @test TK.wait_for(server, "remote menu open", "$menu.classList.contains('bw-menu-open')")
         @test TK.eval_js(server, "$menu.querySelector('.bt-header-remote').click(); true")
         @test TK.wait_for(server, "remote transfers enabled",
             "$menu.querySelector('.bt-header-remote').classList.contains('bt-cap-on')")

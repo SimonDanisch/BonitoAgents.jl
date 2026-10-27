@@ -26,7 +26,7 @@
         # scrollIntoView between mouse-down and mouse-up.
         TK.eval_js(s,"$(q(".bt-messages")).dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:-1})); true")
         for selector in (".bt-media-enlarge", ".bt-agent-msg img")
-            selector==".bt-media-enlarge" && TK.real_click(s,P*".bt-media-actions .bt-menu-trigger")
+            selector==".bt-media-enlarge" && TK.real_click(s,P*".bt-media-actions .bw-menu-trigger")
             TK.real_click(s, P * selector)
             @test TK.wait_for(s, "enlarged image decoded", decoded)
             @test TK.eval_js(s, "(() => {const r=$big.getBoundingClientRect();return r.width>600 && r.height>400 && r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight;})()")

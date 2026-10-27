@@ -758,9 +758,9 @@ has_rendered_view(p::FilePanel) = !(p.kind isa TextFile)
 # value of the root's `data-view`, which the CSS keys on.
 initial_view(p::FilePanel) = has_rendered_view(p) ? "preview" : "source"
 
+# The panel's click handler runs it (`data-fv-action`); the Menu closes on the pick.
 fv_action_btn(action, label, title) =
-    DOM.button(label; class="bt-menu-item bt-fv-act",type="button",title,dataFvAction=action,
-        onclick=js"event => { $(Bonito.JSString(MENU_CLOSE_JS)) }")
+    DOM.button(label; class="bw-menu-item bt-fv-act",type="button",title,dataFvAction=action)
 
 """
     disambiguate_labels(paths) -> Vector{String}
@@ -830,7 +830,7 @@ function file_panel_header(session::Session, p::FilePanel)
     # who never hovers a button they already know how to click.
     save_btn = p.editor === nothing ? () :
         (DOM.button("Save", DOM.span("Ctrl+S"; class = "bt-btn-kbd");
-                    class = "bt-btn bt-btn-sm bt-file-editor-save", type = "button",
+                    class = "bw-btn bw-btn-sm bt-file-editor-save", type = "button",
                     title = "Write this file on the worker"),)
     status = p.editor === nothing ? Observable("") : p.editor.status
     share = isempty(p.view.file.project_id) ? () : ShareControl(;hint="Share a link to this file.") do
@@ -845,7 +845,7 @@ function file_panel_header(session::Session, p::FilePanel)
         metadata=(DOM.span(kind_label(p.kind);class="bt-fv-badge"),
             DOM.span(size_txt;class="bt-fv-size"),DOM.span("";class="bt-fv-dims")),
         actions=(DOM.span(status;class="bt-file-editor-status bt-fv-status"),toggle,share,
-            action_menu(items;title="File actions"),save_btn),
+            Menu(items;title="File actions"),save_btn),
         class="bt-file-editor-header bt-fv-header")
 end
 

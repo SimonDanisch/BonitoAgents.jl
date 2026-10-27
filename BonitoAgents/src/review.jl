@@ -820,7 +820,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     send_btn = map(session, st.comments) do cs
         n = length(cs)
         DOM.button(n == 0 ? "Send" : "Send $(n) comment$(n == 1 ? "" : "s")";
-            class = "bt-btn bt-btn-sm bt-rv-send", type = "button",
+            class = "bw-btn bw-btn-sm bt-rv-send", type = "button",
             dataEmpty = n == 0 ? "1" : "0",
             title = "Deliver every collected comment to the agent as one instruction")
     end
@@ -841,7 +841,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
                 DOM.button("Ask";class="bt-fv-seg",type="button",dataRvMode="ask"),
                 DOM.button("Feedback";class="bt-fv-seg",type="button",dataRvMode="feedback");
                 class="bt-fv-segmented"),
-            DOM.button("⟳";class="bt-btn bt-btn-ghost bt-btn-sm bt-fv-act",type="button",
+            DOM.button("⟳";class="bw-btn bw-btn-ghost bw-btn-sm bt-fv-act",type="button",
                 title="Re-read the diff from the worker",dataRvAction="reload"),send_btn),
         class="bt-file-editor-header bt-rv-header")
 
@@ -995,7 +995,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             actions.className = 'bt-rv-form-actions';
             const ok = document.createElement('button');
             ok.type = 'button';
-            ok.className = 'bt-btn bt-btn-sm';
+            ok.className = 'bw-btn bw-btn-sm';
             ok.textContent = root.dataset.mode === 'ask' ? 'Ask' : 'Add';
             const cancel = document.createElement('button');
             cancel.type = 'button';

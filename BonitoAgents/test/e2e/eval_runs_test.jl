@@ -47,7 +47,7 @@
         return (c.querySelector('.bt-tool-body')?.innerText || '').includes($(repr(text))); })()"""
     notes = "[...($VP?.querySelectorAll('.bt-user-msg-auto') || [])].map(n => n.innerText).join('\\n')"
     remote_item = "$VP?.querySelector('.bt-header-menu .bt-header-remote')"
-    open_menu = "(() => { const t = $VP?.querySelector('.bt-header-menu .bt-menu-trigger'); if (!t) return false; t.click(); return true; })()"
+    open_menu = "(() => { const t = $VP?.querySelector('.bt-header-menu .bw-menu-trigger'); if (!t) return false; t.click(); return true; })()"
 
     # ONE agent for the whole test, routed by the prompt, so a finish note can
     # never be answered by the script meant for a user message. It answers a

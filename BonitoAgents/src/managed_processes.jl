@@ -263,17 +263,17 @@ end
 function taskbar_extra_controls(session,bar,t::ManagedProcessTask)
     controls = map(("terminate"=>"Terminate", "kill"=>"Force kill")) do (action,label)
         payload = "managed-control:" * JSON.json(Dict("action"=>action,"worker"=>t.worker,"id"=>t.snapshot["id"]))
-        DOM.button(label;class="bt-menu-item" * (action=="kill" ? " bt-menu-danger" : ""),
+        DOM.button(label;class="bw-menu-item" * (action=="kill" ? " bw-menu-danger" : ""),
             onclick=js"event => { event.preventDefault(); event.stopPropagation(); $(bar.stop_request).notify($payload); }")
     end
-    return (action_menu(controls...;title="Process controls"),)
+    return (Menu(controls;title="Process controls"),)
 end
 
 const PROCESS_TASK_STYLES = Styles(
-    CSS(".bt-taskbar-slot.bt-process-task", "display"=>"block", "width"=>"100%", "max-width"=>"100%", "min-width"=>"0", "box-sizing"=>"border-box", "border-radius"=>"var(--bt-radius)"),
-    CSS(".bt-process-task summary", "display"=>"flex", "min-width"=>"0", "align-items"=>"center", "gap"=>"var(--bt-space-2)", "cursor"=>"pointer"),
-    CSS(".bt-process-output", "max-height"=>"180px", "overflow"=>"auto", "white-space"=>"pre-wrap", "overflow-wrap"=>"anywhere", "font-size"=>"11px", "margin"=>"var(--bt-space-2) 0 0"),
-    CSS(".bt-process-meta", "font-size"=>"11px", "white-space"=>"pre-wrap", "overflow-wrap"=>"anywhere", "color"=>"var(--bt-text-muted)"))
+    CSS(".bt-taskbar-slot.bt-process-task", "display"=>"block", "width"=>"100%", "max-width"=>"100%", "min-width"=>"0", "box-sizing"=>"border-box", "border-radius"=>"var(--bw-radius)"),
+    CSS(".bt-process-task summary", "display"=>"flex", "min-width"=>"0", "align-items"=>"center", "gap"=>"var(--bw-space-2)", "cursor"=>"pointer"),
+    CSS(".bt-process-output", "max-height"=>"180px", "overflow"=>"auto", "white-space"=>"pre-wrap", "overflow-wrap"=>"anywhere", "font-size"=>"var(--bw-font-size-xs)", "margin"=>"var(--bw-space-2) 0 0"),
+    CSS(".bt-process-meta", "font-size"=>"var(--bw-font-size-xs)", "white-space"=>"pre-wrap", "overflow-wrap"=>"anywhere", "color"=>"var(--bw-text-muted)"))
 
 function taskbar_slot(session,bar,item,head,t::ManagedProcessTask)
     d = t.snapshot

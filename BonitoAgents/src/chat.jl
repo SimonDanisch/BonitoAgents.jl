@@ -2765,7 +2765,7 @@ function Bonito.jsrender(session::Bonito.Session, c::BonitoUpgradeCard)
         end
     end
     btn = DOM.button("Update env";
-        class = "bt-btn bt-worker-upgrade-btn",
+        class = "bw-btn bt-worker-upgrade-btn",
         onclick = js"e => { e.preventDefault(); e.stopPropagation(); $(do_fix).notify(true); }")
     Bonito.jsrender(session, DOM.div(
         DOM.div("Live display needs a newer Bonito"; class = "bt-worker-stale-title"),
@@ -3424,15 +3424,14 @@ event => {
 
 # The same menu items run in chat, workspace and public-viewer toolbars.
 function media_menu_items(is_video::Bool; worker_path="",download=true)
-    close_then(handler)=js"""event => { $(Bonito.JSString(MENU_CLOSE_JS)) ($(handler))(event); }"""
-    items=Any[DOM.button("Enlarge";class="bt-menu-item bt-media-enlarge",type="button",
-        title="Enlarge",onclick=close_then(LIGHTBOX_OPEN_JS))]
-    is_video || push!(items,DOM.button("Copy image";class="bt-menu-item bt-media-copy",type="button",
-        title="Copy image",onclick=close_then(COPY_MEDIA_JS)))
-    download && push!(items,DOM.button("Download";class="bt-menu-item bt-media-download",type="button",
-        title="Download",onclick=close_then(DOWNLOAD_MEDIA_JS)))
+    items=Any[DOM.button("Enlarge";class="bw-menu-item bt-media-enlarge",type="button",
+        title="Enlarge",onclick=LIGHTBOX_OPEN_JS)]
+    is_video || push!(items,DOM.button("Copy image";class="bw-menu-item bt-media-copy",type="button",
+        title="Copy image",onclick=COPY_MEDIA_JS))
+    download && push!(items,DOM.button("Download";class="bw-menu-item bt-media-download",type="button",
+        title="Download",onclick=DOWNLOAD_MEDIA_JS))
     if !is_video && !isempty(worker_path)
-        push!(items,DOM.button("Set as chat icon";class="bt-menu-item bt-media-chat-icon",type="button",
+        push!(items,DOM.button("Set as chat icon";class="bw-menu-item bt-media-chat-icon",type="button",
             title="Set as chat icon",var"aria-label"="Set as chat icon"))
     end
     return items
@@ -3464,7 +3463,7 @@ function media_element(src, mime::AbstractString, is_video::Bool;
         DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS, dims...,
             style = Styles("max-width" => "100%", "height" => "auto", "display" => "block", "cursor" => "zoom-in"))
     heading = toolbar ? FileToolbar(isempty(filename) ? (is_video ? "Video" : "Image") : filename;
-        actions=(controls,DOM.div(action_menu(media_menu_items(is_video;worker_path);title="File actions");
+        actions=(controls,DOM.div(Menu(media_menu_items(is_video;worker_path);title="File actions");
             class="bt-media-actions")),caption=true) : ()
     # The error can come before its handler is attached: the session that
     # attaches it starts once its payload is fetched, and a missing file's 404
@@ -7815,18 +7814,17 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # ── The ⋯ menu ───────────────────────────────────────────────────────────
     # Every other one-shot action lives here, so the strip only shows what the
     # user reads all the time. Each item notifies `menu_pick` with its action
-    # name and closes the menu; the trigger toggles `bt-menu-open` and installs a
-    # capture-phase document listener that closes on a click outside. One
-    # listener per open (a re-open replaces it), removed on every close path.
+    # name.
     menu_pick = Observable("")
-    # Picking an item closes whatever holds it: the popover on wide panes, and
-    # on narrow panes the expanded ⋯ panel the items are laid out in.
-    close_menu_js = MENU_CLOSE_JS * """
+    # Picking an item closes whatever holds it: the Menu closes its popover by
+    # itself, and on narrow panes this closes the expanded ⋯ panel the items
+    # are laid out in.
+    close_menu_js = """
         const header = event.currentTarget.closest('.bt-header');
         const more = header?.querySelector('.bt-header-more-check');
         if (more) { more.checked = false; header.classList.remove('bt-header-open'); }"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
-        class = strip("bt-menu-item " * class),
+        class = strip("bw-menu-item " * class),
         title = title,
         onclick = js"""event => {
             $(Bonito.JSString(close_menu_js))
@@ -7846,15 +7844,15 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                       by = w -> w.name)
         isempty(others) && return DOM.div(; class = "bt-menu-group bt-hidden")
         DOM.div(
-            DOM.div("Continue on"; class = "bt-menu-title"),
+            DOM.div("Continue on"; class = "bw-menu-title"),
             (DOM.button(w.name;
-                class = "bt-menu-item bt-menu-continue",
+                class = "bw-menu-item bt-menu-continue",
                 title = "Open a new chat on $(w.name) that picks up here: the files and the agent's memory. This chat stays as it is.",
                 onclick = js"""event => {
                     $(Bonito.JSString(close_menu_js))
                     $(continue_pick).notify($(w.worker_id));
                 }""") for w in others),
-            DOM.div(; class = "bt-menu-sep");
+            DOM.div(; class = "bw-menu-sep");
             class = "bt-menu-group")
     end
     on(session, continue_pick) do wid
@@ -7993,8 +7991,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             # `hook` is the stable selector the e2e suite queries by; the
             # `bt-cap-*` classes carry the STATE. Keeping them separate means a
             # restyle cannot silently break a test's handle on the control.
-            "bt-menu-item bt-cap-item $(hook)" *
-                (danger ? " bt-menu-danger" : "") *
+            "bw-menu-item bt-cap-item $(hook)" *
+                (danger ? " bw-menu-danger" : "") *
                 (on ? " bt-cap-on" : "") * (busy ? " bt-cap-busy" : "")
         end
         trigger = Observable("")
@@ -8068,19 +8066,14 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     is_admin(viewer) || (remote_item = DOM.div(); devmode_item = DOM.div())
 
     menu_trigger_class = map(session, devmode_on) do on
-        on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :
-             "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger"
+        on ? "bw-btn-secondary bw-btn-sm bt-menu-trigger-danger" : "bw-btn-secondary bw-btn-sm"
     end
-    menu_trigger = DOM.button("⋯";
-        class = menu_trigger_class,
-        title = "More actions",
-        onclick = MENU_TOGGLE_JS)
     # In the ⋯ menu with every other one-shot action, not as a lone button in
     # the strip. The strip is for what the user READS continuously (the context
     # meter) and for the pickers that describe the session; a verb parked next
     # to them reads as a sixth setting.
     review_item = DOM.button("Review changes";
-        class   = "bt-menu-item bt-header-review",
+        class   = "bw-menu-item bt-header-review",
         title   = "Review this project's uncommitted changes — ask about or comment on any line",
         onclick = js"""event => {
             $(Bonito.JSString(close_menu_js))
@@ -8095,32 +8088,31 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         DOM.a("Export as Markdown";
             href     = "/export/$(project_id)",
             download = export_filename(model),
-            class    = "bt-menu-item bt-header-export",
+            class    = "bw-menu-item bt-header-export",
             title    = "Download this chat as a Markdown file (full tool bodies, files by path)",
             onclick  = js"""event => {
                 $(Bonito.JSString(close_menu_js))
             }""")
 
-    menu = DOM.div(
-        menu_trigger,
-        DOM.div(
+    menu = Menu(
+        [
             review_item,
             export_item,
-            DOM.div(; class = "bt-menu-sep"),
+            DOM.div(; class = "bw-menu-sep"),
             continue_items,
             menu_item("Compact", "compact";
                 title = "Summarize the conversation so far to free up context (/compact)"),
             menu_item("Restart session", "restart"; class = "bt-header-restart",
                 title = "Stop and respawn the agent process for this chat"),
-            pane === nothing ? nothing : DOM.div(; class = "bt-menu-sep"),
+            pane === nothing ? nothing : DOM.div(; class = "bw-menu-sep"),
             pane === nothing ? nothing :
                 menu_item("Debug BonitoAgents", "debug"; class = "bt-header-debug",
                     title = "Open a chat on BonitoAgents' own source on this worker, with live " *
                             "introspection into the server running this window"),
             remote_item,
-            devmode_item;
-            class = "bt-menu-list");
-        class = "bt-menu bt-header-menu")
+            devmode_item,
+        ];
+        title = "More actions", class = "bt-header-menu", trigger_class = menu_trigger_class)
 
     # (The Yolo toggle lives in the composer — see `chat_composer` — not in
     # the header: it repurposes the message input as the reminders editor, so
@@ -8460,7 +8452,7 @@ function chat_composer(session::Session, model::ChatModel)
     cancel_status = DOM.div(
         DOM.span("Stopping the agent…"),
         DOM.button("Force stop"; type="button",
-            class="bt-btn bt-btn-danger bt-btn-sm bt-force-stop-btn",
+            class="bw-btn bw-btn-danger bw-btn-sm bt-force-stop-btn",
             title="End an unresponsive agent connection. Your next message reconnects.");
         class="bt-cancel-status", role="status", var"aria-live"="polite", hidden=true)
     # Attaching had exactly two ways in: paste and drag-drop. Neither exists on
@@ -8511,12 +8503,12 @@ function chat_composer(session::Session, model::ChatModel)
     """
     send_mode = DOM.div(
         DOM.button(DOM.span("Queue when done"; class="bt-send-mode-label"); type="button",
-            class="bt-btn bt-btn-ghost bt-send-mode-trigger",
+            class="bw-btn bw-btn-ghost bt-send-mode-trigger",
             title="Queue for when done", var"aria-label"="Queue for when done",
             var"aria-haspopup"="menu", var"aria-expanded"="false"),
         DOM.div(
             [DOM.button(label; type="button", role="menuitemradio",
-                class="bt-btn bt-btn-ghost bt-send-mode-option",
+                class="bw-btn bw-btn-ghost bt-send-mode-option",
                 var"data-send-mode"=mode, var"aria-checked"=mode == "done" ? "true" : "false")
              for (mode, label) in (("done", "Queue for when done"),
                  ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))];
@@ -9548,7 +9540,7 @@ function chat_notice(session::Bonito.Session, model::ChatModel)
     box = DOM.div(
         DOM.details(DOM.summary(; class="bt-session-notice-title"),
                     DOM.div(; class="bt-session-notice-text"); class="bt-session-notice-body"),
-        DOM.button("×"; class="bt-btn bt-btn-ghost bt-btn-sm", type="button",
+        DOM.button("×"; class="bw-btn bw-btn-ghost bw-btn-sm", type="button",
                    title="Dismiss notice");
         class="bt-session-notice", role="status", hidden=true)
     Bonito.onload(session, box, js"""(el) => {

@@ -62,7 +62,7 @@
 
         # The video goes fullscreen itself, rather than a copy downloading it again.
         video_wrap=".bt-media-wrap[data-filename=\"$(basename(mp4))\"]"
-        TK.tap(s,video_wrap*" .bt-media-actions .bt-menu-trigger")
+        TK.tap(s,video_wrap*" .bt-media-actions .bw-menu-trigger")
         TK.tap(s,video_wrap*" .bt-media-enlarge")
         @test TK.wait_for(s, "the video fullscreen",
             "document.fullscreenElement === $(PANE).querySelector('.bt-media-wrap video.bt-media')"; timeout = 10) == true
@@ -71,7 +71,7 @@
         @test TK.wait_for(s, "out of fullscreen", "!document.fullscreenElement"; timeout = 10) == true
 
         # Copy says whether it worked.
-        TK.tap(s,".bt-media-wrap[data-filename=\"$(basename(svg))\"] .bt-media-actions .bt-menu-trigger")
+        TK.tap(s,".bt-media-wrap[data-filename=\"$(basename(svg))\"] .bt-media-actions .bw-menu-trigger")
         TK.tap(s, ".bt-media-wrap .bt-media-copy")
         @test TK.wait_for(s, "the picture copied",
             "$(PANE).querySelector('.bt-media-wrap .bt-media-copy').textContent === '✓'"; timeout = 10) == true

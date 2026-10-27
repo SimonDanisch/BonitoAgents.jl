@@ -19,18 +19,18 @@
     url=TK.eval_js(s,"$control.querySelector('a').href")
     @test TK.eval_js(s,"$control.__preview===$card.querySelector('img.bt-media') && !$card.textContent.includes($(TK.json(url)))")
     @test TK.wait_for(s,"share actions use the common menu",
-        "$control.querySelector('.bt-menu').classList.contains('bt-menu-open') && getComputedStyle($control.querySelector('.bt-share-copy')).display==='block'";timeout=10)
-    TK.click(s,".bt-share-options .bt-menu-trigger")
+        "$control.querySelector('.bw-menu').classList.contains('bw-menu-open') && getComputedStyle($control.querySelector('.bt-share-copy')).display==='block'";timeout=10)
+    TK.click(s,".bt-share-options .bw-menu-trigger")
     style="e => { const s=getComputedStyle(e); return [s.backgroundColor,s.color,s.fontSize,s.padding,s.borderBottomColor]; }"
     chat_style=TK.eval_js(s,"($style)($toolbar)")
     TK.emulate_phone(s) do
         @test TK.wait_for(s,"one heading with reachable mobile actions","""(() => {
-            const t=$toolbar, share=t.querySelector('.bt-share-options .bt-menu-trigger').getBoundingClientRect(), more=t.querySelector('.bt-media-actions .bt-menu-trigger').getBoundingClientRect();
+            const t=$toolbar, share=t.querySelector('.bt-share-options .bw-menu-trigger').getBoundingClientRect(), more=t.querySelector('.bt-media-actions .bw-menu-trigger').getBoundingClientRect();
             return Math.abs(share.top-more.top)<2 && more.right<=innerWidth && t.scrollWidth<=t.clientWidth+1;
         })()""";timeout=10)
         TK.screenshot(s,joinpath(tempdir(),"bonitoagents-share-phone.png"))
     end
-    TK.real_click(s,".bt-media-actions .bt-menu-trigger")
+    TK.real_click(s,".bt-media-actions .bw-menu-trigger")
     TK.real_click(s,".bt-media-actions .bt-media-enlarge")
     @test TK.wait_for(s,"media action still enlarges the existing preview","!!document.querySelector('.bt-lightbox-overlay')";timeout=10)
     TK.click(s,".bt-lightbox-media")
@@ -53,7 +53,7 @@
         TK.eval_js(viewer,"location.href=$(TK.json(url)); true")
         @test TK.wait_for(viewer,"public viewer uses the same widget","!!document.querySelector('.bt-share-page > .bt-file-toolbar-slot .bt-share-download') && document.querySelector('img.bt-media')?.naturalWidth===640";timeout=30)
         @test TK.eval_js(viewer,"($style)(document.querySelector('.bt-file-toolbar'))")==chat_style
-        TK.real_click(viewer,".bt-share-bar .bt-menu-trigger")
+        TK.real_click(viewer,".bt-share-bar .bw-menu-trigger")
         TK.real_click(viewer,".bt-share-bar .bt-media-enlarge")
         @test TK.wait_for(viewer,"public viewer action works","!!document.querySelector('.bt-lightbox-overlay')";timeout=10)
         TK.click(viewer,".bt-lightbox-media")

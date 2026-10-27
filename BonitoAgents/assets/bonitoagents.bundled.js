@@ -4062,7 +4062,7 @@ class BonitoChat {
             ] : []){
                 const button = document.createElement('button');
                 button.type = 'button';
-                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.className = 'bw-btn bw-btn-ghost bw-btn-sm';
                 button.dataset.queueAction = action;
                 button.dataset.queueId = item.id;
                 button.textContent = label;

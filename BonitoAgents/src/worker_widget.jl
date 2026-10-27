@@ -151,7 +151,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
             "$(w.hostname) · home: $(w.home)"
     end
 
-    new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bt-btn bt-btn-secondary")
+    new_proj_btn = Bonito.Button("+ Project"; style=nothing, class = "bw-btn bw-btn-secondary")
     on(session, new_proj_btn.value) do clicked
         clicked || return
         opening = c.picker_state[] != wid
@@ -170,7 +170,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
         c.error_obs[]      = ""
     end
 
-    gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bt-btn bt-btn-secondary")
+    gh_btn = Bonito.Button("+ From GitHub"; style=nothing, class = "bw-btn bw-btn-secondary")
     on(session, gh_btn.value) do clicked
         clicked || return
         c.gh_state[] = c.gh_state[] == wid ? "" : wid
@@ -279,7 +279,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
     # `:failed`). `force_worker_update!` flips the worker to `:requested`, which
     # hides it while the worker's steps run; the replacement worker's hello
     # flips it to `:current`, leaving the compact success badge visible.
-    update_btn = Bonito.Button("Update now"; style=nothing, class = "bt-btn bt-btn-secondary")
+    update_btn = Bonito.Button("Update now"; style=nothing, class = "bw-btn bw-btn-secondary")
     on(session, update_btn.value) do clicked
         clicked || return
         @async try
@@ -368,8 +368,8 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
 end
 
 function render_remote_picker_form(session::Bonito.Session, c::WorkerCard, wid::String)
-    create_btn = Bonito.Button("Create"; style=nothing, class = "bt-btn")
-    cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
+    create_btn = Bonito.Button("Create"; style=nothing, class = "bw-btn")
+    cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bw-btn bw-btn-secondary")
     rp = c.remote_picker
 
     on(session, create_btn.value) do clicked
@@ -416,8 +416,8 @@ end
 # lives on the worker card (like "+ From GitHub" lives next to "+ Project");
 # the old dashboard "+ From GitHub" that carried its own worker select is gone.
 function render_github_form(session::Bonito.Session, c::WorkerCard, wid::String)
-    open_btn  = Bonito.Button("Open"; style=nothing, class = "bt-btn")
-    cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bt-btn bt-btn-secondary")
+    open_btn  = Bonito.Button("Open"; style=nothing, class = "bw-btn")
+    cancel_btn = Bonito.Button("Cancel"; style=nothing, class = "bw-btn bw-btn-secondary")
     url       = Observable("")
     err       = Observable("")
 
@@ -456,13 +456,13 @@ function render_github_form(session::Bonito.Session, c::WorkerCard, wid::String)
                   value = url, class = "bt-gh-url",
                   oninput = js"event => $(url).notify(event.target.value)"),
         DOM.div("Repo → just clone. Issue/PR → clone + auto-prompt 'fix this'.";
-                style = Styles("font-size" => "11px",
-                               "color" => "var(--bt-text-muted)",
+                style = Styles("font-size" => "var(--bw-font-size-xs)",
+                               "color" => "var(--bw-text-muted)",
                                "margin-bottom" => "4px")),
         map(err) do m
             isempty(m) ? DOM.div() :
-                DOM.div(m; style = Styles("color" => "var(--bt-error, #b91c1c)",
-                                          "font-size" => "12px"))
+                DOM.div(m; style = Styles("color" => "var(--bw-error, #b91c1c)",
+                                          "font-size" => "var(--bw-font-size-sm)"))
         end,
         DOM.div(cancel_btn, open_btn, class = "bt-form-actions");
         class = "bt-form")
@@ -525,7 +525,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     # — it should open it so the spinner / refreshed tree are visible), and
     # `stopPropagation` belt-and-braces.
     rescan_btn = DOM.span("↻ Rescan";
-        class = "bt-btn bt-btn-secondary",
+        class = "bw-btn bw-btn-secondary",
         style = Styles("cursor" => "pointer"),
         onclick = js"""event => {
             event.preventDefault(); event.stopPropagation();

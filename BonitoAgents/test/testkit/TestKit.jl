@@ -1936,16 +1936,16 @@ function add_account_ui!(s::TestServer, name::AbstractString; display_name::Abst
                          groups::AbstractString = "")
     to_settings(s)
     eval_js(s, accounts_js("sec.querySelector('.bt-add-account').click() || true"))
-    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bt-modal-card .bt-add-account-submit')"); timeout = 10)
+    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bw-modal-card .bt-add-account-submit')"); timeout = 10)
     eval_js(s, accounts_js("""(() => {
-        const form = sec.querySelector('.bt-modal-card .bt-form');
+        const form = sec.querySelector('.bw-modal-card .bt-form');
         const set = (label, v) => {
             const el = [...form.querySelectorAll('label')].find(l => l.textContent.trim() === label).nextElementSibling;
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
             el.dispatchEvent(new Event('input', {bubbles: true})); };
         set('Account', $(json(name))); set('Full name', $(json(display_name)));
         return true; })()"""))
-    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bt-modal-card .bt-group-pick')"),
+    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bw-modal-card .bt-group-pick')"),
                                     strip.(split(groups, ','; keepempty = false)))
     sleep(0.3)   # the inputs reach the server before the click that reads them
     eval_js(s, accounts_js("sec.querySelector('.bt-add-account-submit').click() || true"))
@@ -1968,8 +1968,9 @@ function account_action!(s::TestServer, name::AbstractString, label::AbstractStr
     ok = eval_js(s, accounts_js("""(() => {
         const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
         if (!row) return 'no row';
-        row.querySelector('.bt-menu-trigger').click();
-        const b = [...row.querySelectorAll('.bt-menu-open .bt-menu-item')].find(x => x.textContent.trim() === $(json(label)));
+        // The actions menu, not the group picker (a menu too) in the same row.
+        row.querySelector('.bt-admin-menu-cell .bw-menu-trigger').click();
+        const b = [...row.querySelectorAll('.bw-menu-open .bw-menu-item')].find(x => x.textContent.trim() === $(json(label)));
         if (!b) return 'no item';
         window.confirm = () => true;   // "Remove" asks first
         b.click(); return true; })()"""))
@@ -1989,8 +1990,8 @@ function pick_groups!(s::TestServer, picker_js::AbstractString, groups::Abstract
     # before its click handler is, and a click then does nothing.
     wait_for(s, "the group list open", """(() => { const m = $(picker_js);
         if (!m) return false;
-        if (!m.classList.contains('bt-menu-open')) m.querySelector('.bt-group-trigger').click();
-        return m.classList.contains('bt-menu-open'); })()"""; timeout = 20)
+        if (!m.classList.contains('bw-menu-open')) m.querySelector('.bt-group-trigger').click();
+        return m.classList.contains('bw-menu-open'); })()"""; timeout = 20)
     ok = eval_js(s, """(() => {
         const m = $(picker_js);
         const want = $(json(collect(String, groups)));

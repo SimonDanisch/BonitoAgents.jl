@@ -21,7 +21,7 @@
         try
             TK.open_browser(s)
             sender = TK.new_chat(s; title = "Coordination sender")
-            TK.eval_js(s, "window.confirm=()=>true; $pane.querySelector('.bt-header-menu .bt-menu-trigger').click(); " *
+            TK.eval_js(s, "window.confirm=()=>true; $pane.querySelector('.bt-header-menu .bw-menu-trigger').click(); " *
                 "$pane.querySelector('.bt-header-devmode').click()")
             @test TK.wait_for(s, "sender has coordination tools",
                 "$pane.querySelector('.bt-header-devmode').classList.contains('bt-cap-on')"; timeout = 60)
