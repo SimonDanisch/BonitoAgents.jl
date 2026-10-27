@@ -56,7 +56,7 @@
     end
     TK.send_message(s,"finish tool progress")
     @test TK.wait_for(s,"explicit completion reaches both views",
-        "$job.dataset.status==='completed' && $job.querySelector('.bt-job-percent').textContent==='100%' && " *
+        "$job.dataset.status==='completed' && $job.querySelector('.bt-job-percent').textContent==='Completed · 100%' && " *
         "$ring.querySelector('.bt-job-ring-fill').getAttribute('stroke-dashoffset')==='0' && ! $pane.querySelector('.bt-busy-active')";timeout=30)
     TK.send_message(s,"native progress")
     @test TK.wait_for(s,"running code updates without an agent tool roundtrip",
@@ -86,4 +86,54 @@
     @test TK.wait_for(s,"failed jobs retain their details",
         "$job.dataset.status==='failed' && $ring.dataset.status==='failed' && $job.querySelector('.bt-job-detail-text').textContent.includes('Encoder exited') && !$pane.querySelector('.bt-busy-active')";timeout=30)
     @test isempty(TK.js_errors(s))
+end
+
+@testitem "e2e:progress_completion" setup=[SharedServer] tags=[:e2e] begin
+    TK=SharedServer.TK
+    tool(action,id;kwargs...) = TK.mcp_call("bt_progress";real_process=true,
+        arguments=merge(Dict{String,Any}("action"=>action,"id"=>id),Dict(string(k)=>v for (k,v) in kwargs)))
+    s=TK.dev_server(agent=prompt -> if prompt=="start transfer"
+        [tool("start","old";label="Previous transfer",total=1),tool("finish","old"),
+         tool("start","sync";label="Pull from worker",total=57,completed=57,unit="files"),TK.end_turn()]
+    elseif prompt=="finish transfer"
+        [tool("finish","sync"),TK.end_turn()]
+    elseif prompt=="fail transfer"
+        [tool("start","failed";label="Failed transfer",total=10,completed=2),
+         tool("fail","failed";detail="Destination refused write"),TK.end_turn()]
+    else
+        [TK.end_turn()]
+    end)
+    try
+        TK.open_browser(s)
+        pid=TK.new_chat(s)
+        pane="document.querySelector('.bt-chatpane[data-pane-pid=\"$pid\"]')"
+        job="$pane.querySelector('.bt-job-progress')"
+        ring="document.querySelector('.bt-side-item[data-project-id=\"$pid\"] .bt-job-icon')"
+        TK.send_message(s,"start transfer")
+        @test TK.wait_for(s,"100 percent still waits for explicit completion",
+            "!$job.hidden && $job.dataset.status==='running' && $job.querySelector('.bt-job-percent').textContent==='100% · finishing' && !$ring.hidden";timeout=60)
+        @test TK.wait_for(s,"old completion expires while current transfer stays visible",
+            "!$job.hidden && $job.dataset.jobId==='sync' && $job.querySelector('.bt-job-label').textContent==='Pull from worker' && !$ring.hidden";timeout=10)
+        TK.send_message(s,"finish transfer")
+        @test TK.wait_for(s,"successful completion is explicit",
+            "!$job.hidden && $job.querySelector('.bt-job-percent').textContent==='Completed · 100%' && $ring.dataset.status==='completed'";timeout=20)
+        TK.screenshot(s,joinpath(tempdir(),"bonitoagents-progress-completed.png"))
+        @test TK.wait_for(s,"successful jobs clear automatically from both views",
+            "$job.hidden && $ring.hidden";timeout=10)
+        TK.reload!(s)
+        @test TK.wait_for(s,"reload does not resurrect completed jobs",
+            "!!$pane?.querySelector('.bt-text-input') && $job?.hidden && $ring?.hidden";timeout=30)
+        TK.send_message(s,"fail transfer")
+        @test TK.wait_for(s,"failure shown",
+            "!$job.hidden && $job.dataset.status==='failed' && $ring.dataset.status==='failed'";timeout=30)
+        TK.eval_js(s,"window.__failureShownAt=performance.now();true")
+        @test TK.wait_for(s,"failure remains visible beyond success expiry",
+            "performance.now()-window.__failureShownAt>6000 && !$job.hidden && !$ring.hidden && $job.querySelector('.bt-job-detail-text').textContent.includes('Destination refused write')";timeout=10)
+        TK.reload!(s)
+        @test TK.wait_for(s,"failure remains after reload",
+            "!$job?.hidden && $job?.dataset.status==='failed' && !$ring?.hidden";timeout=30)
+        @test isempty(TK.js_errors(s))
+    finally
+        close(s)
+    end
 end

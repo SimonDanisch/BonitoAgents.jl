@@ -63,7 +63,7 @@
             end
             @test TK.wait_for(server, "sync completed", shows(id, "synced"); timeout = 120)
             @test TK.wait_for(server, "confirmed transfer finishes progress",
-                "$job.dataset.status==='completed' && $job.querySelector('.bt-job-percent').textContent==='100%' && $ring.dataset.status==='completed'")
+                "$job.dataset.status==='completed' && $job.querySelector('.bt-job-percent').textContent==='Completed · 100%' && $ring.dataset.status==='completed'")
             # Verification also travels through the real tool, then is read
             # from its rendered output. No server/worker internals as oracle.
             code = """
@@ -149,9 +149,11 @@
             @test TK.wait_for(server, "only selected files arrived",
                 shows("verify-batch-$direction", "BATCH VERIFIED $direction"); timeout = 120)
         end
+        @test TK.wait_for(server, "successful transfers leave the progress area",
+            "$job.hidden && $ring.hidden"; timeout = 10)
         TK.reload!(server)
-        @test TK.wait_for(server, "sync completion survives reload",
-            "$job?.dataset.status==='completed' && $ring?.dataset.status==='completed'"; timeout = 30)
+        @test TK.wait_for(server, "old successful transfers stay hidden after reload",
+            "!!$VP?.querySelector('.bt-text-input') && $job?.hidden && $ring?.hidden"; timeout = 30)
 
         # Pull failures use the same visible error path and permission switch.
         for (id, args, expected) in (

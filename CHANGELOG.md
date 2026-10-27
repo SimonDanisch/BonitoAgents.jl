@@ -72,6 +72,9 @@ live.
   streams folders between workers through the link. Use `direction="pull"`
   to retrieve results or `paths` to batch selected files and recursive folders
   in one call. Transfers automatically report progress in the chat and sidebar.
+- Successful progress jobs show “Completed”, then clear from the chat and
+  sidebar after five seconds and stay hidden after reload. Running jobs at
+  100% remain visible until completion is confirmed; failures wait for dismissal.
 - Peer coordination uses `bt_chat` and a separate **Chat messaging** switch,
   off by default in both chats. Dev mode never grants messaging. The server
   immediately enforces permission revocation, including stale dev-tool calls;

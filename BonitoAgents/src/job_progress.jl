@@ -233,7 +233,10 @@ function job_progress_view(session, book; icon=false)
     data = map(identity,session,book.changed)
     Bonito.onload(session,node,js"""el => {
         const data = $(data), icon = $(icon), dismiss = $(dismiss);
-        let selected = null;
+        let selected = null, expiry = null;
+        // Expiry uses server time, including after reload, even if the phone's
+        // clock differs. Never expire running, paused or failed jobs.
+        const clockOffset = $(time())*1000-Date.now();
         if (icon) {
             const ns='http://www.w3.org/2000/svg';
             const svg=document.createElementNS(ns,'svg');
@@ -250,15 +253,27 @@ function job_progress_view(session, book; icon=false)
         }
         const active = j => ['running','paused','failed'].includes(j.status);
         const render = value => {
-            const jobs=Object.values(value).filter(j=>!j.dismissed).sort((a,b)=>
+            clearTimeout(expiry);
+            const now=(Date.now()+clockOffset)/1000;
+            const jobs=Object.values(value).filter(j=>!j.dismissed &&
+                (j.status!=='completed' || now<j.updated_at+5)).sort((a,b)=>
                 Number(active(b))-Number(active(a)) || Number(b.primary)-Number(a.primary) ||
                 (active(a) ? a.started_at-b.started_at : b.updated_at-a.updated_at));
+            const deadlines=jobs.filter(j=>j.status==='completed').map(j=>j.updated_at+5);
+            if (deadlines.length) expiry=setTimeout(()=>{
+                if(el.isConnected) render(data.value);
+            },Math.max(1,(Math.min(...deadlines)-now)*1000));
             selected=jobs[0] || null;
             el.hidden=!selected;
-            if (!selected) return;
+            if (!selected) {
+                delete el.dataset.jobId; delete el.dataset.status; delete el.dataset.indeterminate;
+                return;
+            }
             const j=selected, known=j.total!==null, fraction=known ? Math.min(1,j.completed/j.total) : null;
             const offline=['running','paused'].includes(j.status) && (!j.connected || j.worker_online===false);
-            const percent=known ? Math.floor(fraction*100)+'%' :
+            const measured=known ? Math.floor(fraction*100)+'%' : null;
+            const percent=j.status==='completed' ? 'Completed'+(known ? ' · '+measured : '') :
+                j.status==='running' && fraction===1 ? measured+' · finishing' : measured ||
                 ({completed:'Done',paused:'Paused',failed:'Failed',cancelled:'Stopped',closed:'Ended'})[j.status] || '…';
             const label=j.label || 'Job progress';
             el.dataset.jobId=j.id; el.dataset.status=offline ? 'offline' : j.status;
