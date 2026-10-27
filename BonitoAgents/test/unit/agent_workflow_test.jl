@@ -14,6 +14,8 @@
     @test occursin("[source](./src/app.jl)", briefing)
     @test occursin("BonitoProgress.progress", briefing)
     @test occursin("bt_julia_wait", briefing)
+    @test occursin("bt_sync_folder", briefing)
+    @test occursin("direction=\"pull\"", briefing)
 
     # The standard MCP handshake and the discoverable tool carry the same
     # current chat briefing, without any provider-specific session metadata.

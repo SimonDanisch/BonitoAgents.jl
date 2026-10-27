@@ -183,7 +183,7 @@ jsonable(x) = string(x)
 # allow-list because it is the one request/reply path an MCP process has.
 # `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
 const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console, :wait_input,
-                          :remote_eval, :remote_workers, :sync_folder, :share,
+                          :remote_eval, :remote_workers, :sync_folder, :sync_folder_v2, :share,
                           :app_tools, :app_call, :managed_process)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,

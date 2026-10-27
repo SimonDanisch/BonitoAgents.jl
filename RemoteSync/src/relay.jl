@@ -1,6 +1,6 @@
 # Copy one logical frame without assembling its entire payload. In particular,
 # an old peer's whole-file DELTA may arrive across hundreds of WS messages.
-function relay_frame(source::IO, destination::IO, buffer::Vector{UInt8})
+function relay_frame(source::IO, destination::IO, buffer::Vector{UInt8}; on_progress = nothing)
     tag = read(source, UInt8)
     size = Int(ltoh(read(source, UInt32)))
     size <= MAX_FRAME_BYTES || error("RemoteSync: oversized relayed frame")
@@ -13,6 +13,7 @@ function relay_frame(source::IO, destination::IO, buffer::Vector{UInt8})
         write(destination, view(buffer, 1:n))
         flush(destination)
         remaining -= n
+        notify_progress(on_progress, :file_chunk, (bytes = n,))
     end
     flush(destination)
     return tag
@@ -40,26 +41,42 @@ function relay_directory(source::IO, destination::IO; on_progress = nothing)
     plan, receiver_streaming = decode_plan(payload; with_features = true)
     streaming = sender_streaming && receiver_streaming
     write_frame(source, tag, payload)
-    work = count(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
+    entries = filter(p -> p.action == ACTION_FULL || p.action == ACTION_PATCH, plan)
+    work = length(entries)
     notify_progress(on_progress, :plan_received, (planned = length(plan), work))
     buffer = Vector{UInt8}(undef, DIRECTORY_CHUNK_BYTES)
     if streaming
+        idx = 1
+        starting = true
         while true
-            tag = relay_frame(source, destination, buffer)
+            if starting && idx <= work
+                notify_progress(on_progress, :file_start, (rel = entries[idx].rel, idx, total = work))
+                starting = false
+            end
+            tag = relay_frame(source, destination, buffer; on_progress)
             tag == TAG_DONE && break
             tag in (TAG_LITERAL, TAG_STREAM, TAG_DATA, TAG_END) ||
                 error("RemoteSync relay: unexpected streaming frame $tag")
+            if tag == TAG_LITERAL || tag == TAG_END
+                idx <= work || error("RemoteSync relay: too many files")
+                notify_progress(on_progress, :file_done, (rel = entries[idx].rel, idx, total = work))
+                idx += 1
+                starting = true
+            end
         end
+        idx == work + 1 || error("RemoteSync relay: incomplete transfer")
         tag, payload = read_frame(destination)
         tag == TAG_OK || error("RemoteSync relay: missing final acknowledgement")
         write_frame(source, tag, payload)
     else
-        for _ in 1:work
-            relay_frame(source, destination, buffer) == TAG_DELTA ||
+        for (idx, entry) in pairs(entries)
+            notify_progress(on_progress, :file_start, (rel = entry.rel, idx, total = work))
+            relay_frame(source, destination, buffer; on_progress) == TAG_DELTA ||
                 error("RemoteSync relay: expected DELTA")
             tag, payload = read_frame(destination)
             tag == TAG_OK || error("RemoteSync relay: missing file acknowledgement")
             write_frame(source, tag, payload)
+            notify_progress(on_progress, :file_done, (rel = entry.rel, idx, total = work))
         end
         relay_frame(source, destination, buffer) == TAG_DONE ||
             error("RemoteSync relay: expected DONE")

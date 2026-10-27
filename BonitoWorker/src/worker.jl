@@ -229,7 +229,7 @@ function hello(w::Worker)
         # The requests this worker knows beyond the original set: the server
         # sends a request only to a worker that lists it, so an older one is
         # skipped instead of waited on (it ignores an unknown request unanswered).
-        "capabilities"  => ["kill_processes", "watch_file", "managed_process"],
+        "capabilities"  => ["kill_processes", "watch_file", "managed_process", "sync_paths"],
     )
 end
 
@@ -608,7 +608,7 @@ function run_transfer(ch::WorkerLink.LinkChannel, header::AbstractDict)
             src = String(header["src_path"])
             isdir(src) || error("src_path is not a directory: $src")
             channel_ready(ch)
-            RemoteSync.send_directory(src, wsio)
+            RemoteSync.send_directory(src, wsio; paths = get(header, "paths", nothing))
         elseif direction == "file_from_worker"
             src = String(header["src_path"])
             isfile(src) || error("src_path is not a file: $src")

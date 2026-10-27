@@ -46,13 +46,37 @@ function safe_rel(root::AbstractString, rel::AbstractString)
 end
 
 """
-    walk_directory(root) → Vector{ManifestEntry}
+    walk_directory(root; paths = nothing) → Vector{ManifestEntry}
 
 Walk `root` and produce a stable, sorted manifest. No directories are
 excluded; the project tree mirrors verbatim. Paths in the manifest use
 forward slashes regardless of the host OS so the wire protocol is portable.
+With `paths`, include only those files or recursive subfolders relative to
+`root`. Missing or escaping paths are errors; overlapping selections are deduplicated.
 """
-function walk_directory(root::AbstractString)
+function walk_directory(root::AbstractString; paths = nothing)
+    if paths !== nothing
+        paths isa AbstractVector && !isempty(paths) && all(p -> p isa AbstractString, paths) ||
+            throw(ArgumentError("paths must be a nonempty list of relative file or folder paths"))
+        entries = Dict{String,ManifestEntry}()
+        for path in paths
+            rel = safe_rel(root, path)
+            rel === nothing && throw(ArgumentError("path must stay inside the source folder: $(repr(path))"))
+            full = joinpath(root, rel)
+            if isfile(full)
+                st = stat(full)
+                entries[rel] = ManifestEntry(rel, UInt64(st.size), Float64(st.mtime))
+            elseif isdir(full)
+                for entry in walk_directory(full)
+                    nested = safe_rel(root, joinpath(rel, entry.rel))::String
+                    entries[nested] = ManifestEntry(nested, entry.size, entry.mtime)
+                end
+            else
+                throw(ArgumentError("source path does not exist: $(repr(path))"))
+            end
+        end
+        return sort!(collect(values(entries)); by = e -> e.rel)
+    end
     out = ManifestEntry[]
     isdir(root) || return out
     for (dir, dirs, files) in walkdir(root; topdown = true)
@@ -137,22 +161,23 @@ end
 
 # ── Public: sender side ────────────────────────────────────────────────────
 """
-    send_directory(root, transport::IO; on_progress = nothing, streaming = true)
+    send_directory(root, transport::IO; paths = nothing, on_progress = nothing, streaming = true)
 
 Send `root` over `transport`. The receiver on the other end of `transport`
 must be running `receive_directory`. Updated peers stream bounded chunks and
 acknowledge completion once per transfer. Older peers automatically use the
 legacy protocol; `streaming=false` forces it for diagnostics. Returns when
-the transfer completes.
+the transfer completes. `paths` selects files or recursive subfolders relative
+to `root`; omit it to send the whole folder. Relative structure is preserved.
 
 `on_progress` is an optional callback `(stage::Symbol, info::NamedTuple) -> Any`
 invoked at: `:walk_done`, `:plan_received`, `:file_start`, `:file_done`,
 `:transfer_done`. Useful for driving a UI progress bar without polling.
 """
 function send_directory(root::AbstractString, transport::IO;
-                        on_progress = nothing, streaming::Bool = true)
+                        paths = nothing, on_progress = nothing, streaming::Bool = true)
     notify_progress(on_progress, :walk_start, (root = root,))
-    manifest = walk_directory(root)
+    manifest = walk_directory(root; paths)
     notify_progress(on_progress, :walk_done, (count = length(manifest),))
 
     write_frame(transport, TAG_MANIFEST, encode_manifest(manifest; streaming))

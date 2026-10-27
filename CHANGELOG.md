@@ -69,7 +69,9 @@ live.
 - Run Julia on another worker from the same chat (`bt_julia_eval(...; worker =
   "name")`), switched on per chat by an admin with **Remote julia**.
 - `remote_session` moves Julia values between machines; `bt_sync_folder`
-  streams folders between workers through the link.
+  streams folders between workers through the link. Use `direction="pull"`
+  to retrieve results or `paths` to batch selected files and recursive folders
+  in one call. Transfers automatically report progress in the chat and sidebar.
 - **Continue on** another worker: a new chat there with the project's files and
   the agent's own record of the conversation.
 - A worker that crashed mid-turn tells exactly the chats it cut off to carry on

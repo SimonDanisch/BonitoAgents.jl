@@ -17,6 +17,18 @@ creates a link for other people; ordinary file links are workspace navigation,
 not public shares. Return a Bonito app or a plot from `bt_julia_eval` to show a
 live result; no separate display tool is needed.
 
+Copy folders between workers with `bt_sync_folder(src, worker; dst, direction)`.
+The default `direction="push"` sends src here to dst on worker. Use
+`direction="pull"` to copy src on worker into dst here, for example results
+from Desktop. Transfers use the server's existing connections; no custom
+sockets or separate chat are needed. Both directions require this chat's
+Remote julia switch. Destination-only files are preserved.
+Batch transfers: a folder is recursive, so use one call for a whole tree.
+For a selection, set src to the common root and pass
+`paths=["report.csv", "renders", "logs/run.log"]`; relative structure is kept.
+Do not loop over files or repeatedly sync an unchanged folder. Transfer progress
+appears automatically in the chat and sidebar; no extra bt_progress calls needed.
+
 ## Measurable progress
 For long jobs such as renders, tests or batches, report actual completed work
 with `bt_progress`: start once with a stable job id, update completed/total,

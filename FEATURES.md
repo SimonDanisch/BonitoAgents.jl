@@ -212,8 +212,11 @@ enumerates.
   chat gets the full value over the bridge.
 - `bt_show`: render worker-side files (images, video, text, notebooks, 3D
   geometry) into the chat, through the same renderers the file viewer uses.
-- `bt_sync_folder`: copy a folder to another worker (through the server's
-  mirror, so a second call moves only what changed).
+- `bt_sync_folder`: push a folder to another worker, or retrieve one with
+  `direction="pull"`, through the server's existing connections. Optional
+  `paths` batches selected files and recursive subfolders in one call. Repeated
+  calls transfer only changes and preserve destination-only files. Transfers
+  report progress automatically in the chat and sidebar.
 - `bt_share`: a link anyone can open while the worker is online: a markdown
   file as a page with its images and videos, or a Julia file's Bonito app, live
   from a share host on the worker. Optional password; listed and ended in

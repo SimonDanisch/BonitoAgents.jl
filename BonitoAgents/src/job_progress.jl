@@ -130,6 +130,56 @@ function progress_disconnected!(book, connection)
     return nothing
 end
 
+# Tool-driven sync uses the same durable job snapshots as worker computations.
+# File counts measure the chosen manifest; byte counts are actual relayed data
+# (including deltas), never a guessed fraction of the source's logical size.
+function sync_job_progress(state, pid, worker, label)
+    book = job_book(state, pid)
+    generation = string(uuid4())
+    frame = Dict{String,Any}("id" => "sync-$generation", "generation" => generation,
+        "seq" => 0, "label" => first(label, 256), "status" => "running", "parent" => "",
+        "unit" => "files", "detail" => "", "completed" => 0, "total" => nothing, "primary" => true)
+    last_sent = 0.0
+    files = 0
+    skipped = 0
+    bytes = 0
+    current_file = ""
+    return function(stage, info)
+        if stage === :phase
+            frame["detail"] = info.msg
+        elseif stage === :manifest_received
+            files = info.count
+            frame["total"] = files > 0 ? files : nothing
+            frame["detail"] = "Planning $files files"
+        elseif stage === :plan_received
+            skipped = files - info.work
+            frame["completed"] = skipped
+        elseif stage === :file_start
+            current_file = info.rel
+        elseif stage === :file_chunk
+            bytes += info.bytes
+        elseif stage === :file_done
+            frame["completed"] = skipped + info.idx
+        elseif stage === :transfer_done
+            frame["detail"] = "Confirming destination writes"
+        elseif stage in (:completed, :failed, :cancelled)
+            frame["status"] = String(stage)
+            frame["detail"] = info.msg
+        else
+            return nothing
+        end
+        if stage in (:file_start, :file_chunk, :file_done)
+            frame["detail"] = first("$current_file · $(Base.format_bytes(bytes)) transferred", 4096)
+        end
+        now = time()
+        frame["status"] == "running" && now - last_sent < 0.2 && return nothing
+        last_sent = now
+        frame["seq"] += 1
+        job_update!(book, frame, worker, "server-sync-$generation")
+        return nothing
+    end
+end
+
 function serve_progress_channel(state, channel, pid, worker)
     book = job_book(state,pid)
     connection = string(uuid4())

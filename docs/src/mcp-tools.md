@@ -295,7 +295,7 @@ the context window.
 
 ```
 bt_julia_eval(code; worker = "MacBook", env_path?, timeout?, …)
-bt_sync_folder(src, worker; dst?)
+bt_sync_folder(src, worker; dst?, direction="push", paths?)
 ```
 
 Every eval-family tool takes a `worker`: the display name of another online
@@ -318,10 +318,42 @@ While it is off a call with `worker` fails and tells the agent where the switch
 is. `bt_julia_list_sessions` lists the other workers (and their live sessions)
 so the agent can find the names.
 
-The other machine has its own filesystem: `bt_sync_folder` copies a folder from
-the chat's worker to the target (through the server's mirror, so a second call
-only moves what changed): the project, its `Project.toml`/`Manifest.toml`, the
-data. It needs the same switch.
+The other machine has its own filesystem. `bt_sync_folder` streams folders
+through the server's existing worker connections, transferring only changes
+and preserving destination-only files. It needs the same switch.
+
+- `direction="push"` (default): `src` is on this chat's worker; `dst` is on `worker`.
+- `direction="pull"`: `src` is on `worker`; `dst` is on this chat's worker.
+
+Both paths are absolute; omitted `dst` defaults to the same path as `src`.
+For example, retrieve results from Desktop into this chat's worker:
+
+```julia
+bt_sync_folder(src="/data/results", worker="Desktop",
+               dst="/work/results", direction="pull")
+```
+
+No direct sockets, SSH setup or second chat are needed. Remote Julia evals
+do not change this tool's source: direction is relative to the chat's worker.
+
+Folders are recursive: use **one call for the whole tree**, rather than one
+call per file. For a selected batch, set `src` to a common root and pass relative
+files or subfolders in `paths`. Subfolders are recursive, overlapping selections
+are deduplicated, and destination paths retain their structure:
+
+```julia
+bt_sync_folder(src="/data/results", worker="Desktop", dst="/work/results",
+               direction="pull", paths=["summary.csv", "frames", "logs/render.log"])
+```
+
+Omit `paths` for the whole folder. Paths are literal (no glob expansion); missing
+or escaping paths fail. Update the server for pull/batch support and the source
+worker for selections. Older versions refuse the new operations instead of
+accidentally pushing in the wrong direction or sending the entire folder.
+Every transfer automatically reports measured file counts and transferred bytes
+through the existing chat progress bar and sidebar indicator. Completion is shown
+after the destination confirms its writes; failures remain visible. No separate
+`bt_progress` call or repeated sync polling is needed.
 
 ### Julia values between machines
 
