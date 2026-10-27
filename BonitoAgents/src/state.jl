@@ -196,6 +196,11 @@ mutable struct ProjectInfo
     # (`chat_pane`), and its agent gets the app's own tools. Persisted, and never
     # derived from the folder, for the same reason as `dev_mode`.
     app::String
+    # Which of the app's chats this is: "" for the app's own chat, else a key the
+    # app chose when it started the chat (`start_chat!(...; app, key)`), e.g.
+    # "project/2026-11-black-hole". The app's pane and briefing see it
+    # (`chat_key`), so one app can lay out many chats. Persisted with `app`.
+    app_key::String
     # Searchable file index (worker-derived, runtime-only). See ProjectFileIndex.
     file_index::ProjectFileIndex
 end
@@ -217,6 +222,7 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 false,                   # dev_mode
                 false,                   # remote_eval
                 "",                      # app
+                "",                      # app_key
                 ProjectFileIndex())      # file_index
 
 # Short positional form for tests and fixtures that build a WorkerInfo by hand:
@@ -1564,6 +1570,7 @@ function save_projects!(s::ServerState)
                      "dev_mode"      => p.dev_mode,
                      "remote_eval"   => p.remote_eval,
                      "app"           => p.app,
+                     "app_key"       => p.app_key,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
         atomic_write_json(projects_file(s), data)
@@ -1613,6 +1620,8 @@ function load_projects!(s::ServerState)
             p.remote_eval = get(d, "remote_eval", false) === true
             app = get(d, "app", "")
             p.app = app isa AbstractString ? String(app) : ""
+            key = get(d, "app_key", "")
+            p.app_key = key isa AbstractString ? String(key) : ""
             dc = get(d, "desired_config", nothing)
             if dc isa AbstractDict
                 for (k, v) in dc

@@ -332,6 +332,7 @@ function project_report(p::ProjectInfo)
         "remote_eval"       => p.remote_eval,
         # The app this chat belongs to (apps.jl), "" for an ordinary chat.
         "app"               => p.app,
+        "app_key"           => p.app_key,
         "locked_by"         => jsonable(p.locked_by),
         "desired_config"    => jsonable(p.desired_config),
         "file_index"        => Dict{String,Any}("files" => nfiles,

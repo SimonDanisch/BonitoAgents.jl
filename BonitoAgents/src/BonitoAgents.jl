@@ -104,14 +104,14 @@ export MeshViewer, media_element
 # The app interface (apps.jl): what an app implements, the chat widgets its pane
 # is built from, and what it can do with the server. An app package uses these
 # names and nothing else.
-public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, in_scope,
+public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, AppKeyedChats, in_scope,
        AppCall, AppError,
        app_id, app_title, app_description, app_icon, app_tools, call_tool, chat_pane, app_briefing,
        app_allowed,
        ChatHeader, ChatNotice, ChatTranscript, ChatComposer, ChatToolbar,
        ServerState, ProjectInfo, WorkerInfo, User, ChatFolder,
        caller_user, app_chat, chat_title, chat_folders, find_worker, start_chat!,
-       show_chat!, send_message!,
+       chat_key, chat_file_url, show_chat!, send_message!,
        atomic_write_json, load_json_tolerant, relative_time_label,
        BUILTIN_APPS
 

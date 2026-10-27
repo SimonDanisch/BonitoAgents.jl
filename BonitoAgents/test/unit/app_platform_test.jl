@@ -12,7 +12,7 @@
     # An app package, as small as one gets. Everything it touches is public.
     module NotesPkg
         import BonitoAgents
-        using BonitoAgents: AgentApp, AppContext, AppTool, Param, ToolScope, AppCall, AppError,
+        using BonitoAgents: AgentApp, AppContext, AppTool, Param, ToolScope, AppKeyedChats, AppCall, AppError,
                             ProjectInfo, atomic_write_json, load_json_tolerant
         using Bonito: Observable
 
@@ -34,6 +34,7 @@
                     (text = Param(String, "The note."), times = Param(Int, "How often.", 1),
                      weight = Param(Float64, "How much.", 1.0), loud = Param(Bool, "Shout?", false))),
             AppTool(:notes_clear, "Clear them.", (;); scope = NotesFolders()),
+            AppTool(:notes_item, "Which item this chat is for.", (;); scope = AppKeyedChats("item/")),
         ]
         function BonitoAgents.call_tool(app::NotesApp, ::Val{:notes_add}, call::AppCall)
             (; text, times, weight, loud) = call.args
@@ -45,6 +46,9 @@
         end
         BonitoAgents.call_tool(app::NotesApp, ::Val{:notes_clear}, ::AppCall) =
             (app.notes[] = String[]; "cleared")
+        BonitoAgents.call_tool(::NotesApp, ::Val{:notes_item}, call::AppCall) = "for " * call.caller.app_key
+        BonitoAgents.app_briefing(::NotesApp) = "the notes app"
+        BonitoAgents.app_briefing(::NotesApp, key::AbstractString) = isempty(key) ? "the notes app" : "notes for $key"
     end
 
     # An app whose logo isn't there.
@@ -138,6 +142,40 @@
         call("c1", "notes_add"; text = "kept")
         again = BT.ServerState(; state_dir, working_dir = mktempdir(), apps = (NotesPkg.NotesApp,))
         @test again.apps["notes"].notes[] == ["kept x1 w1.0 by c1"]
+    end
+
+    # Besides its own chat, an app starts chats of its own with a key: they get
+    # its pane, its briefing for that key and the tools scoped to keyed chats,
+    # but they are not "the app's chat".
+    @testset "keyed chats" begin
+        app = server.apps["notes"]
+        own = BT.add_project!(server, BT.ProjectInfo("c3", "notes-app", "w", mktempdir(), "/home/u/p/notes-app", now(UTC)))
+        own.app = "notes"
+        item = BT.add_project!(server, BT.ProjectInfo("c4", "item", "w", mktempdir(), "/home/u/p/item-1", now(UTC) + Second(1)))
+        item.app = "notes"; item.app_key = "item/1"
+        other = BT.add_project!(server, BT.ProjectInfo("c5", "x", "w", mktempdir(), "/home/u/p/x", now(UTC) + Second(2)))
+        other.app = "notes"; other.app_key = "draft/7"
+        # the newest chat without a key is the app's chat, however new a keyed one is
+        @test BT.app_chat(server, app).id == "c3"
+        # scopes: the app's chat, and the keyed chats by prefix
+        @test BT.in_scope(BT.AppChat(), app, own) && !BT.in_scope(BT.AppChat(), app, item)
+        @test BT.in_scope(BT.AppKeyedChats("item/"), app, item)
+        @test !BT.in_scope(BT.AppKeyedChats("item/"), app, other) && !BT.in_scope(BT.AppKeyedChats(), app, own)
+        @test "notes_item" in tools("c4") && !("notes_item" in tools("c5")) && !("notes_item" in tools("c3"))
+        @test text(call("c4", "notes_item")) == "for item/1"
+        # the briefing for each, through the system prompt
+        @test BT.app_prompt_appendix(server, own) == "the notes app"
+        @test BT.app_prompt_appendix(server, item) == "notes for item/1"
+        # the app's chat is pinned; its keyed chats sort like any other
+        @test BT.sidebar_group(own, :other) === :app
+        @test BT.sidebar_group(item, :active) === :active
+        # an app's chat needs a key: "" is its own
+        user = BT.User("u", "", "u", ["admins"])
+        @test_throws BT.AppError BT.start_chat!(server, user, server.workers[]["w"], "/home/u/p/y"; app, key = " ")
+        # the key is saved with the chat
+        lock(() -> BT.save_projects!(server), server.lock)
+        again = BT.ServerState(; state_dir, working_dir = mktempdir(), apps = (NotesPkg.NotesApp,))
+        @test again.projects[]["c4"].app_key == "item/1" && again.projects[]["c3"].app_key == ""
     end
 
     @testset "chat_pane: one node or several" begin
