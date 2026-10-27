@@ -1664,7 +1664,7 @@ class BonitoChat {
         }
         map[w] = h;
         node.__btBodyH = map;
-        const pics = body.querySelectorAll('.bt-media-wrap');
+        const pics = body.querySelectorAll('.bt-media');
         const extra = pics.length === 1 ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
         node.__btMediaExtra = extra;
         this.comm.notify({
@@ -2529,7 +2529,7 @@ class BonitoChat {
         return false;
     }
     applyNative(node) {
-        node.classList.add('bt-tool-native');
+        node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
@@ -2537,7 +2537,7 @@ class BonitoChat {
         }
     }
     removeNative(node) {
-        node.classList.remove('bt-tool-native');
+        node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);
     }
@@ -2731,8 +2731,7 @@ class BonitoChat {
                     });
                     if (msg.show_mime) div.dataset.showMime = msg.show_mime;
                     if (this.wantsNative(div)) {
-                        div.classList.add('bt-tool-native');
-                        div.dataset.btAutoExpand = '1';
+                        this.applyNative(div);
                     } else if (msg.expand || msg.expand_full) {
                         if (div.collapsable.editMode) {
                             div.dataset.btAutoMount = '1';

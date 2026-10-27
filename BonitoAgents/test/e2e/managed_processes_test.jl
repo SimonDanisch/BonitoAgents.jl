@@ -28,7 +28,8 @@
             target = card(id)
             return """(() => {
                 const c = $target; if (!c) return false;
-                if (!c.dataset.processTestOpen) { c.dataset.processTestOpen='1'; c.querySelector('.bt-tool-header').click(); }
+                const header=c.querySelector('.bt-tool-header');
+                if (header.dataset.expanded!=='true') { header.click(); return false; }
                 return c.innerText.includes($(repr(text)));
             })()"""
         end
@@ -48,7 +49,8 @@
             @test TK.wait_for(s,"reconnect retains the same managed job",
                 "!!$(task()) && $(task()).dataset.processStatus === 'running' && !$(task()).textContent.includes('worker disconnected')";timeout=30)
             TK.send_message(s,"wait managed")
-            @test TK.wait_for(s,"bounded wait returns without ending the job",result_says("process-wait","timeout");timeout=30)
+            @test TK.wait_for(s,"bounded wait returns without ending the job",result_says("process-wait","timeout");
+                timeout=30,describe=card("process-wait") * "?.innerText")
             @test TK.eval_js(s,"$(task()).dataset.processStatus") == "running"
             TK.eval_js(s,"$(task()).querySelector('.bt-taskbar-slot-stop').click(); true")
             @test TK.wait_for(s,"uncooperative interrupt stays visible",

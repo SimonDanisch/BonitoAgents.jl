@@ -1922,7 +1922,7 @@ class BonitoChat {
         map[w] = h;
         node.__btBodyH = map;
         // Of that, what is not its one picture (`bodyReserve`).
-        const pics = body.querySelectorAll('.bt-media-wrap');
+        const pics = body.querySelectorAll('.bt-media');
         const extra = pics.length === 1
             ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
         node.__btMediaExtra = extra;
@@ -3147,7 +3147,9 @@ class BonitoChat {
     }
 
     applyNative(node) {
-        node.classList.add('bt-tool-native');
+        // The body will supply the shared file toolbar. Hide the tool header
+        // before its loading placeholder is laid out, not after that RPC.
+        node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
@@ -3158,7 +3160,7 @@ class BonitoChat {
     }
 
     removeNative(node) {
-        node.classList.remove('bt-tool-native');
+        node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
     }
@@ -3423,8 +3425,7 @@ class BonitoChat {
                 if (this.wantsNative(div)) {
                     // Native display: chrome off + body auto-mounted on
                     // first insertion.
-                    div.classList.add('bt-tool-native');
-                    div.dataset.btAutoExpand = '1';
+                    this.applyNative(div);
                 } else if (msg.expand || msg.expand_full) {
                     // Auto-expand (bt_show refs, eval eager-mount /
                     // expand_full) — DEFERRED until the node first enters the

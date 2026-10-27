@@ -50,7 +50,8 @@
             # Only the relay's addresses and a grant: no server URL, no secret.
             @test sort([k for k in keys(env) if startswith(k, "BONITOAGENTS_")]) ==
                   ["BONITOAGENTS_CONTROL_TOKEN", "BONITOAGENTS_CONTROL_URL",
-                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN", "BONITOAGENTS_PROJECT_ID",
+                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN",
+                   "BONITOAGENTS_PROGRESS_ADDR", "BONITOAGENTS_PROGRESS_TOKEN", "BONITOAGENTS_PROJECT_ID",
                    "BONITOAGENTS_VALUES_ADDR"]
             proc[] = open(detach(Cmd(Cmd(String[entry["command"]; entry["args"]]); env)), "r+")
             request(1, "initialize", Dict("protocolVersion" => "2025-06-18", "capabilities" => Dict(),
@@ -92,11 +93,12 @@
             @test inspected["isError"] === false
             @test occursin(p.id, only(inspected["content"])["text"])
             # Revoking an owner's grants leaves everyone else's.
-            BW.mcp_relay_env(relay, p.id; owner = "agent-2")
-            @test length(relay.grants) == 4          # a control and an eval token each
+            replacement_env = BW.mcp_relay_env(relay, p.id; owner = "agent-2")
+            @test length(relay.grants) == 5 # control/eval per agent, telemetry per chat
+            @test replacement_env["BONITOAGENTS_PROGRESS_TOKEN"] == env["BONITOAGENTS_PROGRESS_TOKEN"]
             BW.revoke_mcp_grants!(relay, "agent-2")
             @test sort([(g.owner, g.kind) for g in values(relay.grants)]) ==
-                  [("agent-1", "eval"), ("agent-1", "mcp")]
+                  [("agent-1", "eval"), ("agent-1", "mcp"), ("progress:" * p.id, "progress")]
             # Only a token we handed out gets a channel: an unrelated local
             # process cannot claim a chat. The relay hangs up on it, and the
             # server still knows exactly the one MCP channel.

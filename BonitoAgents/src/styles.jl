@@ -3298,6 +3298,9 @@ const ChatStyles = Bonito.Styles(
     CSS(".bt-tool-native .bt-tool-header",
         "background" => "none", "border" => "none", "min-height" => "0",
         "padding" => "0 0 var(--bw-space-1) 0", "pointer-events" => "none"),
+    # This must be in the initial chat sheet, before the lazy body (and its
+    # FileToolbarStyles) arrives, or every restored picture loses a header row.
+    CSS(".bt-tool-native.bt-output-framed > .bt-tool-header", "display"=>"none"),
     CSS(".bt-tool-native .bt-tool-header > :not(.bt-tool-title):not(.bt-tool-summary)",
         "display" => "none"),
     CSS(".bt-tool-native .bt-tool-title.bt-path-link", "pointer-events" => "auto"),

@@ -50,10 +50,13 @@
     # entering and leaving the sidebar, which a scripted cursor never does.
     ctx = s.browser[]
     function mouse_to(js)
+        # Navigation restores the sidebar before the lazily mounted chat pane.
+        TK.wait_for(s, "chat ready for pointer input",
+            "!!document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages')"; timeout = 30)
         x, y = round.(Int, TK.eval_js(s, js))
         ECT.send_input(ctx, "{type: 'mouseMove', x: $(x), y: $(y)}")
     end
-    away = "(() => { const r = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
+    away = "(() => { const r = document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
     over = "(() => { const r = $(row(a)).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
     mouse_to(away)
 

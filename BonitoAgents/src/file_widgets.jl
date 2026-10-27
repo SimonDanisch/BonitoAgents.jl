@@ -34,7 +34,6 @@ const FILE_TOOLBAR_CSS = [
     CSS(".bt-file-toolbar .bt-share-control", "margin"=>"0", "flex-wrap"=>"nowrap"),
     CSS(".bt-file-toolbar .bt-media-actions", "position"=>"static", "opacity"=>"1", "transition"=>"none"),
     CSS(".bt-file-toolbar .bw-menu-list", "text-align"=>"left"),
-    CSS(".bt-tool-native.bt-output-framed > .bt-tool-header", "display"=>"none"),
     CSS(".bt-output-card", "border"=>"1px solid var(--bw-border)", "border-radius"=>"var(--bw-radius)",
         "background"=>"var(--bw-bg-panel)", "min-width"=>"0"),
     CSS(".bt-output-card .bt-file-toolbar", "border-radius"=>"var(--bw-radius) var(--bw-radius) 0 0"),
