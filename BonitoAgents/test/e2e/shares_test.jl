@@ -115,6 +115,10 @@
             "!!document.querySelector('$(panel) .bt-share-result') && " *
             "!!document.querySelector('$(panel) .bt-fv-seg[data-active=\"1\"]')"; timeout = 60) == true
         TK.eval_js(z, "document.querySelector('$(panel) .bt-share-result').click(); true")
+        @test TK.wait_for(z, "sharing uses the chat progress row and sidebar",
+            "!!$VP.querySelector('.bt-job-progress[data-status=completed]') && " *
+            "!!document.querySelector('.bt-side-active .bt-job-icon[data-status=completed]') && " *
+            "!document.querySelector('.bt-prog-run, .bt-prog-ok')"; timeout=30)
         notes_url = TK.wait_for(z, "the panel names the link",
             "document.querySelector('$(panel) .bt-share-link')?.href || false";
             timeout = 60)

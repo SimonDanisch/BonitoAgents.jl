@@ -18,6 +18,7 @@ mutable struct Job
     acknowledged::Int
     last_error::String
     closed::Bool
+    sink::Union{Nothing,Function}
 end
 
 """
@@ -84,7 +85,7 @@ end
 """
     progress(label; total=nothing, completed=0, id=uuid4(), parent="", primary=true)
 
-Create a job belonging to this chat. Updates are sent in the background and
+Create a job belonging to this chat. Network updates are sent in the background and
 coalesced to at most five per second. Unknown totals use an indeterminate bar.
 `id` identifies the logical job; creating it again starts a new generation.
 
@@ -92,15 +93,21 @@ A job is callable as `(completed, total)`, so a render farm can use
 `renderfarm!(...; progress=job)`. Finish explicitly after validating its result.
 The do-block form finishes on return and reports exceptions as failures:
 `progress("Render frames"; total=100) do job; renderfarm!(...; progress=job); end`.
+
+Hosts running in the server process may pass `sink = snapshot -> ...` to
+consume updates directly. This uses the same job validation and terminal-state
+rules as network reporting; no worker connection is opened for a local sink.
+Local sink callbacks run synchronously; adapters for frequent events should
+coalesce them before publishing updates.
 """
 function progress(label::AbstractString; total=nothing, completed=0, id=string(uuid4()),
-                  parent="", primary=true, unit="", detail="", context=progress_context())
+                  parent="", primary=true, unit="", detail="", context=progress_context(), sink=nothing)
     snapshot = Dict{String,Any}("id"=>checked_text(id,"id"), "generation"=>string(uuid4()), "seq"=>0,
         "label"=>checked_text(label,"label"), "completed"=>0.0, "total"=>nothing, "status"=>"running",
         "parent"=>checked_text(parent,"parent"), "primary"=>Bool(primary),
         "unit"=>checked_text(unit,"unit"), "detail"=>checked_text(detail,"detail";limit=4096))
     job = Job(ReentrantLock(), snapshot, String(context["BONITOAGENTS_PROGRESS_ADDR"]),
-        String(context["BONITOAGENTS_PROGRESS_TOKEN"]), Channel{Nothing}(1), nothing, nothing, 0, "", false)
+        String(context["BONITOAGENTS_PROGRESS_TOKEN"]), Channel{Nothing}(1), nothing, nothing, 0, "", false, sink)
     update!(job,completed; total)
     return job
 end
@@ -145,9 +152,16 @@ function update!(job::Job, completed::Real; total=get(job.snapshot,"total",nothi
         job.snapshot["status"] = String(status)
         label === nothing || (job.snapshot["label"] = String(label))
         detail === nothing || (job.snapshot["detail"] = String(detail))
-        isready(job.wake) || put!(job.wake,nothing)
-        if job.task === nothing && !isempty(job.endpoint) && !isempty(job.token)
-            job.task = Base.errormonitor(@async publish(job))
+        if job.sink !== nothing
+            # In-process hosts report through the same validation and lifecycle
+            # without a network round trip or a second progress implementation.
+            job.sink(copy(job.snapshot))
+            job.acknowledged = job.snapshot["seq"]
+        else
+            isready(job.wake) || put!(job.wake,nothing)
+            if job.task === nothing && !isempty(job.endpoint) && !isempty(job.token)
+                job.task = Base.errormonitor(@async publish(job))
+            end
         end
     end
     return job

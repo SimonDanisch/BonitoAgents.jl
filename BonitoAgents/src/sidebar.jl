@@ -1763,11 +1763,8 @@ function unified_page(state::ServerState, session::Bonito.Session, request)
         DOM.div(; class = "bt-side-backdrop",
                 onclick = js"() => document.querySelector('.bt-sidebar')?.classList.remove('bt-side-open')"),
         stage,
-        # The window's ONE progress card (position:fixed, top-centered).
-        # Every long-running operation and every outcome in this window
-        # reports into `pane.progress` and renders HERE — the dashboard no
-        # longer carries its own pill, and nothing flashes a toast over the
-        # composer any more. See progress.jl::progress_overlay.
+        # Dashboard operations and window-level notices. Chat jobs report
+        # through BonitoProgress and render in the chat's job_progress_view.
         progress_overlay(session, pane.progress),
         # Window-level file-viewer driver: gives every rendered file body its
         # behaviour (image dimensions, table sort, 3D mount) no matter how it

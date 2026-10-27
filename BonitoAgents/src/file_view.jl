@@ -833,7 +833,8 @@ function file_panel_header(session::Session, p::FilePanel)
                     class = "bw-btn bw-btn-sm bt-file-editor-save", type = "button",
                     title = "Write this file on the worker"),)
     status = p.editor === nothing ? Observable("") : p.editor.status
-    share = isempty(p.view.file.project_id) ? () : ShareControl(;hint="Share a link to this file.") do
+    share = isempty(p.view.file.project_id) ? () : ShareControl(;hint="Share a link to this file.",
+        progress=ChatProgress(p.view.file.state, p.view.file.project_id)) do
         share_project_file!(p.view.file.state,p.view.file.project_id,p.worker_path)
     end
     items=Any[fv_action_btn("copy","Copy path","Copy the worker path"),

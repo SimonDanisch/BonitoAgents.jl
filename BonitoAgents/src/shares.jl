@@ -771,7 +771,7 @@ const ShareControlStyles = Bonito.Styles(
 struct ShareControl{F}
     create::F
     hint::String
-    progress::Union{Nothing,Observable}
+    progress::Union{Nothing,ChatProgress}
 end
 ShareControl(create::F; hint::String, progress = nothing) where F = ShareControl(create, hint, progress)
 
@@ -785,21 +785,20 @@ function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
     pending = Ref(false)
     on(session, request) do _
         pending[] && return
-        if progress !== nothing && is_busy_running(progress[])
-            safe_set!(answer, "error:Something else is running in this window. Wait for it to finish.")
-            return
-        end
         pending[] = true
-        progress === nothing || busy_start!(progress, "Sharing result")
+        job = progress === nothing ? nothing : BonitoMCP.BonitoProgress.progress(progress, "Sharing result")
         Base.errormonitor(@async try
             safe_set!(answer, "link:" * control.create())
-            progress === nothing || busy_done!(progress, "Shared link created")
+            job === nothing || BonitoMCP.BonitoProgress.finish!(job; detail="Shared link created")
         catch e
-            e isa InterruptException && rethrow()
+            if e isa InterruptException
+                job === nothing || BonitoMCP.BonitoProgress.cancel!(job)
+                rethrow()
+            end
             detail = sprint(showerror, e)
             @warn "sharing result failed" exception = (e, catch_backtrace())
             safe_set!(answer, "error:" * detail)
-            progress === nothing || busy_fail!(progress, "Could not share result", detail)
+            job === nothing || BonitoMCP.BonitoProgress.fail!(job, detail)
         finally
             pending[] = false
         end)

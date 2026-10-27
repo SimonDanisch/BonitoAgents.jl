@@ -28,14 +28,14 @@ struct PlotPane
     workspace  :: Base.RefValue{Any}
     # `bt_show_app` detach: a tool_id pulse → float (or focus) that embed's panel.
     detach_app  :: Observable{String}
-    # The window's ONE progress/notice channel — a `BusyState` snapshot
+    # Dashboard progress and window-level notices, a `BusyState` snapshot
     # (progress.jl) rendered by the single `progress_overlay` card the shell
-    # mounts. Long-running work (a chat's "continue on worker", the dashboard's
-    # syncs, imports and copies) reports into it with
+    # mounts. The dashboard's syncs, imports and copies report into it with
     # `busy_start!`/`busy_event!`/`busy_done!`/`busy_fail!`; one-line notices go
     # through `show_toast!` / `show_problem!` below. Reachable from chat code via
     # `model.plotpane`, which is how a file that won't open says so instead of
     # opening blank.
+    # Chat jobs use BonitoProgress with ChatProgress, never this observable.
     progress    :: Observable{Any}
     # "Show this project in this window" — a project id pulse that
     # `install_workspace!` forwards to the window's `current_view`. Chat-side

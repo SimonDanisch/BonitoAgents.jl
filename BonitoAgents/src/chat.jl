@@ -2922,7 +2922,7 @@ function eval_result_node(m::JuliaEvalCall, v)
         (ShareControl(; hint = "Share this live result with anyone who has the link. " *
                           "It lasts until the result is closed or its Julia session ends. " *
                           "Manage passwords and end links in Settings.",
-                      progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
+                      progress = ChatProgress(chat.state, chat.project_id)) do
             share_result!(chat.state, chat.project_id, v.payload)
         end,)
     return wrap_for_detach(tool_id(m), DOM.div(FileToolbar("Julia result";actions=controls),
@@ -3148,7 +3148,8 @@ end
 # carry the `.bt-tool-error` the UI/tests key on).
 function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
     controls = isempty(st.project_id) ? () :
-        (ShareControl(; hint="Share this file with anyone who has the link while its worker is online.") do
+        (ShareControl(; hint="Share this file with anyone who has the link while its worker is online.",
+                       progress=ChatProgress(st.state, st.project_id)) do
             share_project_file!(st.state,st.project_id,st.path)
         end,)
     body = try
@@ -7856,6 +7857,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             DOM.div(; class = "bw-menu-sep");
             class = "bt-menu-group")
     end
+    continuing = Ref(false)
     on(session, continue_pick) do wid
         isempty(wid) && return
         continue_pick[] = ""
@@ -7874,25 +7876,30 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             problem("Wait for the current turn to finish, or stop it, before continuing on $(w.name)")
             return
         end
-        # Copying a big project takes a while; it reports into the WINDOW's one
-        # progress card, which stays up for the whole of it and updates in place.
-        prog = pane === nothing ? nothing : pane.progress
-        if prog !== nothing && is_busy_running(prog[])
-            problem("Something else is already running in this window — wait for it to finish")
+        if continuing[]
+            problem("This chat is already being continued on another worker")
             return
         end
-        prog === nothing || busy_start!(prog, "Continuing on $(w.name)")
+        continuing[] = true
+        job = BonitoMCP.BonitoProgress.progress(ChatProgress(state, project_id), "Continuing on $(w.name)"; unit="files")
+        report = sync_job_progress(job)
         Base.errormonitor(@async try
-            new_p = continue_on!(state, p, wid; progress = (stage, info) ->
-                prog === nothing || busy_event!(prog, stage, info))
-            prog === nothing || busy_done!(prog, new_p.resume_session_id === nothing ?
+            new_p = continue_on!(state, p, wid; progress=report)
+            BonitoMCP.BonitoProgress.update!(job, job.snapshot["completed"]; label="New chat on $(w.name)")
+            report(:completed, (msg=new_p.resume_session_id === nothing ?
                 "New chat on $(w.name). The agent starts fresh there; this chat stays as it is." :
-                "New chat on $(w.name), with the agent's memory. This chat stays as it is.")
+                "New chat on $(w.name), with the agent's memory. This chat stays as it is.",))
             pane === nothing || (pane.navigate[] = new_p.id)
         catch e
             bt = catch_backtrace()
             @warn "continue on worker failed" project = p.name target = w.name exception = (e, bt)
-            problem("Could not continue on $(w.name)", error_detail(e, bt))
+            if e isa InterruptException
+                BonitoMCP.BonitoProgress.cancel!(job)
+            else
+                BonitoMCP.BonitoProgress.fail!(job, error_detail(e, bt))
+            end
+        finally
+            continuing[] = false
         end)
     end
 

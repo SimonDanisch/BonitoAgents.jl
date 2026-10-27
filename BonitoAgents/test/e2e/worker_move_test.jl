@@ -60,8 +60,7 @@
     continue_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bt-menu-continue') : [])].map(b => (b.textContent||'').trim()); })()"
     click_continue(name) = "(() => { const p=$VP; const b=[...p.querySelectorAll('.bt-header-menu .bt-menu-continue')]" *
         ".find(x => (x.textContent||'').trim() === $(repr(name))); if(!b) return false; b.click(); return true; })()"
-    card_done(text) = """(() => { const c = document.querySelector('.bt-prog.bt-prog-ok');
-        return !!c && (c.querySelector('.bt-prog-title')?.textContent || '').includes($(repr(text))); })()"""
+    card_done(text) = "[...document.querySelectorAll('.bt-job-icon[data-status=completed]')].some(c=>!c.hidden && c.title.includes($(repr(text))))"
     wait_online(state, name) = begin
         t0 = time()
         while time() - t0 < 30 && !any(w -> w.name == name && w.online[], values(state.workers[]))
@@ -140,20 +139,9 @@
             @test TK.eval_js(server, continue_items) == ["worker-b"]   # never the chat's own worker
             @test TK.eval_js(server, click_continue("worker-b")) == true
 
-            # ONE progress card for the whole of it, ending in DONE (a failure
-            # parks it in `.bt-prog-err`, so "gone" would pass either way).
-            @test TK.eval_js(server, "document.querySelectorAll('.bt-prog').length") == 1
-            @test TK.wait_for(server, "the progress card reports the new chat",
+            @test TK.wait_for(server, "the shared progress indicator reports the new chat",
                 card_done("New chat on worker-b"); timeout = 120) == true
-            # The card's width is fixed: sized to its content, it jumped with every
-            # file path a copy showed. A very long path must not move it.
-            @test TK.eval_js(server, """(() => {
-                const c = document.querySelector('.bt-prog'), m = c.querySelector('.bt-prog-msg');
-                const w = c.offsetWidth, t = m.textContent;
-                m.textContent = '/a/very/long/path/that/goes/on'.repeat(30);
-                const same = c.offsetWidth === w;
-                m.textContent = t;
-                return same; })()""") == true
+            @test TK.eval_js(server, "!document.querySelector('.bt-prog-run, .bt-prog-ok')")
 
             # ── A new chat on B, and the window on it ────────────────────────
             made = new_chats(state, target_id, known)
@@ -266,8 +254,11 @@
             @test TK.wait_for(server, "the menu offers worker A",
                 "$(continue_items).includes($(repr(worker_a.name)))"; timeout = 30) == true
             @test TK.eval_js(server, click_continue(worker_a.name)) == true
+            @test TK.wait_for(server, "failure stays in the shared job row",
+                "!!$VP.querySelector('.bt-job-progress[data-status=failed]')"; timeout=30)
+            TK.eval_js(server, "const j=$VP.querySelector('.bt-job-progress'); if(!j.open) j.querySelector('summary').click(); true")
             @test TK.wait_for(server, "refused, and says why",
-                """(() => { const c = document.querySelector('.bt-prog.bt-prog-err');
+                """(() => { const c = $VP.querySelector('.bt-job-progress[data-status=failed]');
                     return !!c && (c.innerText || '').includes('never synced'); })()"""; timeout = 120) == true
             @test Set(keys(state.projects[])) == known
             @test readdir(target_on_a) == before

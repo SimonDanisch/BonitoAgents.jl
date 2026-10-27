@@ -109,6 +109,13 @@ or test batch can keep reporting while the agent waits or works on something
 else. The chat shows the job, and its sidebar icon shows progress for the
 primary job. Updates change the existing display instead of adding messages.
 
+This is the single progress system for work inside a chat. Built-in file
+transfers, sharing and “Continue on worker” report through the same job API as
+`bt_progress` and `BonitoProgress`. They share one compact progress row and the
+sidebar indicator, including completion, failure, dismissal and reload behavior.
+Adapters may translate events from an operation into job updates; they must not
+create another progress store, bar or percentage calculation.
+
 From any MCP client, use a stable job id and report actual completed units:
 
 ```json

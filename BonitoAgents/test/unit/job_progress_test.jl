@@ -80,6 +80,42 @@
     @test cancelled.snapshot["completed"]==3
 end
 
+@testitem "unit:progress_inprocess" tags=[:unit] begin
+    using BonitoAgents, BonitoMCP
+    B = BonitoAgents
+    P = BonitoMCP.BonitoProgress
+    state = B.ServerState(; state_dir=mktempdir(), working_dir=mktempdir())
+    context = B.ChatProgress(state, "shared-progress", "worker-a")
+    job = P.progress(context, "Sharing result"; id="share", total=4)
+    record() = context.book.changed[]["share"]
+    @test record()["status"] == "running"
+    @test record()["completed"] == 0
+    P.update!(job, 2; detail="Uploading")
+    @test record()["completed"] == 2
+    @test record()["detail"] == "Uploading"
+    @test P.flush_progress(job; timeout=0.1)
+    @test job.task === nothing # in-process work needs no relay task or socket
+    @test_throws ArgumentError P.update!(job, 5)
+    P.finish!(job)
+    @test record()["completed"] == 4
+    @test record()["status"] == "completed"
+    seq = record()["seq"]
+    P.update!(job, 3)
+    P.fail!(job, "late callback")
+    @test record()["seq"] == seq
+    @test record()["status"] == "completed"
+    failed = P.progress(context, "Continue on worker"; id="continue", total=10)
+    P.update!(failed, 3)
+    P.fail!(failed, "Worker disconnected")
+    @test context.book.changed[]["continue"]["status"] == "failed"
+    @test context.book.changed[]["continue"]["completed"] == 3
+    cancelled = P.progress(context, "Cancel sharing"; id="cancel")
+    P.cancel!(cancelled)
+    @test context.book.changed[]["cancel"]["status"] == "cancelled"
+    @test isempty(state.chat_models)
+    @test state.turn_signal[] == 0
+end
+
 @testitem "unit:progress_offline" tags=[:unit] begin
     using BonitoMCP, Sockets
     P=BonitoMCP.BonitoProgress

@@ -60,6 +60,7 @@
                 @test TK.wait_for(server, "transfer progress in chat and sidebar",
                     "!$job.hidden && $job.dataset.status==='running' && !$ring.hidden && $ring.dataset.status==='running'";
                     timeout = 60)
+                @test TK.eval_js(server, "$VP.querySelectorAll('.bt-job-progress').length===1 && !document.querySelector('.bt-prog-run')")
             end
             @test TK.wait_for(server, "sync completed", shows(id, "synced"); timeout = 120)
             @test TK.wait_for(server, "confirmed transfer finishes progress",

@@ -29,15 +29,10 @@ function notify_progress(cb, stage::Symbol, info::NamedTuple)
     return nothing
 end
 
-# ── BusyState — what the window's ONE progress card renders ────────────────
-# A NamedTuple snapshot of the current operation, rendered by
-# `progress_overlay` and by nothing else: there is exactly one of these per
-# window, top-centered, and every long-running operation in the app reports
-# into it. It replaced a second, parallel channel (a 3.2s auto-dismissing
-# toast) that the chat's "continue on worker" used to report into — which is
-# why a move looked like a random popup that flashed the same word over and
-# over: each of the thousands of per-file progress events flashed its own
-# toast for 3.2s instead of updating one line in place.
+# Dashboard operations and window-level notices use this card. Work belonging
+# to a chat MUST use BonitoProgress with ChatProgress (job_progress.jl), which
+# owns the chat row and sidebar indicator. Do not route chat jobs through this
+# window-scoped observable.
 #
 # `kind` is what the card does, and it is the reason this is not just a
 # string:
@@ -195,9 +190,10 @@ end
 """
     progress_overlay(session, busy) -> DOM
 
-The single top-centered card every long-running operation reports into. Mounted
+The top-centered card for dashboard operations and window-level notices. Mounted
 ONCE per window (the shell in sidebar.jl) or once per standalone dashboard —
-never both, or two cards would render the same snapshot.
+never both, or two cards would render the same snapshot. Chat jobs use
+`job_progress_view` and the BonitoProgress API instead.
 
 Why one: the app used to have two, a dashboard-only pill and a window toast, so
 where a failure showed up depended on which view happened to be open, and the
