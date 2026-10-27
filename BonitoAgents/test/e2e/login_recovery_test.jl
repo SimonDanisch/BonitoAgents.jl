@@ -32,8 +32,17 @@
         second_chat = TK.new_chat(z; title = "SecondChat")
         TK.send_message(z, "second chat")
         TK.wait_for(z, "the second reply", "document.body.textContent.includes('reply to: second chat')"; timeout = 60)
-        TK.click(z, ".bt-side-item[data-project-id=\"$first_chat\"]")
+        # Reload restores the last selected chat. Clear that selection through
+        # Home first, or the new page can start fetching a chat before logout.
+        TK.to_dashboard(z)
+        @test TK.wait_for(z, "Home selection saved before reload",
+            "document.querySelector('.bt-main-views')?.dataset.activeView === '' && (localStorage.getItem('bt-last-pid') || '').endsWith('|')";
+            timeout = 30)
         TK.navigate(z, "/")                       # a page that has shown neither chat
+        @test TK.wait_for(z, "fresh dashboard ready before logout",
+            "location.search === '' && document.querySelector('.bt-main-views')?.dataset.activeView === '' && " *
+            "document.querySelector('.bt-conn-led')?.dataset.status === 'connected' && !document.querySelector('.bt-chatpane')";
+            timeout = 30)
         second_pane = """document.querySelector('.bt-chatpane[data-pane-pid="$second_chat"] .bt-messages')"""
         @test TK.eval_js(z, "!$second_pane") == true
 
