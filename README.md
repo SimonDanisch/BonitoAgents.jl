@@ -264,6 +264,29 @@ Run the server on an always-on Linux machine with a domain name, using
 bash BonitoAgents/assets/install_server.sh
 ```
 
+### Server plugins
+
+A server package can add a permanent dashboard app without a custom launcher or
+an edit to BonitoAgents. Install it as a direct dependency of the monorepo
+environment, then run the normal installer:
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.add("BonitoCommunity")'
+bash BonitoAgents/assets/install_server.sh
+```
+
+Opt-in packages declare this in their own `Project.toml`:
+
+```toml
+[bonitoagents]
+plugin = true
+```
+
+Their `__init__()` calls `BonitoAgents.register_app!(MyApp)`. On ordinary
+server startup, BonitoAgents loads only direct dependencies with that explicit
+marker. Re-running the normal installer instantiates the same manifest for the
+service user and restarts the server with the plugin.
+
 It asks how people reach the server, its domain and the admin, saves the
 answers before anything can fail (a second run just offers them again;
 `--reconfigure` asks anew), and prints a setup link for the admin at the end.

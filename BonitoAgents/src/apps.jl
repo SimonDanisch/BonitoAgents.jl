@@ -249,10 +249,13 @@ Called once, by the `ServerState` constructor.
 """
 function start_apps!(server::ServerState, apps)
     for A in apps
-        id = app_id(A)
+        # A plugin package is loaded while `serve` is already executing. Its
+        # app-interface methods therefore live in a newer Julia world age than
+        # this precompiled function; cross that boundary here, once per app.
+        id = Base.invokelatest(app_id, A)
         haskey(server.apps, id) && error("two apps with the id '$id'")
-        app = A(AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
-        icon = app_icon(app)
+        app = Base.invokelatest(A, AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
+        icon = Base.invokelatest(app_icon, app)
         icon === nothing || isfile(icon) || error("the icon of app '$id' is not a file: $icon")
         server.apps[id] = app
     end

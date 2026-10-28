@@ -60,7 +60,8 @@ desktop app) turn it on.
 `state_dir`   overrides where workers.json / projects.json are persisted
               (default: `~/.local/share/bonitoagents-server`).
 `apps`        the apps the server runs, by type (`(BonitoTodo.TodoApp, MyApp)`;
-              see apps.jl). Default: the ones BonitoAgents ships (`BUILTIN_APPS`).
+              see apps.jl). Passing this is explicit; by default the built-ins
+              plus installed opt-in plugins are used (`[bonitoagents] plugin = true`).
 `working_dir` overrides where canonical project copies live on the server.
               Each project lives at `<working_dir>/<name>` and is mirrored
               onto the worker at `<worker.projects_root>/<name>`.
@@ -78,7 +79,7 @@ function serve(; host::String        = "127.0.0.1",
                  worker_link_grace::Real = 300.0,
                  scan_on_connect::Bool = true,
                  log_file::Union{String,Nothing} = nothing,
-                 apps = BUILTIN_APPS)
+                 apps = nothing)
     check_host(auth, host)
     # `nothing` OR `""` (env-var roundtrip) → use the platform default. Anything
     # else is taken as an absolute override.
@@ -112,6 +113,10 @@ function serve(; host::String        = "127.0.0.1",
     install_log_ring!()
     SERVER_STARTED[] == 0.0 && (SERVER_STARTED[] = time())
 
+    # The ordinary server entry point discovers packages deliberately marked as
+    # plugins in its active environment. Passing `apps` remains the explicit,
+    # deterministic path for tests and embedders.
+    apps === nothing && (apps = (BUILTIN_APPS..., load_plugins!()...))
     state = ServerState(; state_dir = sd, working_dir = wd, auth, manage_harnesses,
                           heartbeat_interval = heartbeat_interval,
                           heartbeat_deadline = heartbeat_deadline,

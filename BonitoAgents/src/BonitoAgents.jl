@@ -83,6 +83,7 @@ include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
 include("diagnostics.jl")      # timings, browser tabs and their consoles, for the dev tools
 include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
+include("plugins.jl")          # opt-in app packages discovered from the server environment
 include("apps/BonitoTodo/BonitoTodo.jl")  # the To-do app, written like an app package: public API only
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
 include("remote_values.jl")    # remote_session(…): Julia values between a chat's session and another worker's
@@ -113,7 +114,7 @@ public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, AppK
        caller_user, app_chat, chat_title, chat_folders, find_worker, start_chat!,
        chat_key, chat_file_url, show_chat!, send_message!,
        atomic_write_json, load_json_tolerant, relative_time_label,
-       BUILTIN_APPS
+       BUILTIN_APPS, register_app!, registered_apps
 
 # Bake the real browser-driven paths captured from the e2e suite: literal
 # `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during
