@@ -591,9 +591,9 @@ mutable struct ServerState
     # it) and dies with the server. All guarded by `lock` (the first field), the
     # same mutex their old globals were already taken under.
     eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (an eval worker's bridge channel)
-    mcp_ctrl           :: Dict{String,Any}              # project_id => the chat MCP's MCPChannel
+    mcp_ctrl           :: Dict{String,Any}              # project_id => the chat's MCPChannels
     # Eval hosts: BonitoMCP processes serving a chat's evals from ANOTHER worker
-    # (remote_eval.jl). "project_id\0worker_id" => that host's MCPChannel.
+    # (remote_eval.jl). "project_id\0worker_id" => that host's MCPChannels.
     eval_hosts         :: Dict{String,Any}
     # Single-flight per host key while one is being spawned + waited for.
     eval_host_locks    :: Dict{String,ReentrantLock}

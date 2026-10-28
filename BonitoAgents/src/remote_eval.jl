@@ -33,17 +33,17 @@ const REMOTE_OPS = ("eval", "continue", "interrupt", "restart", "sessions", "run
 eval_host_key(project_id::AbstractString, worker_id::AbstractString) =
     "$(project_id)\0$(worker_id)"
 
-eval_host_ws(state::ServerState, project_id::AbstractString, worker_id::AbstractString) =
-    lock(state.lock) do
-        get(state.eval_hosts, eval_host_key(project_id, worker_id), nothing)
-    end
+function eval_host_ws(state::ServerState, project_id::AbstractString, worker_id::AbstractString)
+    channels = mcp_channels_for(state, project_id, worker_id)
+    return isempty(channels) ? nothing : first(channels)
+end
 
 # Every live host of one chat, as `(worker_id, ws)`.
 function eval_hosts_of(state::ServerState, project_id::AbstractString)
     prefix = project_id * "\0"
     lock(state.lock) do
-        [(String(k[(length(prefix) + 1):end]), ws) for (k, ws) in state.eval_hosts
-         if startswith(k, prefix)]
+        [(String(k[(length(prefix) + 1):end]), ws) for (k, group) in state.eval_hosts
+         if startswith(k, prefix) for ws in group.channels]
     end
 end
 

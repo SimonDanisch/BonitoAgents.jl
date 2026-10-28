@@ -115,6 +115,29 @@
             @test collect(keys(state.mcp_ctrl)) == [p.id]
         end
 
+        @testset "several clients of one chat keep independent connections and requests" begin
+            original = BT.mcp_ctrl_for(state, p.id)
+            extra = open_mcp(p.id)
+            @test timedwait(() -> length(BT.mcp_channels_for(state, p.id)) == 2, 10.0) === :ok
+            @test BT.decode_control(WorkerLink.WebSockets.receive(extra))["ok"]
+            @test isopen(original)
+            extra_server = only(c for c in BT.mcp_channels_for(state, p.id) if c !== original)
+            rid, waiting = BT.register_rpc!(state)
+            push!(original.pending, rid)
+            WorkerLink.WebSockets.send(extra, JSON.json(Dict("request_id"=>rid, "interrupted"=>99)))
+            sleep(0.1)
+            @test !isready(waiting) # even another client of this chat cannot answer it
+            close(extra_server)
+            @test !isready(waiting)
+            @test isopen(original)
+            @test BT.mcp_ctrl_for(state, p.id) === original
+            BT.unregister_rpc!(state, rid)
+            BT.untrack_mcp_request!(original, rid)
+            inspected = request(20, "tools/call", Dict("name"=>"bt_dev_inspect",
+                "arguments"=>Dict("section"=>"projects", "project_id"=>p.id)))
+            @test !inspected["isError"]
+        end
+
         @testset "a refused channel reaches its local client with the server's reason" begin
             # A grant the worker minted for a chat the server does not give it.
             stray = BW.mcp_relay_env(relay, "no-such-chat"; owner = "stray")
@@ -145,10 +168,30 @@
             # accepted but never served.
             hold[] = true
             close(BT.mcp_ctrl_for(state, p.id))
+            @test timedwait(() -> isready(held), 30.0) === :ok
+            parked = take!(held)
+            pong = Channel{Nothing}(1)
+            @async for raw in parked
+                if get(JSON.parse(String(raw)), "request_id", "") == "ready-probe"
+                    put!(pong, nothing)
+                    break
+                end
+            end
+            WorkerLink.WebSockets.send(parked, JSON.json(Dict("op"=>"ping", "request_id"=>"ready-probe")))
+            @test timedwait(() -> isready(pong), 10.0) === :ok
             result = Channel{Any}(1)
             @async put!(result, try request(7, "tools/call",
                 Dict("name" => "bt_julia_list_sessions", "arguments" => Dict())) catch e; e end)
-            @test timedwait(() -> isready(held), 30.0) === :ok
+            sent = Channel{Nothing}(1)
+            @async for raw in parked
+                if get(JSON.parse(String(raw)), "type", "") == "dev_request"
+                    put!(sent, nothing)
+                    break
+                end
+            end
+            # The caller must actually be waiting on this connection, rather
+            # than still waiting for its reconnect handshake to finish.
+            @test timedwait(() -> isready(sent), 10.0) === :ok
             close(relay)
             @test timedwait(() -> isready(result), 10.0) === :ok
             isready(result) || error("disconnected MCP call did not finish")

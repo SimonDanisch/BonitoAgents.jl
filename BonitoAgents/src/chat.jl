@@ -77,11 +77,12 @@ mutable struct ChatRun
     card::Any                      # its `JuliaEvalToolMsg` (typed there); nothing until bound
     known::Bool                    # `started` is its process's own (a status frame came)
     seen::Float64                  # when its process last spoke about it
+    control::Union{Nothing,WeakRef} # owning MCPChannel; completed runs must not retain dead links
 end
 ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
         summary, collected, notified, content, card) =
     ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
-            summary, collected, notified, content, card, false, time())
+            summary, collected, notified, content, card, false, time(), nothing)
 
 # The chat's runs, and the task that tells the agent when ones it has not
 # collected finish (at most one at a time). `runs` holds each id's newest run.

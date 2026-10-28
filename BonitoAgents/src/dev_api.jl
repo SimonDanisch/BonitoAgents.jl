@@ -261,7 +261,7 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
             "chat_models"     => length(chat_ids),
             "bound_sessions"  => length(bound),
             "eval_bridges"    => lock(() -> length(state.eval_workers), state.lock),
-            "mcp_channels"    => lock(() -> length(state.mcp_ctrl), state.lock),
+            "mcp_channels"    => lock(() -> sum(g -> length(g.channels), values(state.mcp_ctrl); init=0), state.lock),
             "pending_rpcs"    => lock(() -> length(state.pending_rpcs), state.lock),
             "pending_chunks"  => lock(() -> length(state.pending_chunks), state.lock),
             # Browser tabs the server serves, and those whose socket is gone but
@@ -364,6 +364,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
     agent = sh.agent
     return Dict{String,Any}(
         "project_id"     => String(project_id),
+        "mcp_clients"    => length(mcp_channels_for(state, project_id)),
         "cwd"            => m.cwd,
         "chat_dir"       => m.chat_dir,
         "messages"       => nmsgs,
@@ -644,7 +645,7 @@ function registry_counts(state::ServerState)
         "eval_bridges"         => length(bridges),
         "eval_parked_bytes"    => parked,
         "eval_stream_sinks"    => lock(() -> length(state.eval_stream_sinks), state.lock),
-        "mcp_channels"         => lock(() -> length(state.mcp_ctrl), state.lock),
+        "mcp_channels"         => lock(() -> sum(g -> length(g.channels), values(state.mcp_ctrl); init=0), state.lock),
         "pending_rpcs"         => lock(() -> length(state.pending_rpcs), state.lock),
         "pending_chunks"       => lock(() -> length(state.pending_chunks), state.lock),
         "worker_links"         => lock(() -> length(state.worker_links), state.lock),
