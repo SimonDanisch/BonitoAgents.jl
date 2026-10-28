@@ -982,7 +982,11 @@ function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
             # cancel (otherwise cancel would make every delay bail and the stream
             # races to `end_turn`, ending the turn instead of wedging).
             remaining = Float64(get(ev, "ms", 0)) / 1000
+            until_file = String(get(ev, "until_file", ""))
             while remaining > 0 && !(cancelled[] && !IGNORE_CANCEL)
+                # A browser test can release a stream only after observing
+                # its intermediate DOM, independent of machine speed.
+                !isempty(until_file) && isfile(until_file) && break
                 slice = min(remaining, 0.05)
                 sleep(slice)
                 remaining -= slice

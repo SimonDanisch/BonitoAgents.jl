@@ -132,6 +132,14 @@ end
     @test BT.renders_from_input(m) === true       # …now the diff is known
     d = BT.edit_diff_from_input(m)
     @test d isa ACP.DiffContent && d.new_text == "x\ny"
+    body = BT.tool_body_snapshot(m, [])
+    BT.apply_input!(m, Dict("new_string" => "x\ny\nz"))
+    @test BT.tool_body_snapshot(m, []) != body
+    body = BT.tool_body_snapshot(m, [])
+    m.message.status = "in_progress"
+    @test BT.tool_body_snapshot(m, []) == body
+    @test BT.tool_body_snapshot(m, [dif("a.jl", "x", "y")]) != body
+    @test BT.tool_body_snapshot(mcp("bt_julia_eval"), []) === nothing
     # Every other tool still shows the placeholder when it has no content.
     @test BT.renders_from_input(gt("read", "Read", "read a.jl")) === false
     @test BT.renders_from_input(mcp("bt_julia_eval")) === false

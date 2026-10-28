@@ -3831,6 +3831,14 @@ end
 renders_from_input(::ToolMsg) = false
 renders_from_input(m::EditToolMsg) = edit_diff_from_input(m) !== nothing
 
+# Static edit bodies need a new render when streamed input or diff content
+# changes. Status/title updates alone keep the existing body; reactive eval
+# bodies manage their own updates and must never be remounted here.
+tool_body_snapshot(::ToolMsg, content) = nothing
+tool_body_snapshot(m::EditToolMsg, content) =
+    (m.file_path, m.old_string, m.new_string,
+     Tuple((c.path, c.old_text, c.new_text) for c in content if c isa DiffContent))
+
 # Default body: text blocks that ARE a fenced code block become Monaco; prose
 # stays markdown; diff blocks (uncommon outside edit) and images render inline.
 # The typed variants below fall back to this when their shape isn't present.
@@ -4722,6 +4730,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
                 chat_emit(h.chat, d0)
         end
         shown_running = Ref(false)
+        body_snapshot = Ref{Any}(tool_body_snapshot(b, m.content))
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
@@ -4748,6 +4757,11 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             pretty_title, _ = pretty_tool_title(h.title)
             d = Dict{String,Any}("type" => "tool_update", "id" => h.id,
                 "status" => h.status, "title" => pretty_title, "summary" => h.summary)
+            next_body = tool_body_snapshot(b, snap.content)
+            if next_body != body_snapshot[]
+                d["refresh_body"] = true
+                body_snapshot[] = next_body
+            end
             # A background subagent: mark the bubble so the browser renders its
             # background/taskbar affordance (the pill itself comes from the shared
             # TaskBar observable via the `push!` above).

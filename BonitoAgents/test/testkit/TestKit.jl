@@ -441,13 +441,16 @@ commands(cmds::AbstractVector) = Dict("type" => "commands",
         end for c in cmds])
 
 """
-    delay(ms) -> Dict
+    delay(ms; until_file = "") -> Dict
 
 Agent event that sleeps `ms` milliseconds in the mock WITHOUT ending the
 turn, so frames already emitted (a pinned todo, an in-progress tool) stay
 live while the test asserts against them.
+With `until_file`, the test releases the delay by creating that file after
+observing the intermediate DOM; `ms` remains the upper bound.
 """
-delay(ms::Real) = Dict("type" => "delay", "ms" => Float64(ms))
+delay(ms::Real; until_file::AbstractString = "") =
+    Dict("type" => "delay", "ms" => Float64(ms), "until_file" => String(until_file))
 
 """
     error_reply(message) -> Dict

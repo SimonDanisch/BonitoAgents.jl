@@ -2309,6 +2309,7 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) {

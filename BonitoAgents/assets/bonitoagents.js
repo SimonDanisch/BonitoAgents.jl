@@ -2809,6 +2809,10 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // An edit can mount before all of its arguments have streamed in.
+        // Refresh an existing preview when its source changes, using the same
+        // near-viewport scheduler and serialized render requests as first mount.
+        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
