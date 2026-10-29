@@ -119,6 +119,52 @@ every step to the guide behind it.
   <img src="BonitoAgents/assets/screenshot-chat.png" alt="A Claude Code chat with a streamed Monaco diff; the header shows the agent picker next to the model, permission and effort pills" width="850">
 </p>
 
+## Worker-local MCP servers
+
+[RomeoDB](RomeoDB/) is the monorepo's independent Julia code-search package and MCP
+server. It compares complete functions across repositories, finds implementations by
+purpose, and discovers useful packages. Its embedding runner is optional; the core
+and the integration tests work without the GPU stack.
+
+Every worker ships the CPU-only RomeoDB core and automatically offers its tools as
+`btromeodb`. Fresh installs, worker updates and desktop bundles include it; no separate
+package installation or MCP registration is needed. The default uses the worker's Julia
+environment and keeps the index in its per-install scratch directory under `romeodb/`.
+The full ecosystem index is separate data. Until it is available, the tools report
+that the index is not initialized, rather than claiming no matching code exists.
+
+The embedding runner, GPU libraries and model weights are optional. To use an existing
+index or enable embeddings in a separate environment, override `btromeodb` under
+`mcp_servers` in the worker's `config.json` (`BonitoWorker.config_path()` gives its
+location). For example:
+
+```json
+{
+  "mcp_servers": {
+    "btromeodb": {
+      "command": "/path/to/julia",
+      "args": [
+        "--project=/path/to/embedding-env", "--startup-file=no", "--threads=8",
+        "-e", "using RomeoDB; RomeoDB.serve(ARGS[1]; embedder = RomeoDB.loadqwen3embedding)",
+        "/path/to/index"
+      ],
+      "env": {"JULIA_GLFW_PLATFORM": "null"}
+    }
+  }
+}
+```
+
+Set `mcp_servers.btromeodb.enabled` to `false` to disable it. Other stdio MCP servers
+can be added in the same section. Commands and paths refer to the worker's machine;
+`btworker` is reserved. Changes take effect after restarting the worker and existing
+chat sessions. For dev workers, `BONITOAGENTS_MCP_CONFIG` can name a separate JSON
+configuration. Explicit environment values reach agents that filter inherited values.
+
+RomeoDB's `find_existing` accepts complete function definitions, their purpose,
+optional alternative phrasings, and `exclude_packages`. It returns structural code
+matches, possible implementations by purpose, and relevant packages. Read candidate
+definitions before recommending reuse: similarity does not establish equivalent behavior.
+
 ## See everything the agent makes
 
 The agent puts a file into the chat with `bt_show`, and you can open any file

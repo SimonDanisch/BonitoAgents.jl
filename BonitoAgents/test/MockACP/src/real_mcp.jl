@@ -2,18 +2,21 @@
 # in-process tool simulator, this uses ONLY the MCP command/argv/env supplied
 # in ACP session/new or session/load and speaks real MCP over subprocess stdio.
 const MCP_CONFIG = Ref{Any}(nothing)
+const MCP_CONFIGS = Dict{String,Any}()
 mutable struct RealMCPClient
     proc::Any
     next_id::Int
     lock::ReentrantLock
 end
-const MCP_CLIENTS = Dict{String,RealMCPClient}()
+const MCP_CLIENTS = Dict{Tuple{String,String},RealMCPClient}()
 const MCP_CLIENTS_LOCK = ReentrantLock()
 
 function set_mcp_config!(params)
-    config = findfirst(s -> get(s, "name", "") == "btworker", get(params, "mcpServers", []))
-    config === nothing && return
-    MCP_CONFIG[] = params["mcpServers"][config]
+    empty!(MCP_CONFIGS)
+    for config in get(params, "mcpServers", [])
+        MCP_CONFIGS[String(config["name"])] = config
+    end
+    MCP_CONFIG[] = get(MCP_CONFIGS, "btworker", nothing)
 end
 
 function real_mcp_request(client::RealMCPClient, method, params)
@@ -34,11 +37,11 @@ end
 
 # Named clients reproduce one agent hosting several MCP subprocesses. Each
 # uses the exact same ACP launch config, as Codex thread clients do.
-function real_mcp_client(name)
+function real_mcp_client(name; server = "btworker")
     lock(MCP_CLIENTS_LOCK) do
-        get!(MCP_CLIENTS, String(name)) do
-            cfg = MCP_CONFIG[]
-            cfg === nothing && error("ACP did not supply btworker MCP configuration")
+        get!(MCP_CLIENTS, (String(server), String(name))) do
+            cfg = get(MCP_CONFIGS, server, nothing)
+            cfg === nothing && error("ACP did not supply $server MCP configuration")
             env = Dict(k => v for (k, v) in ENV if !startswith(k, "BONITOAGENTS_"))
             merge!(env, Dict(String(e["name"]) => String(e["value"]) for e in cfg["env"]))
             cmd = Cmd(Cmd(String[cfg["command"]; cfg["args"]]); env)
@@ -47,13 +50,14 @@ function real_mcp_client(name)
                 "capabilities" => Dict(), "clientInfo" => Dict("name" => name, "version" => "1")))
             println(client.proc, JSON.json(Dict("jsonrpc" => "2.0", "method" => "notifications/initialized")))
             flush(client.proc)
+            real_mcp_request(client, "tools/list", Dict())
             client
         end
     end
 end
 
-function real_mcp_call(tool, args; meta = nothing, client = "main")
-    c = real_mcp_client(client)
+function real_mcp_call(tool, args; meta = nothing, client = "main", server = "btworker")
+    c = real_mcp_client(client; server)
     lock(c.lock) do
         params = Dict{String,Any}("name" => tool, "arguments" => args)
         meta === nothing || (params["_meta"] = meta)
@@ -63,19 +67,21 @@ end
 
 function emit_real_mcp_call(ev)
     tool = String(ev["tool"])
+    server = String(get(ev, "server", "btworker"))
+    name = "mcp__" * server * "__" * tool
     tid = String(get(ev, "id", "real-mcp"))
     # Claude Code names the tool call on every `tools/call` (its tool_use id, the
     # same id claude-agent-acp gives the ACP tool call); `anonymous = true` plays
     # an agent that sends nothing of the kind.
     anonymous = get(ev, "anonymous", false) === true
     args = get(ev,"arguments",nothing)
-    args === nothing && (args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id", "anonymous", "client")))
-    meta = Dict("claudeCode" => Dict("toolName" => "mcp__btworker__" * tool))
+    args === nothing && (args = Dict(k => v for (k, v) in ev if k ∉ ("type", "tool", "id", "anonymous", "client", "server")))
+    meta = Dict("claudeCode" => Dict("toolName" => name))
     upd("tool_call", Dict("toolCallId" => tid, "kind" => "other",
-        "title" => "mcp__btworker__" * tool, "status" => "pending",
+        "title" => name, "status" => "pending",
         "rawInput" => args, "content" => Any[], "_meta" => meta))
     result = try
-        real_mcp_call(tool, args; client=get(ev, "client", "main"), meta = anonymous ? nothing :
+        real_mcp_call(tool, args; client=get(ev, "client", "main"), server, meta = anonymous ? nothing :
                                         Dict("claudecode/toolUseId" => tid))
     catch e
         Dict("isError" => true, "content" => [Dict("type" => "text",

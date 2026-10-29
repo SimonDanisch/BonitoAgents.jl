@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]
+RomeoDB = "b0bc34ab-3faa-4d3f-891a-2fccc1f41d4b"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
 BonitoBook = "b416d416-7a6e-4336-8c1a-1f8a8cd59518"
@@ -24,6 +25,7 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 # user's default browser (see `open_browser`), so no Electron is bundled.
 
 [sources]
+RomeoDB = {path = "../RomeoDB"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoAgents = {path = "../BonitoAgents"}
 # BonitoBook is a transitive dep (via BonitoAgents); pin its branch at the root

@@ -74,6 +74,7 @@ isdir(joinpath(homedir(), ".claude")) ||
 println("\n==> Installing into shared @bonito-agents env")
 Pkg.activate("bonito-agents"; shared = true)
 const SPECS = [
+    Pkg.PackageSpec(name = "RomeoDB",     url = REPO, subdir = "RomeoDB",     rev = REV),
     Pkg.PackageSpec(name = "RemoteSync",   url = REPO, subdir = "RemoteSync",   rev = REV),
     Pkg.PackageSpec(name = "WorkerLink",   url = REPO, subdir = "WorkerLink",   rev = REV),
     Pkg.PackageSpec(name = "BonitoWorker", url = REPO, subdir = "BonitoWorker", rev = REV),
@@ -99,7 +100,7 @@ const SPECS = [
 function _tree_shas()
     deps = Pkg.dependencies()
     Dict(p.name => p.tree_hash for p in values(deps)
-         if p.name in ("RemoteSync", "WorkerLink", "BonitoWorker", "BonitoMCP", "Bonito"))
+         if p.name in ("RemoteSync", "WorkerLink", "BonitoWorker", "BonitoMCP", "Bonito", "RomeoDB"))
 end
 before = _tree_shas()
 Pkg.add(SPECS)        # idempotent: handles the fresh-install path
