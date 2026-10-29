@@ -284,7 +284,7 @@ has_uncommitted(dir) =
 function review_beat!(s, ctx; line_match = "mod1(i + di",
                       comment = "mod1 twice per neighbour is a lot of integer math; " *
                                 "hoist the row index out of the inner loop.")
-    ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bt-menu-trigger"))))
+    ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bw-menu-trigger"))))
     sleep(1.2)
     ECT.click(ctx, ECT.JS(el_center_js(visible_js(".bt-header-review"))))
     TK.wait_for(s, "review diff",
@@ -306,7 +306,7 @@ function review_beat!(s, ctx; line_match = "mod1(i + di",
     sleep(0.5)
     ECT.type_text(ctx, comment)
     sleep(1.0)
-    ECT.click(ctx, ECT.JS(el_center_js("document.querySelector('.bt-rv-form .bt-btn')")))
+    ECT.click(ctx, ECT.JS(el_center_js("document.querySelector('.bt-rv-form .bw-btn')")))
     TK.wait_for(s, "comment collected",
         "document.querySelectorAll('.bt-rv-chip').length > 0"; timeout = 20)
     sleep(2.5)                                   # rest on the numbered chip

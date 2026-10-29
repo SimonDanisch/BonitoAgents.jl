@@ -164,6 +164,7 @@ restart does not wait for it: a process started from here on is not in it.
 """
 function end_chat_processes!(state::ServerState, project_id::AbstractString)
     state = root_state(state)
+    close_managed_processes!(state,project_id)
     procs = chat_processes(state, project_id)
     return Base.errormonitor(@async begin
         close_eval_hosts!(state, project_id)
@@ -215,6 +216,6 @@ function end_chat_session!(model::ChatModel, why::AbstractString)
     lost && note_finished_runs!(chat)
     interrupt_background_tasks!(chat; reason = "chat_restarted")
     bar = chat_taskbar(chat)
-    foreach(t -> finished!(t; reason = "chat_restarted"), lock(() -> copy(bar.items[]), bar.lock))
+    foreach(t -> t isa SupervisedTask || finished!(t; reason = "chat_restarted"), lock(() -> copy(bar.items[]), bar.lock))
     return nothing
 end

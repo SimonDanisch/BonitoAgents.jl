@@ -6,12 +6,13 @@
     target = BT.ProjectInfo("receiver", "Receiver", "worker-b", "/target", mktempdir(), now(UTC))
     state.projects[][sender.id] = sender
     state.projects[][target.id] = target
+    sender.chat_messaging = target.chat_messaging = true
     model = BT.ChatModel(state, target.server_path; project_id = target.id,
         agent = BT.WorkerAgent(state, target.worker_id, target.worker_path; project_id = target.id))
     state.chat_models[target.id] = model
     models = [model]
     try
-        result = BT.dev_request(state, "control", Dict("op" => "send_message",
+        result = BT.dev_request(state, "chat_messaging", Dict("action" => "send",
             "project_id" => target.id, "text" => "GPU is free",
             "sender_id" => "forged", "sent_at" => "yesterday"), sender.id)
         entry = only(model.pending_sends)

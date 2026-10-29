@@ -55,7 +55,7 @@ comment_on(file, line, text; shift = false) = """(() => {
     const form = document.querySelector('$(REVIEW) .bt-rv-form');
     if (!form) return 'no-form';
     form.querySelector('textarea').value = $(TK.json(text));
-    form.querySelector('button.bt-btn').click();
+    form.querySelector('button.bw-btn').click();
     return true;
 })()"""
 

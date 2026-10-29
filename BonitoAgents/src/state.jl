@@ -191,6 +191,9 @@ mutable struct ProjectInfo
     # Persisted: a granted capability must survive a server restart, and must
     # never be derived from anything else.
     remote_eval::Bool
+    # Independent, explicit opt-in to sending AND receiving peer messages.
+    # Dev mode never grants this capability. Checked live, including dispatch.
+    chat_messaging::Bool
     # The app this chat belongs to (`app_id` of one of `ServerState.apps`), or ""
     # for an ordinary chat. An app chat's pane is what the app renders
     # (`chat_pane`), and its agent gets the app's own tools. Persisted, and never
@@ -216,6 +219,7 @@ ProjectInfo(id, name, worker_id, server_path, worker_path, created) =
                 Dict{String,String}(),   # desired_config
                 false,                   # dev_mode
                 false,                   # remote_eval
+                false,                   # chat_messaging
                 "",                      # app
                 ProjectFileIndex())      # file_index
 
@@ -515,6 +519,8 @@ mutable struct ServerState
     # `Any` like `chat_models` above and for the same reason: review.jl is
     # included after this file, so the concrete type isn't known here.
     review_states :: Dict{String,Any}
+    job_progress :: Dict{String,Any}   # per-chat progress books, independent of agent turns
+    process_jobs :: Dict{String,Any}   # worker-owned jobs and their taskbar sources
 
     # Bumped (via `notify_chats!`) whenever `chat_models` gains or loses an
     # entry. `chat_models` is a plain Dict (not an Observable), but the
@@ -533,10 +539,10 @@ mutable struct ServerState
     turn_signal :: Observable{Int}
 
     # When each chat's last turn ended (`time()`, by project id), as the server
-    # saw it since it started: the sidebar lists the chats that just went quiet
+    # saw it: the sidebar lists the chats that just went quiet
     # first among the inactive ones, next to the active chats they came from.
     # Kept here, not on the chat, because an idle chat's model can be closed.
-    # Guarded by `lock`; runtime only.
+    # Guarded by `lock`; persisted with each project in projects.json.
     turns_ended :: Dict{String,Float64}
 
     # One link per worker (worker id → link), connected or waiting out its grace
@@ -585,9 +591,9 @@ mutable struct ServerState
     # it) and dies with the server. All guarded by `lock` (the first field), the
     # same mutex their old globals were already taken under.
     eval_workers       :: Dict{String,Any}              # project_id => EvalBridge (an eval worker's bridge channel)
-    mcp_ctrl           :: Dict{String,Any}              # project_id => the chat MCP's MCPChannel
+    mcp_ctrl           :: Dict{String,Any}              # project_id => the chat's MCPChannels
     # Eval hosts: BonitoMCP processes serving a chat's evals from ANOTHER worker
-    # (remote_eval.jl). "project_id\0worker_id" => that host's MCPChannel.
+    # (remote_eval.jl). "project_id\0worker_id" => that host's MCPChannels.
     eval_hosts         :: Dict{String,Any}
     # Single-flight per host key while one is being spawned + waited for.
     eval_host_locks    :: Dict{String,ReentrantLock}
@@ -720,6 +726,8 @@ function ServerState(; state_dir::String,
         Observable(Dict{String,ProjectInfo}()),   # projects
         Dict{String,Any}(),                       # chat_models
         Dict{String,Any}(),                       # review_states
+        Dict{String,Any}(),                       # job_progress
+        Dict{String,Any}(),                       # process_jobs
         Observable(0),                            # chat_signal
         Observable(0),                            # turn_signal
         Dict{String,Float64}(),                   # turns_ended
@@ -797,6 +805,8 @@ function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Not
             map(identity, session, s.projects),
             s.chat_models,
             s.review_states,           # shared: the point is surviving a session
+            s.job_progress,
+            s.process_jobs,
             map(identity, session, s.chat_signal),
             map(identity, session, s.turn_signal),
             s.turns_ended,             # shared: one record per server
@@ -911,9 +921,9 @@ end
 """
     global_agents_md(state) -> String
 
-The server-wide agent instructions (`<state_dir>/AGENTS.md`). Appended to the
-system prompt of EVERY agent session brought up through this server — across
-all workers and projects (see `session_meta_params` in transport.jl). ""
+The server-wide agent instructions (`<state_dir>/AGENTS.md`). Composed into the
+MCP briefing for every agent session across all workers and projects, and into
+Claude's native system-prompt append (see `session_meta` in transport.jl). ""
 when the file doesn't exist. Editable from the dashboard, or directly on
 disk (read per session bring-up, so edits apply to the next chat opened —
 no restart needed).
@@ -931,18 +941,22 @@ function set_global_agents_md!(s::ServerState, text::AbstractString)
     return nothing
 end
 
-# Built-in house rules BonitoAgents itself appends to EVERY Claude session's
-# system prompt, ahead of the user's editable AGENTS.md. Product-level guidance
+# Built-in house rules delivered through MCP to every provider, and appended to
+# Claude's system prompt, ahead of the user's editable AGENTS.md. Product guidance
 # for footguns we keep seeing across agents — keep it short, it rides on every
 # session. (The dashboard textarea shows/edits only the user's AGENTS.md; these
 # rules are composed in at session bring-up via `agents_prompt_appendix`.)
-const BUILTIN_AGENT_RULES = """
+const BUILTIN_AGENT_RULES = BonitoMCP.AGENT_WORKFLOW * "\n\n" * """
 ## Long-running work: use the tool, never shell backgrounding
 Every kind of long work has a tool that this app TRACKS — it shows in the task \
 bar while it runs, and you are notified automatically when it finishes:
 
-  * a shell command — `Bash` with `run_in_background: true`
-  * a whole sub-task — `Task`/`Agent` with `run_in_background: true`
+  * an external command — `bt_process(action="start", id="build-1", \
+    argv=["make"], label="Build")`. The worker owns it and its taskbar \
+    controls; this works across providers. Use `bt_process` wait/status/output \
+    and interrupt/terminate/kill for that job, never raw PID guessing.
+  * a whole sub-task — the agent's native delegation tool when available and \
+    authorized; with Claude, `Task`/`Agent` with `run_in_background: true`
   * Julia — `bt_julia_eval` with `background: true`. It returns a run id \
     (`r4`) at once; the run shows in the task bar, and you are told when it \
     finishes. Start one per worker/env to run several at once (e.g. a test \
@@ -958,11 +972,13 @@ Never start a long command detached and then poll for it from a second watcher \
 task (`until ! kill -0 <pid>; do sleep ...; done`, tail loops, and the like) — \
 such monitors routinely never terminate (PID reuse keeps `kill -0` succeeding) \
 and pile up as zombie background tasks. Run the long command itself as ONE \
-background task (`run_in_background`) with any post-processing (grep/summary) \
+managed job (`bt_process`) with any post-processing (grep/summary) \
 appended after it in the same command.
 
-## Waiting for it: `bt_wait`, never a sleeper
-The tools above START work; none of them WAIT for it. `run_in_background` \
+## Waiting for it: use a bounded wait, never a sleeper
+Use `bt_process(action="wait", id="build-1", seconds=600)` for a managed \
+command, or `bt_julia_wait` for Julia runs. A launch STARTS work; it does not \
+wait for completion. A background launch \
 returns immediately, so if you have nothing else to do the turn simply ends and \
 you are called again seconds later. Turns fire far faster than wall-clock, so \
 "start a `sleep` and check next turn" spawns one orphaned sleeper per cycle — \
@@ -1004,8 +1020,8 @@ A few julia rules:
 * never ever use `try; xxx; catch; end;` its absolutely horrible to blanket catch errors and not report them. Even `@debug err` is bad, since its not printing by default.
 """
 
-# What actually rides on the `_meta.systemPrompt.append` for a session: the
-# built-in rules plus the user's AGENTS.md (when present).
+# The MCP briefing and Claude's `_meta.systemPrompt.append` share one source:
+# the built-in rules plus the user's AGENTS.md (when present).
 function agents_prompt_appendix(s::ServerState)
     user = global_agents_md(s)
     return isempty(user) ? BUILTIN_AGENT_RULES : BUILTIN_AGENT_RULES * "\n\n" * user
@@ -1104,7 +1120,9 @@ You have `bt_dev_*` tools that read the **running process**:
   test-suite run). Clean counters here do not mean "no leak" — for that class,
   count the processes on the machine.
 - `bt_dev_control` — drive the server the way a user would (open a chat, send a
-  message, restart a session, move a project between machines).
+  message, restart a session, move a project between machines). Messaging still
+  requires the independent Chat messaging switches in both chats; use `bt_chat`
+  for ordinary coordination.
 """
 
 const DEV_MODE_RULES_SOURCE = """
@@ -1338,7 +1356,11 @@ notify_turn!(s::ServerState) = timed(() -> safe_notify!(root_state(s).turn_signa
 
 # A chat's turn ended now: the sidebar's order among the inactive chats.
 function turn_ended!(s::ServerState, project_id::AbstractString)
-    lock(() -> (s.turns_ended[String(project_id)] = time()), s.lock)
+    s = root_state(s)
+    lock(s.lock) do
+        s.turns_ended[String(project_id)] = time()
+        save_projects!(s)
+    end
     return nothing
 end
 
@@ -1550,6 +1572,7 @@ function save_projects!(s::ServerState)
         data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
                      "server_path" => p.server_path, "worker_path" => p.worker_path,
                      "created" => string(p.created),
+                     "last_turn_ended" => get(s.turns_ended, p.id, 0.0),
                      "owner" => p.owner,
                      # `:syncing` is a runtime state — persist as `:stale` so a
                      # crash mid-sync doesn't leave the next start-up reporting
@@ -1563,6 +1586,7 @@ function save_projects!(s::ServerState)
                      "dismissed"     => p.dismissed,
                      "dev_mode"      => p.dev_mode,
                      "remote_eval"   => p.remote_eval,
+                     "chat_messaging" => p.chat_messaging,
                      "app"           => p.app,
                      "desired_config" => p.desired_config)
                 for p in values(s.projects[])]
@@ -1611,6 +1635,7 @@ function load_projects!(s::ServerState)
             # Absent ⇒ false: running code on other machines is granted per chat,
             # never assumed.
             p.remote_eval = get(d, "remote_eval", false) === true
+            p.chat_messaging = get(d, "chat_messaging", false) === true
             app = get(d, "app", "")
             p.app = app isa AbstractString ? String(app) : ""
             dc = get(d, "desired_config", nothing)
@@ -1620,6 +1645,10 @@ function load_projects!(s::ServerState)
                 end
             end
             track_project!(s, p)
+            ended = get(d, "last_turn_ended", 0.0)
+            if ended isa Real && isfinite(ended) && ended > 0
+                s.turns_ended[p.id] = Float64(ended)
+            end
         catch e
             @warn "skipping malformed project entry" entry=d exception=e
         end

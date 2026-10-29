@@ -258,6 +258,9 @@ Operations (`op`):
   • `open_chat`     — bring up (or focus) a project's chat session.
                       Args: `project_id`.
   • `send_message`  — send a user message into a chat and return immediately;
+                      Legacy peer messaging; prefer bt_chat action="send".
+                      BOTH chats must enable Chat messaging independently of
+                      dev mode. Success means queued, not confirmed delivery.
                       the reply lands in that chat, not here.
                       Includes the sending chat/worker identity and server UTC
                       send/dispatch timestamps, so the receiver can judge age.

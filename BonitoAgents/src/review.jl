@@ -820,7 +820,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
     send_btn = map(session, st.comments) do cs
         n = length(cs)
         DOM.button(n == 0 ? "Send" : "Send $(n) comment$(n == 1 ? "" : "s")";
-            class = "bt-btn bt-btn-sm bt-rv-send", type = "button",
+            class = "bw-btn bw-btn-sm bt-rv-send", type = "button",
             dataEmpty = n == 0 ? "1" : "0",
             title = "Deliver every collected comment to the agent as one instruction")
     end
@@ -831,30 +831,19 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
         "  ·  + comments on a line; shift-click a second + to cover a block."
     end
 
-    header = DOM.div(
-        DOM.span("⑂"; class = "bt-fv-icon"),
-        path_span(repo_txt; class = "bt-file-editor-path bt-rv-repo"),
-        # The badge carries its own padding and background, so an EMPTY one is
-        # still a visible 15×3px stub — a stray dash next to the icon. Harmless
-        # while it only flickered during a load; the "pick a folder" state holds
-        # it indefinitely, so hide it when there is no branch to name. (The other
-        # header spans collapse to 0×0 on their own; this one doesn't.)
-        DOM.span(branch_txt; class = "bt-fv-badge",
-                 style = map(b -> isempty(b) ? "display:none" : "", session, branch_txt)),
-        DOM.span(stat_txt; class = "bt-rv-stat"),
-        DOM.span(st.status; class = "bt-file-editor-status"),
-        DOM.div(
-            folder_select,
-            base_input,
+    header = FileToolbar(
+        path_span(repo_txt;class="bt-file-editor-path bt-rv-repo");
+        metadata=(DOM.span(branch_txt;class="bt-fv-badge",
+            style=map(b->isempty(b) ? "display:none" : "",session,branch_txt)),
+            DOM.span(stat_txt;class="bt-rv-stat")),
+        actions=(DOM.span(st.status;class="bt-file-editor-status"),folder_select,base_input,
             DOM.div(
-                DOM.button("Ask"; class = "bt-fv-seg", type = "button", dataRvMode = "ask"),
-                DOM.button("Feedback"; class = "bt-fv-seg", type = "button", dataRvMode = "feedback");
-                class = "bt-fv-segmented"),
-            DOM.button("⟳"; class = "bt-fv-act", type = "button",
-                       title = "Re-read the diff from the worker", dataRvAction = "reload"),
-            send_btn;
-            class = "bt-fv-actions");
-        class = "bt-file-editor-header bt-rv-header")
+                DOM.button("Ask";class="bt-fv-seg",type="button",dataRvMode="ask"),
+                DOM.button("Feedback";class="bt-fv-seg",type="button",dataRvMode="feedback");
+                class="bt-fv-segmented"),
+            DOM.button("⟳";class="bw-btn bw-btn-ghost bw-btn-sm bt-fv-act",type="button",
+                title="Re-read the diff from the worker",dataRvAction="reload"),send_btn),
+        class="bt-file-editor-header bt-rv-header")
 
     node = DOM.div(
         header,
@@ -1006,7 +995,7 @@ function Bonito.jsrender(session::Session, rp::ReviewPanel)
             actions.className = 'bt-rv-form-actions';
             const ok = document.createElement('button');
             ok.type = 'button';
-            ok.className = 'bt-btn bt-btn-sm';
+            ok.className = 'bw-btn bw-btn-sm';
             ok.textContent = root.dataset.mode === 'ask' ? 'Ask' : 'Add';
             const cancel = document.createElement('button');
             cancel.type = 'button';

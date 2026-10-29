@@ -38,13 +38,27 @@
         @test only(ACP.open_turns(cli)) === original
         @test !ACP.isover(original)
 
+        # Claude's host-owned fallback is another spelling of active-only
+        # steering. It must use the steering API, not an ordinary prompt.
+        cli.session_result["bonitoSteeringIdleBehavior"] = "promptRequired"
+        BT.send_message!(m, BT.UserMsg("priority correction"); mode=:next)
+        delivery = @async BT.deliver_boundary_message!(m)
+        steer = request(transport)
+        @test steer["method"] == "_session/steering"
+        @test steer["params"]["_meta"]["steering"]["idleBehavior"] == "promptRequired"
+        @test !haskey(steer["params"], "activeOnly")
+        respond(transport, steer["id"], Dict("outcome"=>"injected"))
+        wait(delivery)
+        @test timedwait(() -> isempty(m.pending_sends), 5) === :ok
+        @test only(ACP.open_turns(cli)) === original
+
         # The original finishes while steering is in flight. The adapter
         # declines, so this message remains queued for one ordinary prompt.
         BT.send_message!(m, BT.UserMsg("race correction"); mode = :next)
         delivery = @async BT.deliver_boundary_message!(m)
         steer = request(transport)
         respond(transport, original.id, Dict("stopReason" => "end_turn"))
-        respond(transport, steer["id"], Dict("outcome" => "notInjected"))
+        respond(transport, steer["id"], Dict("outcome" => "promptRequired"))
         wait(delivery)
         @test timedwait(() -> only(m.pending_sends).status === :waiting, 5) === :ok
         @test ACP.wait_turn!(original)["stopReason"] == "end_turn"

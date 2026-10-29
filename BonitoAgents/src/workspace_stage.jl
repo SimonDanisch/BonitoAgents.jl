@@ -144,25 +144,10 @@ function install_workspace!(session::Bonito.Session,
     }
     """
 
-    # Theme the BonitoWidgets chrome (tab bars, bodies, gutters, floats) to the
-    # app's LIGHT palette — otherwise the workspace renders with BonitoWidgets'
-    # dark defaults and the chat panel's body shows as dark voids around the
-    # content. `:root:root` (what Theme emits) outranks the dark media query.
-    ws_theme = BonitoWidgets.Theme(scheme = :light;
-        bg         = "var(--bt-bg)",
-        bg_panel   = "var(--bt-surface)",
-        bg_bar     = "var(--bt-surface-2)",
-        bg_hover   = "rgba(15,23,42,0.05)",
-        text       = "var(--bt-text)",
-        text_muted = "var(--bt-text-muted)",
-        accent     = "var(--bt-accent)",
-        accent_bg  = "rgba(59,130,246,0.10)",
-        border     = "var(--bt-border)",
-        radius     = "var(--bt-radius)",
-        radius_sm  = "var(--bt-radius-sm)",
-        font       = "'Inter', system-ui, -apple-system, sans-serif",
-    )
-    stage = DOM.div(ws_theme, ws; class = "bt-stage")
+    # The BonitoWidgets chrome (tab bars, bodies, gutters, floats) reads the
+    # app's palette. Without it the workspace follows the OS into dark mode and
+    # the chat panel's body shows as dark voids around the content.
+    stage = DOM.div(APP_THEME, ws; class = "bt-stage")
     return (stage, glue_js, pane)
 end
 
@@ -179,7 +164,7 @@ const WorkspaceStageStyles = Bonito.Styles(
         "flex" => "1 1 0", "width" => "100%",
         "min-width" => "0", "min-height" => "0",
         "display" => "flex", "flex-direction" => "column",
-        "background" => "var(--bt-bg)"),
+        "background" => "var(--bw-bg)"),
     Bonito.CSS(".bt-main > .bt-main-views",
         "flex" => "1 1 auto", "width" => "100%", "min-width" => "0", "min-height" => "0"),
     # Keep the dashboard's stacked sections at a comfortable centered width even
@@ -200,8 +185,8 @@ const WorkspaceStageStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "padding" => "2px 0 6px"),
     Bonito.CSS(".bt-detach-placeholder",
-        "color" => "var(--bt-text-muted)",
-        "font-size" => "11px", "font-style" => "italic",
+        "color" => "var(--bw-text-muted)",
+        "font-size" => "var(--bw-font-size-xs)", "font-style" => "italic",
         "display" => "none"),
     # The controller marks the slot and its frame detached while the embed
     # lives in the app panel; reveal the placeholder in the now-empty inline
@@ -218,7 +203,7 @@ const WorkspaceStageStyles = Bonito.Styles(
     # the same as inline.
     Bonito.CSS(".bt-app-frame",
         "width" => "100%", "height" => "100%",
-        "color" => "var(--bt-text)", "background" => "var(--bt-surface)",
+        "color" => "var(--bw-text)", "background" => "var(--bw-bg-panel)",
         "display" => "flex", "flex-direction" => "column",
         "min-height" => "0", "overflow" => "auto"),
     Bonito.CSS(".bt-app-frame > .bt-embed",

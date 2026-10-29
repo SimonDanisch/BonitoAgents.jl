@@ -45,6 +45,13 @@ server needs a reachable address. Per machine the worker:
 
 ### Link liveness
 
+The worker connection carries separate channels for its clients. A chat may
+have several MCP subprocesses, including clients created by agent threads.
+They coexist: connecting one never evicts another. Each connection owns its
+pending requests and Julia run controls, so closing or interrupting one client
+does not disconnect the others. Incoming chat messages wake waits across the
+chat's connected clients.
+
 Laptops suspend and switch networks, which can leave a TCP connection
 half-open: both ends think it is ESTABLISHED while nothing flows. The server
 pings every worker and kills the transport of any worker that goes silent past

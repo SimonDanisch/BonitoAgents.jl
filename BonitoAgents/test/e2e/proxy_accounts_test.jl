@@ -171,7 +171,7 @@ end
         @test TK.eval_js(b, "document.querySelectorAll('.bt-worker-cell').length") == 1
         continue_on(s, pid) = begin
             TK.eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\"$(pid)\"]').click(); true")
-            TK.wait_for(s, "the chat header", "!!document.querySelector('.bt-chatpane[data-pane-pid=\"$(pid)\"] .bt-menu-trigger')";
+            TK.wait_for(s, "the chat header", "!!document.querySelector('.bt-chatpane[data-pane-pid=\"$(pid)\"] .bw-menu-trigger')";
                         timeout = 60)
             sleep(1.0)
             String.(TK.eval_js(s, "[...document.querySelectorAll('.bt-chatpane[data-pane-pid=\"$(pid)\"] .bt-menu-continue')].map(b => b.textContent.trim())"))

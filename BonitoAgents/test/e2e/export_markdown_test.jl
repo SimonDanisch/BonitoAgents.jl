@@ -26,7 +26,7 @@
     # but hidden; the header menu renders per pane).
     VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     vpClick(sel) = "(() => { const p=$VP; const e=p && p.querySelector($(repr(sel))); if(!e) return false; e.click(); return true; })()"
-    menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bt-menu-list'); " *
+    menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bw-menu-list'); " *
                 "return !!l && getComputedStyle(l).display !== 'none'; })()"
 
     cwd  = mktempdir()
@@ -58,7 +58,7 @@
 
     link = nothing
     @testset "the ⋯ menu offers the export link" begin
-        @test TK.eval_js(s, vpClick(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.eval_js(s, vpClick(".bt-header-menu .bw-menu-trigger")) == true
         @test TK.wait_for(s, "menu opened", menu_open; timeout = 5) == true
         link = TK.eval_js(s, "(() => { const p=$VP; const a=p && p.querySelector('.bt-header-menu a.bt-header-export'); " *
             "return a ? {text: (a.textContent||'').trim(), href: a.getAttribute('href'), " *

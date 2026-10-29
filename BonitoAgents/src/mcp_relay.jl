@@ -17,6 +17,23 @@ MCPChannel(state::ServerState, channel::WorkerLink.LinkChannel, project_id::Abst
            host_worker::AbstractString) =
     MCPChannel(state, channel, String(project_id), String(host_worker), Set{String}(), false)
 
+# A chat may have several MCP clients (for example, one per agent thread).
+# Connection ownership stays with each client; sharing a chat never replaces it.
+struct MCPChannels{C}
+    state::ServerState
+    channels::Vector{C}
+end
+Base.close(group::MCPChannels) = foreach(close, lock(() -> copy(group.channels), group.state.lock))
+
+function mcp_channels_for(state::ServerState, project_id::AbstractString, host_worker::AbstractString="")
+    lock(state.lock) do
+        registry, key = isempty(host_worker) ? (state.mcp_ctrl, String(project_id)) :
+            (state.eval_hosts, eval_host_key(project_id, host_worker))
+        group = get(registry, key, nothing)
+        group === nothing ? MCPChannel[] : copy(group.channels)
+    end
+end
+
 # Where the channel is registered: a chat's MCP under its project, an eval host
 # under (project, worker).
 mcp_registry(ch::MCPChannel) = isempty(ch.host_worker) ?
@@ -43,7 +60,11 @@ function Base.close(ch::MCPChannel)
         ch.closed && return String[]
         ch.closed = true
         registry, key = mcp_registry(ch)
-        get(registry, key, nothing) === ch && delete!(registry, key)
+        group = get(registry, key, nothing)
+        if group !== nothing
+            filter!(c -> c !== ch, group.channels)
+            isempty(group.channels) && delete!(registry, key)
+        end
         result = collect(ch.pending)
         empty!(ch.pending)
         result
@@ -55,16 +76,13 @@ function Base.close(ch::MCPChannel)
     return nothing
 end
 
-# Serve `ch` for as long as its channel lives. A newer channel for the same key
-# (the MCP process restarted) replaces an older one.
+# Serve each client's channel independently, including its requests and replies.
 function serve_mcp_channel(state::ServerState, ch::MCPChannel)
     registry, key = mcp_registry(ch)
-    previous = lock(state.lock) do
-        old = get(registry, key, nothing)
-        registry[key] = ch
-        old
+    lock(state.lock) do
+        group = get!(() -> MCPChannels(state, MCPChannel[]), registry, key)
+        push!(group.channels, ch)
     end
-    previous === nothing || close(previous)
     @info "MCP channel connected" project_id = ch.project_id eval_host = ch.host_worker
     try
         for msg in ch.channel
@@ -91,8 +109,9 @@ function serve_mcp_channel(state::ServerState, ch::MCPChannel)
         close(ch)
         @info "MCP channel closed" project_id = ch.project_id eval_host = ch.host_worker
         # Its runs end as lost unless it comes back and announces them again.
-        runs_channel_closed!(state, ch.project_id, ch.host_worker)
-        host_channel_closed!(state, ch.project_id, ch.host_worker)
+        runs_channel_closed!(state, ch.project_id, ch.host_worker; control=ch)
+        isempty(mcp_channels_for(state, ch.project_id, ch.host_worker)) &&
+            host_channel_closed!(state, ch.project_id, ch.host_worker)
     end
     return nothing
 end

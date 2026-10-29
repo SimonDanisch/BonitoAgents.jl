@@ -94,15 +94,24 @@ new_relay_token() = bytes2hex(rand(Random.RandomDevice(), UInt8, 32))
 function mcp_relay_env(relay::MCPRelay, project_id::AbstractString;
                        host::Bool = false, owner::AbstractString = project_id)
     control, eval = new_relay_token(), new_relay_token()
-    lock(relay.lock) do
+    progress = lock(relay.lock) do
         relay.closed && error("worker control connection is closed")
         relay.grants[control] = RelayGrant("mcp", project_id, host, owner)
         relay.grants[eval] = RelayGrant("eval", project_id, host, owner)
+        # Reuse one telemetry-only grant per chat/host. It belongs to the chat,
+        # so a detached coordinator survives replacement of its agent process.
+        prior = findfirst(g -> g.kind == "progress" && g.project_id == project_id && g.host == host, relay.grants)
+        prior === nothing || return prior
+        token = new_relay_token()
+        relay.grants[token] = RelayGrant("progress", project_id, host, "progress:" * project_id)
+        token
     end
     return Dict("BONITOAGENTS_CONTROL_URL" => "ws://" * WebSockets.server_addr(relay.server),
                 "BONITOAGENTS_VALUES_ADDR" => tcp_address(relay),
                 "BONITOAGENTS_CONTROL_TOKEN" => control,
-                "BONITOAGENTS_EVAL_TOKEN" => eval)
+                "BONITOAGENTS_EVAL_TOKEN" => eval,
+                "BONITOAGENTS_PROGRESS_ADDR" => tcp_address(relay),
+                "BONITOAGENTS_PROGRESS_TOKEN" => progress)
 end
 
 # ── The local connection, either transport ──────────────────────────────────
@@ -196,7 +205,7 @@ function relay_request(relay::MCPRelay, handshake::AbstractString)
     grant = lock(() -> relay.closed ? nothing : get(relay.grants, token, nothing), relay.lock)
     grant === nothing && return nothing
     header = Dict{String,Any}("kind" => grant.kind, "project_id" => grant.project_id, "host" => grant.host)
-    if grant.kind == "mcp"
+    if grant.kind in ("mcp", "progress")
         isempty(rest) || return nothing
     elseif length(rest) == 2 && rest[1] == "eval" && !isempty(rest[2])
         header["prefix"] = String(rest[2])
@@ -240,7 +249,7 @@ function serve_mcp_relay(relay::MCPRelay, conn::LocalConnection)
         # Live-render frames and values can be large; the MCP's control messages
         # are small and should not wait behind them.
         channel = WorkerLink.open_channel(relay.link, MsgPack.pack(header);
-                                          priority = header["kind"] == "mcp" ? 1 : 2)
+                                          priority = header["kind"] in ("mcp","progress") ? 1 : 2)
         # Registered before the server answers, so a revoke or close reaches a
         # connection still waiting; and only while its grant stands, since a
         # revoke that ran since the handshake has closed every peer it knew of.

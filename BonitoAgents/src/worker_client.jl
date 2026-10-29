@@ -527,6 +527,9 @@ function accept_worker_channel(state::ServerState, worker_id::String, ch::Worker
     if kind == "mcp"
         accept_channel(ch)
         serve_mcp_channel(state, MCPChannel(state, ch, project_id, host ? worker_id : ""))
+    elseif kind == "progress"
+        accept_channel(ch)
+        serve_progress_channel(state, ch, project_id, worker_id)
     elseif kind == "eval"
         serve_eval_bridge(state, ch, eval_bridge_key(project_id, host ? worker_id : ""),
                           String(get(header, "prefix", "")))
@@ -693,6 +696,7 @@ function worker_link_changed!(state::ServerState, worker_id::String,
             note_interrupted_turns!(state, worker_id)
         end
         w.online[] = online
+        progress_worker_connected!(state,worker_id,online)
         notify_workers!(state)
         if online
             @info "Worker connected" worker_id name = w.name
@@ -719,6 +723,8 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                     apply_update_status!(state, worker_id, cmd)
                 elseif t == "harness_status"
                     apply_harness_status!(state, worker_id, cmd)
+                elseif t == "managed_process_update"
+                    managed_process_update!(state, worker_id, cmd["job"])
                 elseif t in ("list_dir_response", "make_dir_response", "ensure_dir_response",
                              "stat_path_response", "read_file_range_response",
                              "list_project_files_response", "clone_repo_response",
@@ -727,7 +733,7 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                              "read_log_response", "debug_checkout_response",
                              "stage_session_response", "install_session_response",
                              "discard_staging_response", "open_eval_host_response",
-                             "close_eval_host_response", "kill_processes_response")
+                             "close_eval_host_response", "kill_processes_response", "managed_process_response")
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "scan_sessions_result"
                     sessions = [Dict{String,Any}(s) for s in get(cmd, "sessions", Any[])]

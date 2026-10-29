@@ -32,12 +32,13 @@ running(id, env; kw...) = frame(id; status = "running", route = abspath(env), en
 
 # A run's process, as the server's channel to it: answers every interrupt with
 # `reply`, and counts them.
-struct FakeRunProcess
+mutable struct FakeRunProcess
     state::Any
     reply::Dict{String,Any}
     asked::Base.RefValue{Int}
 end
 FakeRunProcess(state, reply) = FakeRunProcess(state, Dict{String,Any}(reply), Ref(0))
+Base.isopen(::FakeRunProcess) = true
 function HTTP.WebSockets.send(p::FakeRunProcess, frame::AbstractString)
     p.asked[] += 1
     rid = String(JSON.parse(frame)["request_id"])
@@ -47,11 +48,37 @@ end
 BT.untrack_mcp_request!(::FakeRunProcess, rid) = nothing
 function host_process!(worker, reply)
     p = FakeRunProcess(state, reply)
-    lock(state.lock) do; state.eval_hosts[BT.eval_host_key("proj", worker)] = p; end
+    lock(state.lock) do; state.eval_hosts[BT.eval_host_key("proj", worker)] = BT.MCPChannels(state, [p]); end
     return p
 end
 
 try
+    @testset "client controls and disconnects belong to their own runs" begin
+        a = FakeRunProcess(state, Dict("interrupted"=>1))
+        b = FakeRunProcess(state, Dict("interrupted"=>1))
+        BT.run_update!(state, "proj", "", running("r601", "/tmp/client-a"); control=a)
+        BT.run_update!(state, "proj", "", running("r602", "/tmp/client-b"); control=b)
+        left = model.runs.runs["r601"]
+        right = model.runs.runs["r602"]
+        @test BT.interrupt_run!(state, "proj", right)
+        @test b.asked[] == 1
+        @test a.asked[] == 0
+        unknown = BT.new_chat_run("r603", "")
+        state.mcp_ctrl["proj"] = BT.MCPChannels(state, [a,b])
+        try
+            @test_throws ErrorException BT.interrupt_run!(state, "proj", unknown)
+            @test a.asked[] == 0 && b.asked[] == 1
+        finally
+            delete!(state.mcp_ctrl, "proj")
+        end
+        BT.runs_channel_closed!(state, "proj", ""; control=a, grace=0.05)
+        @test timedwait(() -> left.status == "lost", 2.0) === :ok
+        @test right.status == "running"
+        left.notified = right.notified = true
+        BT.run_update!(state, "proj", "", frame("r601"; status="passed", started=left.started, route=left.route); control=a)
+        BT.run_update!(state, "proj", "", frame("r602"; status="passed", started=right.started, route=right.route); control=b)
+    end
+
     @testset "a replayed eval can reconnect to its live run" begin
         # Codex resumes by replaying tools, not by going through build_tool_msg.
         # The MCP can subsequently announce that one of those runs is still live.

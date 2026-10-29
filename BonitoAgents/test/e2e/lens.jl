@@ -40,8 +40,20 @@ function run_suite(server)
         TK.new_chat(server; title = "Lens")
         # Mixed history: a user msg mentioning "monitor", an agent reply, a
         # second user msg that does NOT, and an agent reply with a tool.
-        TK.send_message(server, "please start a resource monitor"); sleep(2.5)
-        TK.send_message(server, "show me a chart"); sleep(2.5)
+        # User bubbles arrive on agent receipt, not on Send. Cold agent
+        # startup can outlast a fixed sleep; messages delivered after the lens
+        # runs join its live view and invalidate the expected filtered history.
+        TK.send_message(server, "please start a resource monitor")
+        @test TK.wait_for(server, "first reply completed",
+            "[...document.querySelectorAll('.bt-agent-msg')].some(e => e.textContent.trim() === 'On it.') && " *
+            "!document.querySelector('.bt-busy-active')"; timeout = 60)
+        TK.send_message(server, "show me a chart")
+        @test TK.wait_for(server, "mixed history completed",
+            "document.querySelectorAll('.bt-user-msg').length === 2 && " *
+            "document.querySelectorAll('.bt-agent-msg').length === 2 && " *
+            "[...document.querySelectorAll('.bt-agent-msg')].some(e => e.textContent.trim() === 'Here is a chart.') && " *
+            "!!document.querySelector('.bt-tool-msg .bt-status-completed') && " *
+            "!document.querySelector('.bt-busy-active')"; timeout = 60)
 
         @testset "the lens bar and its vocabulary are present" begin
             @test TK.eval_js(server, "!!document.querySelector('.bt-header .bt-lens-bar')") == true
@@ -82,6 +94,10 @@ function run_suite(server)
             TK.eval_js(server, "document.querySelector('.bt-lens-clear').click()")
             @test TK.wait_for(server, "lens cleared",
                 "$(chat_state("lensActive")) === false"; timeout = 5) == true
+            @test TK.wait_for(server, "all history restored",
+                "document.querySelectorAll('.bt-user-msg').length === 2 && " *
+                "document.querySelectorAll('.bt-agent-msg').length === 2 && " *
+                "document.querySelectorAll('.bt-tool-msg').length === 1"; timeout = 5)
         end
 
         @testset "saving makes a persisted chip; deleting removes it" begin

@@ -46,7 +46,10 @@
         TK.screenshot(s, joinpath(screenshot_dir, "mobile_long_draft.png"))
         TK.set_input(s, P * ".bt-text-input", "first line\nsecond line")
         TK.tap(s, P * ".bt-send-btn")
-        @test TK.wait_for(s, "mobile send button delivers", "$(q(".bt-user-msg"))?.textContent.includes('first line\\nsecond line')")
+        # The bubble now waits for a receipt from the freshly spawned agent.
+        # Use the first-message launch budget, not the 8s local-DOM budget.
+        @test TK.wait_for(s, "mobile send button delivers", "$(q(".bt-user-msg"))?.textContent.includes('first line\\nsecond line')";
+            timeout=60)
         @test TK.wait_for(s, "composer shrinks after send", "$ta.value==='' && $ta.getBoundingClientRect().height <= 46")
     end
 

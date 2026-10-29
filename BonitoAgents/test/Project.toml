@@ -40,6 +40,9 @@ RemoteSync = {path = "../../RemoteSync"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 ElectronCall = {url = "https://github.com/IanButterworth/ElectronCall.jl.git", rev = "sd/testsuite"}
 BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
-BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
+BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "sd/shared-ui-widgets"}
 
 WorkerLink = {path = "../../WorkerLink"}
+
+[compat]
+BonitoWidgets = "0.1.3"

@@ -11,6 +11,9 @@ FixedPointNumbers = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
 HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Malt = "36869731-bdee-424d-aa32-cab38c994e3b"
+Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 PNGFiles = "f57f5aa1-a3ce-4bc8-8ab9-96f992907883"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
@@ -26,7 +29,7 @@ PNGFiles = "0.4"
 # resolve `Test` and the whole suite errored before running a line.
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 
 [targets]
-test = ["Test", "Sockets"]
+test = ["Test", "ProgressLogging"]

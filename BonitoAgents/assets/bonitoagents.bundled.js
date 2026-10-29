@@ -1664,7 +1664,7 @@ class BonitoChat {
         }
         map[w] = h;
         node.__btBodyH = map;
-        const pics = body.querySelectorAll('.bt-media-wrap');
+        const pics = body.querySelectorAll('.bt-media');
         const extra = pics.length === 1 ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
         node.__btMediaExtra = extra;
         this.comm.notify({
@@ -2309,6 +2309,7 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) {
@@ -2529,7 +2530,7 @@ class BonitoChat {
         return false;
     }
     applyNative(node) {
-        node.classList.add('bt-tool-native');
+        node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
@@ -2537,7 +2538,7 @@ class BonitoChat {
         }
     }
     removeNative(node) {
-        node.classList.remove('bt-tool-native');
+        node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);
     }
@@ -2731,8 +2732,7 @@ class BonitoChat {
                     });
                     if (msg.show_mime) div.dataset.showMime = msg.show_mime;
                     if (this.wantsNative(div)) {
-                        div.classList.add('bt-tool-native');
-                        div.dataset.btAutoExpand = '1';
+                        this.applyNative(div);
                     } else if (msg.expand || msg.expand_full) {
                         if (div.collapsable.editMode) {
                             div.dataset.btAutoMount = '1';
@@ -4019,7 +4019,7 @@ class BonitoChat {
             text.textContent = item.text;
             const status = document.createElement('div');
             status.className = 'bt-queue-status';
-            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' : item.status === 'held' ? 'Goes out with your next message' : item.status === 'offline' ? 'Agent not reachable · sends once it is back' : item.status === 'sending' ? 'Connecting · not sent yet' : item.mode === 'interrupt' ? 'Waiting for interruption to finish' : item.mode === 'next' ? 'Waiting for the next message boundary' : 'Waiting until the agent finishes');
+            status.textContent = item.detail || (item.status === 'paused' ? 'Paused · not sent' : item.status === 'held' ? 'Goes out with your next message' : item.status === 'offline' ? 'Agent not reachable · sends once it is back' : item.status === 'sending' ? 'Connecting · not sent yet' : item.status === 'submitted' ? 'Waiting for agent receipt' : item.mode === 'interrupt' ? 'Waiting for interruption to finish' : item.mode === 'next' ? 'Waiting for the next message boundary' : 'Waiting until the agent finishes');
             const summary = document.createElement('summary');
             summary.className = 'bt-queue-summary';
             const preview = document.createElement('span');
@@ -4027,7 +4027,7 @@ class BonitoChat {
             preview.textContent = item.text;
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
-            badge.textContent = item.status === 'paused' ? 'Paused · not sent' : item.status === 'held' ? 'With your next message' : item.status === 'offline' ? 'Agent offline · queued' : item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' : item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
+            badge.textContent = item.status === 'paused' ? 'Paused' : item.status === 'held' ? 'With your next message' : item.status === 'offline' ? 'Agent offline · queued' : item.status === 'submitted' ? 'Awaiting receipt' : item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' : item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;
             summary.append(preview, badge);
             const detail = document.createElement('div');
@@ -4062,7 +4062,7 @@ class BonitoChat {
             ] : []){
                 const button = document.createElement('button');
                 button.type = 'button';
-                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.className = 'bw-btn bw-btn-ghost bw-btn-sm';
                 button.dataset.queueAction = action;
                 button.dataset.queueId = item.id;
                 button.textContent = label;

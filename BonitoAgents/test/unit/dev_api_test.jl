@@ -386,8 +386,10 @@ end
             # arrived, because the MCP was respawned with the ORIGINAL
             # environment. No number of restarts could fix it; only closing and
             # reopening the chat. Both halves must be derived, not one of each.
-            baked = BT.ProjectInfo("baked-env", "proj", "w-none",
-                                   mktempdir(), "/remote/baked", BT.now(BT.UTC))
+            # Enabling dev mode builds a briefing by statting the project's
+            # directory on its worker. Use this suite's real connected worker.
+            baked = BT.ProjectInfo("baked-env", "proj", wid,
+                                   mktempdir(), mktempdir(), BT.now(BT.UTC))
             st.projects[]["baked-env"] = baked
             stale = [BT.AgentClientProtocol.MCPServer(
                          BT.INJECTED_MCP_NAME, "/usr/bin/julia";

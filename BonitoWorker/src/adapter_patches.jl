@@ -120,3 +120,44 @@ function patch_active_steering!(root::AbstractString = harness_root())
     mv(tmp, file; force = true)
     return :patched
 end
+
+# ACP v1's prompt response arrives at completion, while writing a queued prompt
+# says nothing about whether Claude consumed it. Reuse the adapter's existing
+# insertion event; all queue persistence and cancellation decisions stay in the
+# shared client. Remove this shim when the adapter ships prompt receipts.
+const PROMPT_RECEIPT_PATCH_MARK = "/* bonitoworker: prompt receipts */"
+
+function patch_prompt_receipts(src::AbstractString)
+    capability = r"(agentCapabilities:\s*\{\s*_meta:\s*\{)"
+    callback = r"inserted\(\)\s*\{\s*\}"
+    all(p -> length(collect(eachmatch(p, src))) == 1, (capability, callback)) || return nothing
+    patched = replace(src, capability => SubstitutionString("\\1 promptReceipts: true,"); count=1)
+    patched = replace(patched, callback => "inserted: () => { $PROMPT_RECEIPT_PATCH_MARK\n" *
+        "const id = params._meta?.bonitoPromptId;\n" *
+        "if (typeof id === \"string\") this.client.extNotification(\"_bonito/prompt_received\", " *
+        "{ sessionId: params.sessionId, messageId: id }).catch(error => " *
+        "this.logger.error(\"Prompt receipt failed:\", error));\n}"; count=1)
+    # This adapter already supports a host-owned idle fallback, but advertises
+    # only `supported`. Expose its existing option so the shared client can use
+    # real mid-turn steering rather than a low-priority ordinary prompt.
+    steering = r"steering:\s*\{\s*supported:\s*true\s*,?\s*\}"
+    if occursin("params._meta?.steering?.idleBehavior === \"promptRequired\"", src) &&
+       length(collect(eachmatch(steering, src))) == 1
+        patched = replace(patched, steering => "steering: { supported: true, idleBehavior: \"promptRequired\" }"; count=1)
+    end
+    return patched
+end
+
+function patch_prompt_receipts!(root::AbstractString = harness_root())
+    file = joinpath(package_dir(root, "@agentclientprotocol/claude-agent-acp"), "dist", "acp-agent.js")
+    isfile(file) || return :absent
+    src = read(file, String)
+    occursin(PROMPT_RECEIPT_PATCH_MARK, src) && return :patched
+    patched = patch_prompt_receipts(src)
+    patched === nothing && return :unchanged
+    tmp = file * ".partial"
+    write(tmp, patched)
+    chmod(tmp, filemode(file) & 0o777)
+    mv(tmp, file; force=true)
+    return :patched
+end

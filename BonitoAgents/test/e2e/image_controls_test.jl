@@ -21,7 +21,12 @@
         TK.send_message(s, "seed pictures")
         @test TK.wait_for(s, "tool picture decoded", "$(q("img.bt-media"))?.naturalWidth === 1200"; timeout=45)
         @test TK.wait_for(s, "Markdown picture decoded", "$(q(".bt-agent-msg img"))?.naturalWidth === 1200"; timeout=30)
+        # Read the earlier media before opening its toolbar, as a user scrolling
+        # back does. Following the newest reply would otherwise undo the helper's
+        # scrollIntoView between mouse-down and mouse-up.
+        TK.eval_js(s,"$(q(".bt-messages")).dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaY:-1})); true")
         for selector in (".bt-media-enlarge", ".bt-agent-msg img")
+            selector==".bt-media-enlarge" && TK.real_click(s,P*".bt-media-actions .bw-menu-trigger")
             TK.real_click(s, P * selector)
             @test TK.wait_for(s, "enlarged image decoded", decoded)
             @test TK.eval_js(s, "(() => {const r=$big.getBoundingClientRect();return r.width>600 && r.height>400 && r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight;})()")

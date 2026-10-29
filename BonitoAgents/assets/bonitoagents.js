@@ -1922,7 +1922,7 @@ class BonitoChat {
         map[w] = h;
         node.__btBodyH = map;
         // Of that, what is not its one picture (`bodyReserve`).
-        const pics = body.querySelectorAll('.bt-media-wrap');
+        const pics = body.querySelectorAll('.bt-media');
         const extra = pics.length === 1
             ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
         node.__btMediaExtra = extra;
@@ -2809,6 +2809,10 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // An edit can mount before all of its arguments have streamed in.
+        // Refresh an existing preview when its source changes, using the same
+        // near-viewport scheduler and serialized render requests as first mount.
+        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
@@ -3147,7 +3151,9 @@ class BonitoChat {
     }
 
     applyNative(node) {
-        node.classList.add('bt-tool-native');
+        // The body will supply the shared file toolbar. Hide the tool header
+        // before its loading placeholder is laid out, not after that RPC.
+        node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
@@ -3158,7 +3164,7 @@ class BonitoChat {
     }
 
     removeNative(node) {
-        node.classList.remove('bt-tool-native');
+        node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
     }
@@ -3423,8 +3429,7 @@ class BonitoChat {
                 if (this.wantsNative(div)) {
                     // Native display: chrome off + body auto-mounted on
                     // first insertion.
-                    div.classList.add('bt-tool-native');
-                    div.dataset.btAutoExpand = '1';
+                    this.applyNative(div);
                 } else if (msg.expand || msg.expand_full) {
                     // Auto-expand (bt_show refs, eval eager-mount /
                     // expand_full) — DEFERRED until the node first enters the
@@ -5032,6 +5037,7 @@ class BonitoChat {
                 item.status === 'held' ? 'Goes out with your next message' :
                 item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
                 item.status === 'sending' ? 'Connecting · not sent yet' :
+                item.status === 'submitted' ? 'Waiting for agent receipt' :
                 item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
                 item.mode === 'next' ? 'Waiting for the next message boundary' :
                 'Waiting until the agent finishes');
@@ -5042,9 +5048,10 @@ class BonitoChat {
             preview.textContent = item.text;
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
-            badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+            badge.textContent = item.status === 'paused' ? 'Paused' :
                 item.status === 'held' ? 'With your next message' :
                 item.status === 'offline' ? 'Agent offline · queued' :
+                item.status === 'submitted' ? 'Awaiting receipt' :
                 item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
                 item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;
@@ -5063,7 +5070,7 @@ class BonitoChat {
                     item.status === 'waiting' || item.status === 'offline' ? [['remove', 'Remove']] : []) {
                 const button = document.createElement('button');
                 button.type = 'button';
-                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.className = 'bw-btn bw-btn-ghost bw-btn-sm';
                 button.dataset.queueAction = action;
                 button.dataset.queueId = item.id;
                 button.textContent = label;

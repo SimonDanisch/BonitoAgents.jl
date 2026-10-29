@@ -35,6 +35,7 @@ BonitoWorker.WebSockets.receive(ws::MCPEnvFrames) = popfirst!(ws.frames)
             env = Dict(e["name"] => e["value"] for e in servers[1]["env"])
             @test sort(collect(keys(env))) == ["BONITOAGENTS_CONTROL_TOKEN", "BONITOAGENTS_CONTROL_URL",
                                                "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN",
+                                               "BONITOAGENTS_PROGRESS_ADDR", "BONITOAGENTS_PROGRESS_TOKEN",
                                                "BONITOAGENTS_PROJECT_ID", "BONITOAGENTS_VALUES_ADDR"]
             @test startswith(env["BONITOAGENTS_CONTROL_URL"], "ws://127.0.0.1:")
             @test startswith(env["BONITOAGENTS_VALUES_ADDR"], "127.0.0.1:")
@@ -65,6 +66,19 @@ BonitoWorker.WebSockets.receive(ws::MCPEnvFrames) = popfirst!(ws.frames)
     @test BonitoWorker.relay_request(relay, evaltoken) === nothing
     @test BonitoWorker.relay_request(relay, control * " eval bridge-1") === nothing
     @test BonitoWorker.relay_request(relay, evaltoken * " eval ") === nothing
+    progress = env["BONITOAGENTS_PROGRESS_TOKEN"]
+    @test BonitoWorker.relay_request(relay,progress)[3]["kind"] == "progress"
+    @test BonitoWorker.relay_request(relay,progress * " eval bridge") === nothing
+    @test BonitoWorker.relay_request(relay,progress * " values") === nothing
+    restarted = BonitoWorker.mcp_relay_env(relay,"test-chat";owner="replacement")
+    @test restarted["BONITOAGENTS_PROGRESS_TOKEN"] == progress
+    otherchat = BonitoWorker.mcp_relay_env(relay,"other-chat";owner="other")
+    @test otherchat["BONITOAGENTS_PROGRESS_TOKEN"] != progress
+    BonitoWorker.revoke_mcp_grants!(relay,"roles")
+    @test BonitoWorker.relay_request(relay,progress) !== nothing
+    # Renew the agent grants for the remaining role checks.
+    env = BonitoWorker.mcp_relay_env(relay,"test-chat";owner="roles-new")
+    control,evaltoken=env["BONITOAGENTS_CONTROL_TOKEN"],env["BONITOAGENTS_EVAL_TOKEN"]
     # Value exchanges: the chat's session asks, the other side answers a pair.
     @test BonitoWorker.relay_request(relay, evaltoken * " values")[3] ==
           Dict{String,Any}("kind" => "values", "project_id" => "test-chat", "host" => false)

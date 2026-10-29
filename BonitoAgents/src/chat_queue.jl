@@ -1,5 +1,5 @@
 # Pending text is an outbox, not conversation history. A submission enters
-# chat.md only once prompt! has handed it to the agent connection.
+# chat.md only once the agent confirms receipt, when receipts are supported.
 #
 # `riders`: what the chat would have told the agent on its own while the user
 # had it stopped (`stopped`). They go out with this message, the user's next:
@@ -55,6 +55,28 @@ origin_from_wire(o::AbstractDict) = PeerMessageOrigin(String(o["id"]), String(o[
     String(o["title"]), String(o["worker_id"]), String(o["worker_name"]), DateTime(o["sent_at"]))
 
 const HELD_DETAIL = "You pressed Stop: this goes out with your next message."
+const PEER_DISABLED_DETAIL = "Not sent: Chat messaging was turned off. Enable it in both chats, then send again or remove this message."
+
+function pause_disallowed_peer_sends!(model; revoked_project = "")
+    lock(model.lock) do
+        changed = false
+        for entry in model.pending_sends
+            entry isa PendingSend && entry.origin !== nothing &&
+                entry.status in (:waiting, :offline, :sending) || continue
+            revoked = !isempty(revoked_project) &&
+                (entry.origin.project_id == revoked_project || model.project_id == revoked_project)
+            !revoked && peer_messaging_allowed(model.state, entry.origin.project_id, model.project_id) && continue
+            entry.status = :paused
+            entry.detail = PEER_DISABLED_DETAIL
+            changed = true
+        end
+        if changed
+            save_pending_sends!(model)
+            emit_queue!(model)
+        end
+    end
+    return nothing
+end
 
 # The prompt of a message with riders: theirs first, as they happened before it.
 with_riders(riders::Vector{UserMsg}, text::AbstractString) =
@@ -81,13 +103,13 @@ send_mode(s) = s == "interrupt" ? :interrupt : s == "next" ? :next : :done
 function yolo_ready(model)
     s = shared(model)
     return s.yolo[] && !s.stopped[] && isempty(AgentClientProtocol.open_turns(s)) &&
-        !any(e -> e isa PendingSend && e.status in (:waiting, :offline, :sending), s.pending_sends)
+        !any(e -> e isa PendingSend && e.status in (:waiting, :offline, :sending, :submitted), s.pending_sends)
 end
 
 # Caller holds the chat lock and persists/broadcasts the resulting queue.
 function drop_idle_sends!(model)
     for e in model.pending_sends
-        e isa PendingSend && e.mode === :idle && e.status !== :sent || continue
+        e isa PendingSend && e.mode === :idle && !(e.status in (:sent, :submitted)) || continue
         e.status = :superseded
     end
     filter!(e -> !(e isa PendingSend && e.status === :superseded), model.pending_sends)
@@ -157,12 +179,15 @@ function load_pending_sends!(model)
         # to the agent (a handed-over entry is :sent and not persisted), so it
         # goes out once this chat's consumer runs.
         status = get(row, "status", "waiting")
-        kept = status == "paused" ? :paused : status == "held" ? :held : :waiting
+        # A submitted prompt may have run before a crash. Keep it for review
+        # rather than silently dropping it or automatically executing it twice.
+        kept = status in ("paused", "submitted") ? :paused : status == "held" ? :held : :waiting
         kept === :held && (model.stopped[] = true)
         push!(model.pending_sends, PendingSend(String(row["id"]),
             UserMessage(with_riders(riders, bubble.text), collect(AgentClientProtocol.ImageAttachment, images)),
             bubble, riders, send_mode(get(row, "mode", "done")), kept,
-            kept === :waiting ? "" : String(get(row, "detail", "")), nothing,
+            status == "submitted" ? "Receipt was not confirmed before the connection closed. Queue again or remove it." :
+                kept === :waiting ? "" : String(get(row, "detail", "")), nothing,
             origin_from_wire(get(row, "origin", nothing))))
     end
     dropped_idle && save_pending_sends!(model)
@@ -232,11 +257,13 @@ function enqueue_message!(model, msg; images, mode, origin = nothing)
     @info "message queued" project_id=s.project_id message_id=entry.id mode status=entry.status riders=length(entry.riders)
     emit_queue!(s)
     entry.status === :held || wake_outbox!(s)
-    # Native steering is safe during a quiet tool call too. Waiting for the
-    # next output/tool boundary can otherwise strand input behind bt_wait.
+    # Steering and acknowledged prompt queueing are safe during a quiet tool
+    # call too. Waiting for output can strand input behind a voluntary wait.
     c = client(s.agent)
     if entry.status === :waiting && mode === :next && c !== nothing &&
-            get(c.session_result, "bonitoActiveSteering", false)
+            (get(c.session_result, "bonitoActiveSteering", false) ||
+             (get(c.session_result, "bonitoPromptQueueing", false) &&
+              get(c.session_result, "bonitoPromptReceipts", false)))
         Base.errormonitor(@async deliver_boundary_message!(s))
     end
     return nothing
@@ -245,20 +272,50 @@ end
 function next_submission(model)
     s = shared(model)
     lock(s.lock) do
+        pause_disallowed_peer_sends!(s)
         # Already-steered spans must settle before a new ordinary turn starts.
-        for ready in (==(:sent), in((:waiting, :offline)))
+        for ready in (in((:sent, :submitted)), in((:waiting, :offline)))
             i = findfirst(e -> e isa PendingSend && ready(e.status), s.pending_sends)
             i === nothing && continue
             e = s.pending_sends[i]
-            e.status == :sent || (e.status = :sending)
+            e.status in (:sent, :submitted) || (e.status = :sending)
             return e
         end
         return nothing
     end
 end
 
+has_other_turn(model, turn) = any(t -> t !== turn, AgentClientProtocol.open_turns(model))
+
+function submission_submitted!(model, e, span; text, receipt_id)
+    e.status = :submitted
+    e.detail = "Waiting for the agent to receive this message"
+    e.span = (turn=span, nstore0=length(model.msgs_store), receipt_id=receipt_id, text=text)
+    save_pending_sends!(model)
+    emit_queue!(model)
+    @info "message awaiting agent receipt" project_id=model.project_id message_id=e.id receipt_id
+    # Let a voluntary wait return so the agent can consume this queued input.
+    # A fresh prompt can start its own wait before this control frame arrives.
+    # Only input to an already running turn should release a wait.
+    has_other_turn(model, span) && wake_agent_waits!(model)
+    return span
+end
+
+function confirm_submission!(model, receipt_id)
+    s = shared(model)
+    lock(s.lock) do
+        i = findfirst(e -> e isa PendingSend && e.status === :submitted &&
+            e.span !== nothing && e.span.receipt_id == receipt_id, s.pending_sends)
+        i === nothing && return nothing
+        e = s.pending_sends[i]
+        submission_sent!(s, e, e.span.turn; text=e.span.text)
+    end
+    return nothing
+end
+
 function submission_sent!(model, e, span; text = e.bubble.text)
     e.status = :sent
+    e.detail = ""
     e.bubble.text = text
     foreach(r -> close(send!(model, r)), e.riders)
     close(send!(model, e.bubble))
@@ -346,7 +403,18 @@ end
 function settle_submission!(model, entry, failure)
     go_on = true
     lock(model.lock) do
-        if entry.status == :sent
+        if entry.status === :submitted
+            if entry.mode === :idle
+                # An unconsumed continuation belongs to the old turn. Never
+                # offer to replay it after Stop or into the user's new task.
+                entry.status = :superseded
+                filter!(e -> e !== entry, model.pending_sends)
+            else
+                entry.status = :paused
+                entry.detail = "The turn ended without confirming receipt. Queue again or remove it."
+            end
+            entry.span = nothing
+        elseif entry.status == :sent
             filter!(e -> e !== entry, model.pending_sends)
         elseif entry.status == :sending
             if failure !== nothing
@@ -379,6 +447,13 @@ function drop_queued_sends!(model::ChatModel)
     count = lock(s.lock) do
         n = 0
         for e in s.pending_sends
+            if e isa PendingSend && e.status === :submitted
+                # Its prompt is still on the wire. Retain its receipt token
+                # until the cancel settles, including a racing late receipt.
+                e.detail = "Stopping; receipt has not been confirmed"
+                n += 1
+                continue
+            end
             e isa PendingSend && e.status in (:waiting, :offline, :sending) || continue
             if e.bubble.auto
                 e.status = :held
@@ -406,12 +481,14 @@ function deliver_boundary_message!(model)
     cancelling(s) && return nothing
     native = get(c.session_result, "bonitoActiveSteering", false)
     entry = lock(s.lock) do
+        pause_disallowed_peer_sends!(s)
         i = findfirst(e -> e isa PendingSend && e.status == :waiting && e.mode == :next, s.pending_sends)
         i === nothing && return nothing
         e = s.pending_sends[i]
-        if !native && !get(c.session_result, "bonitoPromptQueueing", false)
+        if !native && !(get(c.session_result, "bonitoPromptQueueing", false) &&
+                       get(c.session_result, "bonitoPromptReceipts", false))
             e.mode = :done
-            e.detail = "This agent does not advertise steering; waiting until the turn finishes."
+            e.detail = "This agent does not advertise steering with delivery confirmation; waiting until the turn finishes."
             save_pending_sends!(s)
             emit_queue!(s)
             return nothing
@@ -441,12 +518,15 @@ function deliver_boundary_message!(model)
         else
             lock(s.lock) do
                 entry.status === :sending || return nothing
-                AgentClientProtocol.prompt!(c, with_prelude(s, payload.message.text); images=payload.message.images)
+                receipt_id = string(uuid4())
+                turn = AgentClientProtocol.prompt!(c, with_prelude(s, payload.message.text);
+                    images=payload.message.images, receipt_id)
+                submission_submitted!(s, entry, turn; text=payload.text, receipt_id)
             end
         end
         !native && span === nothing && return nothing
         lock(s.lock) do
-            submission_sent!(s, entry, span; text = payload.text)
+            native && submission_sent!(s, entry, span; text = payload.text)
         end
         native && wake_agent_waits!(s)
     catch err

@@ -115,7 +115,7 @@
         @test get(Bonito.Hyperscript.attrs(page), "class", "") == "bt-fv-notebook"
         @test !occursin("onerror", sprint(show, page))
         # The markdown page has no scripts, so its bar's styles are written out.
-        @test occursin(".bt-btn-secondary", BT.css_text(BT.ShareStyles))
+        @test occursin(".bw-btn-secondary", BT.css_text(BT.ShareStyles))
     end
 
     @testset "a page's viewer, from the file's content" begin

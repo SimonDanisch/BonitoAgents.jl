@@ -8,6 +8,7 @@ using Test
 delete!(ENV, "JULIA_LOAD_PATH")
 
 @testset "BonitoMCP" begin
+    include("test_progress_logging.jl")
     # Stability regressions (M2–M7, M9–M11, M14): output caps, kill-session
     # races, dial bootstrap, requestId-scoped cancel. Pure unit tests.
     include("test_stability.jl")

@@ -115,6 +115,7 @@ const BT = BonitoAgents
             # other dev-API test calls `dev_request` directly and would pass
             # even if the two halves disagreed about the frame shape.
             @testset "dev_request round-trip (MCP → server → reply)" begin
+                BT.set_dev_mode!(state, "ctrl-proj", true)
                 BT.install_log_ring!()
                 @info "unit:mcp_ctrl dev probe"
 
@@ -148,6 +149,13 @@ const BT = BonitoAgents
                     bad = tool.handler(Dict{String,Any}("section" => "bogus"))
                     @test bad["isError"] == true
                     @test occursin("bogus", bad["content"][1]["text"])
+                    # Keep this MCP and its original env/tool object alive:
+                    # revocation is enforced on the server, without a restart.
+                    BT.set_dev_mode!(state, "ctrl-proj", false)
+                    revoked = tool.handler(Dict{String,Any}("section" => "overview"))
+                    @test revoked["isError"]
+                    @test occursin("Dev mode is off", revoked["content"][1]["text"])
+                    BT.set_dev_mode!(state, "ctrl-proj", true)
                 end
                 withenv("BONITOAGENTS_DEV_TOOLS" => nothing) do
                     @test !any(t -> t.name == "bt_dev_inspect", BonitoMCP.available_tools())

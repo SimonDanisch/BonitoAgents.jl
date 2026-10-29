@@ -38,7 +38,10 @@
         # Another tab opens chats until the cap on live agents closes the oldest
         # idle one, which is X (every chat has a message, so none is preferred).
         other = TK.another_tab(s)
-        TK.wait_for(other, "the other tab's dashboard", "!!document.querySelector('.bt-dash')"; timeout = 60)
+        # A new tab restores X from localStorage. The dashboard's hidden DOM
+        # exists before that navigation finishes; wait for the actual restored
+        # view before new_chat clicks Home, or restoration can undo that click.
+        @test TK.wait_for(other, "the other tab restored X", shown(x); timeout = 60)
         for i in 1:TK.BT.BIND_CAP
             TK.new_chat(other; title = "Fill$(i)")
             TK.send_message(other, "fill $(i)")

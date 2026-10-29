@@ -36,10 +36,12 @@
         # right switch on the wrong chat.
         @test occursin("p1", err)
         # The companion tool is gated by the same switch.
-        err = try
-            BT.dev_request(st, "sync_folder", Dict{String,Any}("worker" => "MacBook", "src" => "/a"), "p1"); ""
-        catch e; sprint(showerror, e) end
-        @test occursin("switched OFF", err)
+        for direction in ("push", "pull"), op in ("sync_folder", "sync_folder_v2")
+            err = try
+                BT.dev_request(st, op, Dict{String,Any}("worker" => "MacBook", "src" => "/a", "direction" => direction), "p1"); ""
+            catch e; sprint(showerror, e) end
+            @test occursin("switched OFF", err)
+        end
         # A request that names no chat (no project id on the channel) can't be granted.
         err = try; BT.dev_request(st, "remote_eval", eval_args("MacBook"), ""); ""
               catch e; sprint(showerror, e) end
@@ -74,6 +76,14 @@
         err = try; BT.dev_request(st, "remote_eval", eval_args("MacBook"; op = "dance"), "p1"); ""
               catch e; sprint(showerror, e) end
         @test occursin("unknown remote op", err)
+        err = try
+            BT.dev_request(st, "sync_folder", Dict{String,Any}("worker" => "MacBook", "src" => "/a", "direction" => "sideways"), "p1"); ""
+        catch e; sprint(showerror, e) end
+        @test occursin("`direction` must be `push` or `pull`", err)
+        err = try
+            BT.dev_request(st, "sync_folder", Dict{String,Any}("worker" => "MacBook", "src" => "/a", "direction" => "pull", "paths" => ["result.txt"]), "p1"); ""
+        catch e; sprint(showerror, e) end
+        @test occursin("update source worker 'MacBook'", err)
         # With everything in order but no control socket to the worker, the
         # spawn is refused as unreachable — the message the agent relays.
         err = try; BT.dev_request(st, "remote_eval", eval_args("MacBook"), "p1"); ""

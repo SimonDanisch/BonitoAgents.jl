@@ -8,6 +8,57 @@ using Test, BonitoWorker
 import JSON
 const BW = BonitoWorker
 
+const RECEIPT_FIXTURE = raw"""
+class Agent {
+  sent = [];
+  logger = { error: (...args) => { throw new Error(args.join(" ")); } };
+  client = { extNotification: async (method, params) => { this.sent.push({method, params}); } };
+  initialize() { return { agentCapabilities: { _meta: { claudeCode: { promptQueueing: true } } }, _meta: { steering: { supported: true } } }; }
+  async steer(params) {
+    if (params._meta?.steering?.idleBehavior === "promptRequired") return {outcome:"promptRequired"};
+  }
+  async prompt(params) {
+    let events;
+    const outcome = new Promise((resolve, reject) => {
+      events = { inserted() {}, ended: resolve, failed: reject };
+    });
+    if (params.consume) events.inserted("sdk-uuid");
+    events.ended({stopReason: params.consume ? "end_turn" : "cancelled"});
+    return outcome;
+  }
+}
+const agent = new Agent();
+await agent.prompt({sessionId:"s", _meta:{bonitoPromptId:"never-consumed"}, consume:false});
+await agent.prompt({sessionId:"s", _meta:{bonitoPromptId:"received"}, consume:true});
+await agent.prompt({sessionId:"s", consume:true}); // ordinary ACP clients need no extension
+console.log(JSON.stringify({caps:agent.initialize(), sent:agent.sent}));
+"""
+
+@testset "claude-agent-acp: prompt receipts" begin
+    patched = BW.patch_prompt_receipts(RECEIPT_FIXTURE)
+    @test patched !== nothing
+    @test BW.patch_prompt_receipts(patched) === nothing
+    @test BW.patch_prompt_receipts(replace(RECEIPT_FIXTURE, "inserted() {}"=>"inserted() { changed(); }")) === nothing
+    mktempdir() do root
+        @test BW.patch_prompt_receipts!(root) === :absent
+        file = joinpath(root, "npm", "node_modules", "@agentclientprotocol", "claude-agent-acp", "dist", "acp-agent.js")
+        mkpath(dirname(file))
+        write(file, RECEIPT_FIXTURE)
+        Sys.iswindows() || chmod(file, 0o751)
+        @test BW.patch_prompt_receipts!(root) === :patched
+        @test BW.patch_prompt_receipts!(root) === :patched
+        Sys.iswindows() || @test filemode(file) & 0o777 == 0o751
+        node = Sys.which("node")
+        if node !== nothing
+            result = JSON.parse(read(`$node --input-type=module -e $(read(file,String))`, String))
+            @test result["caps"]["agentCapabilities"]["_meta"]["promptReceipts"] === true
+            @test result["caps"]["_meta"]["steering"]["idleBehavior"] == "promptRequired"
+            @test only(result["sent"])["method"] == "_bonito/prompt_received"
+            @test only(result["sent"])["params"] == Dict("sessionId"=>"s", "messageId"=>"received")
+        end
+    end
+end
+
 const STEERING_FIXTURE = raw"""
 class Agent {
   started = 0;

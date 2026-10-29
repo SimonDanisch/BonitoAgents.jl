@@ -381,10 +381,15 @@ share_file_policy(::MIME"application/pdf") = nothing
 
 # A shared page's header: the file's name and a Download button for `url`.
 share_bar(l::ShareLink, url::AbstractString) =
-    DOM.div(DOM.span(basename(l.path); class = "bt-share-name"),
-            DOM.a("Download"; href = url, download = basename(l.path),
-                  class = "bt-btn bt-btn-secondary bt-btn-sm bt-share-download");
-            class = "bt-share-bar")
+    FileToolbar(isempty(l.title) ? basename(l.path) : l.title;
+        metadata=basename(l.path),
+        actions=(DOM.a("Download"; href=url,download=basename(l.path),
+                    class="bw-btn bw-btn-secondary bw-btn-sm bt-share-download"),
+            share_media_actions(file_kind(l.path))), class="bt-share-bar")
+
+share_media_actions(::FileKind) = ()
+share_media_actions(kind::Union{ImageFile,VideoFile}) =
+    Menu(media_menu_items(kind isa VideoFile;download=false);title="File actions")
 
 # A file's path under its link, relative to the page.
 share_href(rel::AbstractString) = join(HTTP.escapeuri.(splitpath(rel)), "/")
@@ -447,7 +452,7 @@ end
 function share_page(::MarkdownShare, state::ServerState, l::ShareLink, context)
     body = markdown_html(read_share_markdown(state, l), no_link)
     css = read(Bonito.local_path(Bonito.MarkdownCSS), String)
-    bar = sprint(show, MIME"text/html"(), share_bar(l, share_href(basename(l.path))))
+    bar = sprint(show, MIME"text/html"(), file_toolbar_node(share_bar(l, share_href(basename(l.path)))))
     html = """<!doctype html><html><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>$(esc_html(l.title))</title><style>$(css)
@@ -589,20 +594,20 @@ end
 # ── App pages ────────────────────────────────────────────────────────────────
 
 const ShareStyles = Bonito.Styles(
-    THEME_TOKENS, BUTTON_CSS...,
+    BASE_STYLES, FILE_TOOLBAR_CSS...,
     # Light, as the viewers in them are: Bonito's own theme follows a dark
-    # desktop otherwise (see `html:root` in styles.jl BASE_CSS for why `html:`).
+    # desktop otherwise (see `html:root` in styles.jl BASE_STYLES for why `html:`).
     CSS("html:root", "color-scheme" => "light"),
-    CSS(".bt-share-page", "max-width" => "1200px", "margin" => "0 auto", "padding" => "var(--bt-space-4)",
-        "font-family" => "system-ui, sans-serif", "color" => "var(--bt-text)"),
-    CSS(".bt-share-note", "color" => "var(--bt-text-muted)", "padding" => "2rem 0"),
-    CSS(".bt-share-bar", "display" => "flex", "align-items" => "center", "gap" => "var(--bt-space-3)",
-        "padding-bottom" => "var(--bt-space-3)"),
-    CSS(".bt-share-name", "font-weight" => "600", "overflow-wrap" => "anywhere", "flex" => "1 1 auto"),
+    CSS(".bt-share-page", "max-width" => "1200px", "margin" => "0 auto", "padding" => "var(--bw-space-4)",
+        "font-family" => "system-ui, sans-serif", "color" => "var(--bw-text)"),
+    CSS(".bt-share-note", "color" => "var(--bw-text-muted)", "padding" => "2rem 0"),
+    CSS(".bt-share-bar", "border"=>"1px solid var(--bw-border)",
+        "border-radius"=>"var(--bw-radius) var(--bw-radius) 0 0"),
     # The viewer fills the window below the bar.
     CSS(".bt-share-viewer", "display" => "flex", "flex-direction" => "column",
         "height" => "calc(100vh - 96px)", "min-height" => "320px",
-        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius)", "overflow" => "hidden"))
+        "border" => "1px solid var(--bw-border)", "border-top"=>"0",
+        "border-radius" => "0 0 var(--bw-radius) var(--bw-radius)", "overflow" => "hidden"))
 
 # A style sheet as CSS text, for a page without Bonito (`share_page(::MarkdownShare)`).
 # Sheets with an `Asset` in them need a session to name its url.
@@ -614,7 +619,7 @@ function share_page(::AppShare, state::ServerState, l::ShareLink, context)
         root = open_share_page!(state, Bonito.root_session(session))
         content = Observable{Any}(DOM.div("Starting the app…"; class = "bt-share-note"))
         Base.errormonitor(@async content[] = share_app_content(state, l, root))
-        return DOM.div(ShareStyles, content; class = "bt-share-page")
+        return DOM.div(ShareStyles,FileToolbar(l.title;metadata="Live result"),content; class = "bt-share-page")
     end
     return Bonito.HTTPServer.apply_handler(app, context)
 end
@@ -752,16 +757,21 @@ function share_result!(state::ServerState, project_id::AbstractString, payload::
 end
 
 const ShareControlStyles = Bonito.Styles(
+    # Output controls also travel with detached results. Carry the shared
+    # tokens and button rules rather than depending on the dashboard sheet.
+    BASE_STYLES,
     CSS(".bt-share-control", "display" => "flex", "align-items" => "center",
-        "gap" => "var(--bt-space-2)", "flex-wrap" => "wrap"),
+        "gap" => "var(--bw-space-2)", "flex-wrap" => "wrap",
+        "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-share-control [hidden]", "display" => "none"),
-    CSS(".bt-share-link", "overflow-wrap" => "anywhere", "user-select" => "text"),
-    CSS(".bt-share-error", "white-space" => "pre-wrap"))
+    CSS(".bt-share-error", "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
+        "color" => "var(--bw-error)"),
+    CSS(".bt-share-error:empty", "display" => "none"))
 
 struct ShareControl{F}
     create::F
     hint::String
-    progress::Union{Nothing,Observable}
+    progress::Union{Nothing,ChatProgress}
 end
 ShareControl(create::F; hint::String, progress = nothing) where F = ShareControl(create, hint, progress)
 
@@ -775,36 +785,38 @@ function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
     pending = Ref(false)
     on(session, request) do _
         pending[] && return
-        if progress !== nothing && is_busy_running(progress[])
-            safe_set!(answer, "error:Something else is running in this window. Wait for it to finish.")
-            return
-        end
         pending[] = true
-        progress === nothing || busy_start!(progress, "Sharing result")
+        job = progress === nothing ? nothing : BonitoMCP.BonitoProgress.progress(progress, "Sharing result")
         Base.errormonitor(@async try
             safe_set!(answer, "link:" * control.create())
-            progress === nothing || busy_done!(progress, "Shared link created")
+            job === nothing || BonitoMCP.BonitoProgress.finish!(job; detail="Shared link created")
         catch e
-            e isa InterruptException && rethrow()
+            if e isa InterruptException
+                job === nothing || BonitoMCP.BonitoProgress.cancel!(job)
+                rethrow()
+            end
             detail = sprint(showerror, e)
             @warn "sharing result failed" exception = (e, catch_backtrace())
             safe_set!(answer, "error:" * detail)
-            progress === nothing || busy_fail!(progress, "Could not share result", detail)
+            job === nothing || BonitoMCP.BonitoProgress.fail!(job, detail)
         finally
             pending[] = false
         end)
     end
     button = DOM.button("Share"; type = "button", disabled = true,
-                        class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-result",
+                        class = "bw-btn bw-btn-sm bw-btn-secondary bt-share-result",
                         title = control.hint, ariaLabel = "Share this output")
-    link = DOM.a(; class = "bt-share-link", target = "_blank", rel = "noopener noreferrer")
+    link = DOM.a("Open shared link"; class = "bw-menu-item bt-share-link",
+                 hidden = true, target = "_blank", rel = "noopener noreferrer")
     copy = DOM.button("Copy link"; type = "button", hidden = true,
-                      class = "bt-btn bt-btn-sm bt-btn-secondary bt-share-copy")
+                      class = "bw-menu-item bt-share-copy")
+    menu = Menu([link,copy];title="Sharing options",label="Share")
+    options = DOM.div(menu;class="bt-share-options",hidden=true)
     error = DOM.span(; class = "bt-share-error", role = "status")
-    node = DOM.div(ShareControlStyles, button, link, copy, error; class = "bt-share-control")
+    node = DOM.div(ShareControlStyles, button, options, error; class = "bt-share-control")
     Bonito.onload(session, node, js"""root => {
-        const button = $(button), link = $(link), copy = $(copy), error = $(error);
-        const request = $(request), answer = $(answer);
+        const button = $(button), link = $(link), copy = $(copy), error = $(error), options=$(options);
+        const request = $(request), answer = $(answer), menu_open = $(menu.open);
         button.addEventListener('click', e => {
             e.preventDefault(); e.stopPropagation();
             button.disabled = true; error.textContent = '';
@@ -812,14 +824,16 @@ function Bonito.jsrender(session::Bonito.Session, control::ShareControl)
         });
         copy.addEventListener('click', e => {
             e.preventDefault(); e.stopPropagation();
+            menu_open.notify(false);
             ($(COPY_TEXT_JS))(link.href).catch(() => {
-                error.textContent = 'Could not copy automatically. Select and copy the link.';
+                error.textContent = 'Could not copy automatically. Open the link and copy its address.';
             });
         });
         answer.on(value => {
             if (value.startsWith('link:')) {
-                link.href = value.slice(5); link.textContent = value.slice(5);
-                copy.hidden = false; button.hidden = true;
+                link.href = value.slice(5); link.title = value.slice(5);
+                link.hidden = false; copy.hidden = false; button.hidden = true; options.hidden=false;
+                menu_open.notify(true);
             } else if (value.startsWith('error:')) {
                 error.textContent = value.slice(6); button.disabled = false;
             }
@@ -887,13 +901,13 @@ function shares_section(session::Bonito.Session, state::ServerState)
                    DOM.td(DOM.input(type = "password",
                                     placeholder = isempty(l.password_hash) ? "no password" : "password set",
                                     class = "bt-share-password"),
-                          DOM.button("Set"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                          DOM.button("Set"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                                      onclick = js"""event => {
                                          const f = event.target.parentElement.querySelector('.bt-share-password');
                                          $(password).notify([$(l.id), f.value]); f.value = ''; }""")),
-                   DOM.td(DOM.button("Copy link"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                   DOM.td(DOM.button("Copy link"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                                      onclick = js"event => navigator.clipboard.writeText($(url))"),
-                          DOM.button("End"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                          DOM.button("End"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                                      onclick = js"event => $(revoke).notify($(l.id))")))
         end
         DOM.table(DOM.tr(DOM.th("Link"), DOM.th("Made"), DOM.th("Password (empty: none)"), DOM.th("")),

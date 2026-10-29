@@ -196,6 +196,7 @@ struct SidebarChat
     group   :: Observable{String}
     # Persistent image identity, shared with the dashboard.
     image   :: Observable{Any}
+    progress::JobBook
     tree    :: Union{Nothing,WorkerFileTree}
     active0 :: Bool        # first paint only; the nav handler owns it afterwards
 end
@@ -208,12 +209,21 @@ function render_part(session::Bonito.Session, c::SidebarChat)   # timed: diagnos
     icon_node = DOM.div(
         map(session, c.tag, c.wname, c.image, c.color) do t, wn, img, col
             project_icon_for(c.pid, c.name, c.hue_key, t, wn; image = img, color = col)
-        end;
+        end,
+        job_progress_view(session,c.progress;icon=true);
         class = map(session, c.status) do st; "bt-side-icon-wrap bt-glow-$(st)" end,
         # The ring colour rides `style`, which does track: a string assigned to
         # `el.style` is forwarded to `cssText`.
         style = map(session, c.color) do col; "--bt-worker:$(col)" end,
         title = map(session, c.status) do st; string(st) end)
+    Bonito.onload(session,icon_node,js"""el => {
+        el.addEventListener('click',()=>{
+            if (!el.closest('.bt-side-item')?.classList.contains('bt-side-active')) return;
+            const pane=document.querySelector('.bt-chatpane[data-pane-pid="'+$(c.pid)+'"]');
+            const details=pane?.querySelector('.bt-job-progress');
+            if (details && !details.hidden) details.open=!details.open;
+        });
+    }""")
     item = DOM.div(
         icon_node,
         DOM.span(c.label; class = "bt-side-name"),
@@ -389,8 +399,8 @@ const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 
 # A chat's place in the sidebar: by group, then the chats whose turn ended most
 # recently (a chat that just went quiet stays next to the active ones it left),
-# then the rest by name. `ended` is 0.0 for a chat with no turn since the server
-# started.
+# then the rest by name. `ended` is persisted, so reloading or restarting keeps
+# the hot list. It is 0.0 for a chat without a recorded turn.
 sidebar_rank(group::Symbol, ended::Float64, p::ProjectInfo) =
     (SIDEBAR_GROUP_RANK[group], -ended, lowercase(p.name))
 
@@ -521,6 +531,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                 SidebarChat(p.id, p.name, folder_hue_key(p),
                             Observable(label), Observable(tooltip), Observable(t), Observable(wn),
                             Observable(col), Observable(st), Observable(""), Observable{Any}(nothing),
+                            job_book(state,p.id),
                             pane === nothing ? nothing : WorkerFileTree(state, p.id, pane),
                             active_pid == p.id)
             end
@@ -691,8 +702,8 @@ const SidebarStyles = Bonito.Styles(
         # own default. A custom property, not an inline `width`, so the
         # collapsed and mobile rules below still win outright.
         "width" => "var(--bt-side-w, 200px)", "flex-shrink" => "0",
-        "background" => "var(--bt-surface)",
-        "border-right" => "1px solid var(--bt-border)",
+        "background" => "var(--bw-bg-panel)",
+        "border-right" => "1px solid var(--bw-border)",
         "overflow-y" => "auto", "overflow-x" => "hidden",
         "display" => "flex", "flex-direction" => "column",
         # Small top padding so the first item (Home) rides up near the
@@ -717,12 +728,12 @@ const SidebarStyles = Bonito.Styles(
         "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
         "width" => "28px", "height" => "28px", "padding" => "0",
         "background" => "transparent", "border" => "none",
-        "border-radius" => "var(--bt-radius-sm)",
-        "color" => "var(--bt-text-muted)", "cursor" => "pointer",
+        "border-radius" => "var(--bw-radius-sm)",
+        "color" => "var(--bw-text-muted)", "cursor" => "pointer",
         "transition" => "background 80ms, color 80ms",
         "-webkit-tap-highlight-color" => "transparent"),
     CSS(".bt-side-collapse:hover",
-        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text)"),
+        "background" => "var(--bw-bg-subtle)", "color" => "var(--bw-text)"),
     CSS(".bt-sidebar.bt-collapsed", "width" => "56px"),
     # Drag handle, a flex child of `.bt-shell` between the sidebar and the
     # stage. NOT a child of the aside: the aside is the scroll container, so
@@ -731,7 +742,7 @@ const SidebarStyles = Bonito.Styles(
         "flex" => "0 0 5px", "align-self" => "stretch", "cursor" => "col-resize",
         "background" => "transparent", "transition" => "background 100ms"),
     CSS(".bt-side-resize:hover, .bt-side-resize.bt-side-resize-active",
-        "background" => "var(--bt-accent)"),
+        "background" => "var(--bw-accent)"),
     # Nothing to resize in the icon rail.
     CSS(".bt-sidebar.bt-collapsed + .bt-side-resize", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-name", "display" => "none"),
@@ -740,12 +751,12 @@ const SidebarStyles = Bonito.Styles(
     # The group labels ("Active", "Other chats") over the first row of each
     # group. In the icon rail a label becomes a hairline between the groups.
     CSS(".bt-side-group",
-        "font-size" => "11px", "font-weight" => "600", "letter-spacing" => "0.04em",
-        "text-transform" => "uppercase", "color" => "var(--bt-text-muted)",
+        "font-size" => "var(--bw-font-size-xs)", "font-weight" => "600", "letter-spacing" => "0.04em",
+        "text-transform" => "uppercase", "color" => "var(--bw-text-muted)",
         "padding" => "10px 12px 4px", "user-select" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-group",
         "font-size" => "0", "padding" => "0", "height" => "1px",
-        "margin" => "6px 12px", "background" => "var(--bt-border)"),
+        "margin" => "6px 12px", "background" => "var(--bw-border)"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
@@ -758,10 +769,10 @@ const SidebarStyles = Bonito.Styles(
         "border-left" => "3px solid transparent",
         "transition" => "background 80ms"),
     CSS(".bt-side-item:hover",
-        "background" => "var(--bt-surface-2)"),
+        "background" => "var(--bw-bg-subtle)"),
     CSS(".bt-side-active",
-        "border-left-color" => "var(--bt-accent)",
-        "background" => "var(--bt-surface-2)"),
+        "border-left-color" => "var(--bw-accent)",
+        "background" => "var(--bw-bg-subtle)"),
     # Machine and liveness live on the icon. The machine's colour is the tile's
     # own BACKGROUND, with the picture inset inside it by 1.5px and rounded a
     # little tighter — so the ring is not a second shape sharing the picture's
@@ -813,7 +824,7 @@ const SidebarStyles = Bonito.Styles(
     # sits inside the padding, so no two shapes share an edge.
     CSS(".bt-proj-icon",
         "position" => "relative", "box-sizing" => "border-box",
-        "padding" => "1.5px", "background" => "var(--bt-worker, var(--bt-border))",
+        "padding" => "1.5px", "background" => "var(--bt-worker, var(--bw-border))",
         "border-radius" => "9.5px",
         "flex-shrink" => "0", "user-select" => "none",
         "display" => "flex", "align-items" => "center", "justify-content" => "center",
@@ -844,15 +855,15 @@ const SidebarStyles = Bonito.Styles(
         "display" => "flex", "align-items" => "center", "justify-content" => "center",
         "flex-shrink" => "0"),
     # invert+sepia+rotate is the standard trick for tinting a white SVG via
-    # CSS without per-color SVG variants. Lands close to --bt-text-muted (#64748b).
+    # CSS without per-color SVG variants. Lands close to --bw-text-muted (#64748b).
     CSS(".bt-side-nav-icon img",
         "filter" => "invert(48%) sepia(13%) saturate(540%) hue-rotate(176deg) brightness(92%) contrast(86%)"),
     CSS(".bt-side-active .bt-side-nav-icon img",
         "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
     CSS(".bt-side-name",
-        "font-size" => "12px",
+        "font-size" => "var(--bw-font-size-sm)",
         "line-height" => "1.3",
-        "color" => "var(--bt-text)",
+        "color" => "var(--bw-text)",
         "min-width" => "0",
         "flex" => "1 1 auto",
         # Two-line clamp so a long auto-inferred title wraps cleanly without
@@ -876,10 +887,10 @@ const SidebarStyles = Bonito.Styles(
     # would be a trap.
     CSS(".bt-side-close",
         "position" => "absolute", "top" => "3px", "right" => "6px",
-        "color" => "var(--bt-text-faint)",
+        "color" => "var(--bw-text-faint)",
         "font-size" => "12px", "line-height" => "1",
-        "padding" => "2px 4px", "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface-2)",
+        "padding" => "2px 4px", "border-radius" => "var(--bw-radius-sm)",
+        "background" => "var(--bw-bg-subtle)",
         "opacity" => "0", "pointer-events" => "none",
         "transition" => "opacity 80ms, background 80ms, color 80ms"),
     # Reveal on the row wrapper too: the files hint is a SIBLING overlaying the
@@ -888,14 +899,14 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-side-item:hover .bt-side-close, .bt-side-chat-row:hover .bt-side-close",
         "opacity" => "1", "pointer-events" => "auto"),
     CSS(".bt-side-close:hover",
-        "background" => "rgba(239,68,68,0.14)", "color" => "var(--bt-error)"),
+        "background" => "rgba(239,68,68,0.14)", "color" => "var(--bw-error)"),
     # The icons-only rail has no titles — a corner ✕ would overlay the icon
     # itself and misclicks would close chats; the rail is for switching only.
     CSS(".bt-sidebar.bt-collapsed .bt-side-close", "display" => "none"),
     # Shown when no chats are open yet.
     CSS(".bt-side-empty",
-        "padding" => "10px 12px", "font-size" => "12px",
-        "color" => "var(--bt-text-muted)", "line-height" => "1.4"),
+        "padding" => "10px 12px", "font-size" => "var(--bw-font-size-sm)",
+        "color" => "var(--bw-text-muted)", "line-height" => "1.4"),
 
     # ── Per-chat file tree ──────────────────────────────────────────────────
     # The chat row and its file tree share ONE pill: opening flips
@@ -903,10 +914,10 @@ const SidebarStyles = Bonito.Styles(
     # to the chat above it.
     CSS(".bt-side-chat",
         "display" => "flex", "flex-direction" => "column",
-        "border-radius" => "var(--bt-radius-sm)",
+        "border-radius" => "var(--bw-radius-sm)",
         "transition" => "background 80ms"),
     CSS(".bt-side-chat.bt-tree-open",
-        "background" => "var(--bt-surface-2)"),
+        "background" => "var(--bw-bg-subtle)"),
     # The row wrapper anchors the files affordance: `position: relative` here
     # (NOT on the whole chat box) keeps the hint pinned to the ROW's bottom-right,
     # so it stays in place when the tree expands below.
@@ -919,13 +930,13 @@ const SidebarStyles = Bonito.Styles(
         "position" => "absolute", "right" => "6px", "bottom" => "3px",
         "display" => "flex", "align-items" => "center", "gap" => "3px",
         "padding" => "0 3px",
-        "font-size" => "10px", "font-weight" => "500", "line-height" => "1.3",
+        "font-size" => "var(--bw-font-size-2xs)", "font-weight" => "500", "line-height" => "1.3",
         "white-space" => "nowrap",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bw-text-muted)",
         # Subtle backdrop so the floating label stays legible when it overlays
         # the title's text — matches the row's hover/open tint so it blends in.
-        "background" => "var(--bt-surface-2)",
-        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bw-bg-subtle)",
+        "border-radius" => "var(--bw-radius-sm)",
         "cursor" => "pointer", "user-select" => "none",
         "opacity" => "0", "pointer-events" => "none",
         "transition" => "opacity 100ms, color 100ms"),
@@ -933,30 +944,30 @@ const SidebarStyles = Bonito.Styles(
         "opacity" => "1", "pointer-events" => "auto"),
     # Feedback on the affordance's own hover — just accent the text.
     CSS(".bt-side-tree-hint:hover",
-        "color" => "var(--bt-accent)"),
+        "color" => "var(--bw-accent)"),
     # The tree itself — hidden until the chat carries `.bt-tree-open`.
     CSS(".bt-side-tree-wrap", "display" => "none"),
     CSS(".bt-side-chat.bt-tree-open > .bt-side-tree-wrap", "display" => "block"),
     CSS(".bt-tree",
         "display" => "flex", "flex-direction" => "column", "padding" => "2px 0 6px 0"),
     CSS(".bt-tree-search",
-        "margin" => "2px 8px 6px 8px", "padding" => "4px 8px", "font-size" => "12px",
-        "border" => "1px solid var(--bt-border)", "border-radius" => "5px",
-        "background" => "var(--bt-bg)", "color" => "var(--bt-text, #111827)",
+        "margin" => "2px 8px 6px 8px", "padding" => "4px 8px", "font-size" => "var(--bw-font-size-sm)",
+        "border" => "1px solid var(--bw-border)", "border-radius" => "5px",
+        "background" => "var(--bw-bg)", "color" => "var(--bw-text, #111827)",
         "outline" => "none"),
-    CSS(".bt-tree-search:focus", "border-color" => "var(--bt-accent, #2563eb)"),
+    CSS(".bt-tree-search:focus", "border-color" => "var(--bw-accent, #2563eb)"),
     CSS(".bt-tree-scroll",
         "max-height" => "42vh", "overflow-y" => "auto", "overflow-x" => "hidden"),
     CSS(".bt-tree-rows", "display" => "flex", "flex-direction" => "column"),
     CSS(".bt-tree-row",
         "display" => "flex", "align-items" => "center", "gap" => "4px",
-        "padding" => "2px 8px 2px 4px", "font-size" => "12px", "line-height" => "1.5",
+        "padding" => "2px 8px 2px 4px", "font-size" => "var(--bw-font-size-sm)", "line-height" => "1.5",
         "cursor" => "pointer", "white-space" => "nowrap",
-        "color" => "var(--bt-text, #111827)"),
+        "color" => "var(--bw-text, #111827)"),
     CSS(".bt-tree-row:hover", "background" => "var(--bt-hover, rgba(0,0,0,0.05))"),
     CSS(".bt-tree-arrow",
         "flex" => "0 0 auto", "width" => "10px", "font-size" => "8px",
-        "color" => "var(--bt-text-muted)", "text-align" => "center"),
+        "color" => "var(--bw-text-muted)", "text-align" => "center"),
     # Shrink weights, and they are the whole fix for "search hits are
     # unreadable". Flexbox shrinks items in PROPORTION to their content width,
     # so a 40-char directory kept most of the row while the 9-char filename next
@@ -969,18 +980,18 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-tree-dir > .bt-tree-label", "font-weight" => "500"),
     CSS(".bt-tree-relpath",
         "flex" => "0 9999 auto", "min-width" => "0",
-        "margin-left" => "6px", "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "margin-left" => "6px", "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)",
         "overflow" => "hidden", "text-overflow" => "ellipsis"),
     # ⤓ download affordance: right-anchored, revealed on row hover.
     CSS(".bt-tree-download",
         "flex" => "0 0 auto", "margin-left" => "auto",
-        "padding" => "0 4px", "font-size" => "12px", "line-height" => "1",
-        "color" => "var(--bt-text-muted)",
+        "padding" => "0 4px", "font-size" => "var(--bw-font-size-sm)", "line-height" => "1",
+        "color" => "var(--bw-text-muted)",
         "opacity" => "0", "transition" => "opacity 80ms, color 80ms"),
     CSS(".bt-tree-row:hover .bt-tree-download", "opacity" => "1"),
-    CSS(".bt-tree-download:hover", "color" => "var(--bt-accent)"),
+    CSS(".bt-tree-download:hover", "color" => "var(--bw-accent)"),
     CSS(".bt-tree-empty",
-        "padding" => "4px 12px", "font-size" => "11px", "color" => "var(--bt-text-muted)"),
+        "padding" => "4px 12px", "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)"),
     # No trees / hint in the collapsed icon rail.
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-wrap", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-hint", "display" => "none"),
@@ -1002,7 +1013,7 @@ const SidebarStyles = Bonito.Styles(
         # The group labels as hairlines, as in the collapsed rail.
         CSS(".bt-sidebar:not(.bt-side-open) .bt-side-group",
             "font-size" => "0", "padding" => "0", "height" => "1px",
-            "margin" => "6px 12px", "background" => "var(--bt-border)"),
+            "margin" => "6px 12px", "background" => "var(--bw-border)"),
         # Same story for the "No open chats yet — open one from the
         # dashboard" empty state: a 56px column has no room for a sentence.
         CSS(".bt-sidebar:not(.bt-side-open) .bt-side-empty", "display" => "none"),
@@ -1034,7 +1045,7 @@ const SidebarStyles = Bonito.Styles(
         CSS(".bt-sidebar.bt-side-open .bt-side-item",
             "justify-content" => "flex-start", "padding-right" => "44px"),
         CSS(".bt-sidebar.bt-side-open .bt-side-group",
-            "font-size" => "11px", "padding" => "10px 12px 4px", "height" => "auto",
+            "font-size" => "var(--bw-font-size-xs)", "padding" => "10px 12px 4px", "height" => "auto",
             "margin" => "0", "background" => "none"),
         CSS(".bt-sidebar.bt-side-open .bt-side-empty", "display" => "block"),
         # A finger-sized ✕ at the row's right edge, away from the icon.
@@ -1060,7 +1071,7 @@ const UnifiedShellStyles = Bonito.Styles(
         # subtle, just enough that the app reads as a contained surface
         # instead of dissolving into the page bg. Match the dashboard's bg
         # variable so theming stays in one place.
-        "background" => "var(--bt-bg, #fafaf9)"),
+        "background" => "var(--bw-bg, #fafaf9)"),
     # Width tokens for the chat/dashboard column. `--bt-main-max` is the bounded,
     # centered width when the plotpane is CLOSED — chosen so home / a plotpane-less
     # chat look identical to the old centered 1600px shell (1600 − 200px sidebar =
@@ -1076,13 +1087,13 @@ const UnifiedShellStyles = Bonito.Styles(
         # 100dvh, not 100vh (mobile URL-bar safe).
         "height"    => "100dvh",
         "display"   => "flex", "flex-direction" => "row",
-        "background"   => "var(--bt-bg)",
+        "background"   => "var(--bw-bg)",
         # Root font for the WHOLE shell. Without this only `.bt-dash` carried a
         # font-family and everything else (sidebar, loading/error cards, chat)
         # fell back to the browser default — i.e. Times serif. A modern system
         # stack renders cleanly on every OS with no web-font fetch.
         "font-family" => "system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
-        "color"        => "var(--bt-text)",
+        "color"        => "var(--bw-text)",
         "-webkit-font-smoothing" => "antialiased"),
     # Everything to the right of the sidebar: the chat/dashboard column plus the
     # plotpane. Fills the viewport minus the sidebar; `.bt-main` centers within
@@ -1110,7 +1121,7 @@ const UnifiedShellStyles = Bonito.Styles(
         "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
         "overflow" => "hidden",
-        "box-shadow" => "inset 1px 0 var(--bt-border), inset -1px 0 var(--bt-border)"),
+        "box-shadow" => "inset 1px 0 var(--bw-border), inset -1px 0 var(--bw-border)"),
     # Mobile: drop the 480px desktop floor that keeps the chat readable on
     # split screens. On a 393px-wide phone the floor forces .bt-main to
     # 480px so the chat pane runs ~143px off the right edge of the viewport
@@ -1163,7 +1174,7 @@ const UnifiedShellStyles = Bonito.Styles(
     # the same spot across all phases.
     CSS(".bt-view-overlay .bt-loading-wrap",
         "height" => "100%",
-        "background" => "var(--bt-bg)",
+        "background" => "var(--bw-bg)",
         "transition" => "opacity 200ms ease"),
     # Hidden-until-onload: a card over an already-settled pane (kept-alive
     # revisit) is dismissed before it ever paints.
@@ -1253,7 +1264,7 @@ function Bonito.jsrender(session::Bonito.Session, v::ChatLoadingView)
                 DOM.div("Couldn't open $(p.name)"; class = "bt-loading-title"),
                 DOM.div(ls.errors[pid]; class = "bt-loading-sub"),
                 DOM.div("Try again";
-                        class   = "bt-btn bt-btn-secondary",
+                        class   = "bw-btn bw-btn-secondary",
                         style   = Styles("margin-top" => "6px"),
                         onclick = js"() => $(ls.retry).notify($(pid))");
                 class = "bt-loading-msg"), true)
@@ -1752,11 +1763,8 @@ function unified_page(state::ServerState, session::Bonito.Session, request)
         DOM.div(; class = "bt-side-backdrop",
                 onclick = js"() => document.querySelector('.bt-sidebar')?.classList.remove('bt-side-open')"),
         stage,
-        # The window's ONE progress card (position:fixed, top-centered).
-        # Every long-running operation and every outcome in this window
-        # reports into `pane.progress` and renders HERE — the dashboard no
-        # longer carries its own pill, and nothing flashes a toast over the
-        # composer any more. See progress.jl::progress_overlay.
+        # Dashboard operations and window-level notices. Chat jobs report
+        # through BonitoProgress and render in the chat's job_progress_view.
         progress_overlay(session, pane.progress),
         # Window-level file-viewer driver: gives every rendered file body its
         # behaviour (image dimensions, table sort, 3D mount) no matter how it

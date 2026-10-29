@@ -50,7 +50,8 @@
             # Only the relay's addresses and a grant: no server URL, no secret.
             @test sort([k for k in keys(env) if startswith(k, "BONITOAGENTS_")]) ==
                   ["BONITOAGENTS_CONTROL_TOKEN", "BONITOAGENTS_CONTROL_URL",
-                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN", "BONITOAGENTS_PROJECT_ID",
+                   "BONITOAGENTS_DEV_TOOLS", "BONITOAGENTS_EVAL_TOKEN",
+                   "BONITOAGENTS_PROGRESS_ADDR", "BONITOAGENTS_PROGRESS_TOKEN", "BONITOAGENTS_PROJECT_ID",
                    "BONITOAGENTS_VALUES_ADDR"]
             proc[] = open(detach(Cmd(Cmd(String[entry["command"]; entry["args"]]); env)), "r+")
             request(1, "initialize", Dict("protocolVersion" => "2025-06-18", "capabilities" => Dict(),
@@ -92,11 +93,12 @@
             @test inspected["isError"] === false
             @test occursin(p.id, only(inspected["content"])["text"])
             # Revoking an owner's grants leaves everyone else's.
-            BW.mcp_relay_env(relay, p.id; owner = "agent-2")
-            @test length(relay.grants) == 4          # a control and an eval token each
+            replacement_env = BW.mcp_relay_env(relay, p.id; owner = "agent-2")
+            @test length(relay.grants) == 5 # control/eval per agent, telemetry per chat
+            @test replacement_env["BONITOAGENTS_PROGRESS_TOKEN"] == env["BONITOAGENTS_PROGRESS_TOKEN"]
             BW.revoke_mcp_grants!(relay, "agent-2")
             @test sort([(g.owner, g.kind) for g in values(relay.grants)]) ==
-                  [("agent-1", "eval"), ("agent-1", "mcp")]
+                  [("agent-1", "eval"), ("agent-1", "mcp"), ("progress:" * p.id, "progress")]
             # Only a token we handed out gets a channel: an unrelated local
             # process cannot claim a chat. The relay hangs up on it, and the
             # server still knows exactly the one MCP channel.
@@ -111,6 +113,29 @@
                 @test_throws HTTP.WebSockets.WebSocketError HTTP.WebSockets.receive(ws)
             end
             @test collect(keys(state.mcp_ctrl)) == [p.id]
+        end
+
+        @testset "several clients of one chat keep independent connections and requests" begin
+            original = BT.mcp_ctrl_for(state, p.id)
+            extra = open_mcp(p.id)
+            @test timedwait(() -> length(BT.mcp_channels_for(state, p.id)) == 2, 10.0) === :ok
+            @test BT.decode_control(WorkerLink.WebSockets.receive(extra))["ok"]
+            @test isopen(original)
+            extra_server = only(c for c in BT.mcp_channels_for(state, p.id) if c !== original)
+            rid, waiting = BT.register_rpc!(state)
+            push!(original.pending, rid)
+            WorkerLink.WebSockets.send(extra, JSON.json(Dict("request_id"=>rid, "interrupted"=>99)))
+            sleep(0.1)
+            @test !isready(waiting) # even another client of this chat cannot answer it
+            close(extra_server)
+            @test !isready(waiting)
+            @test isopen(original)
+            @test BT.mcp_ctrl_for(state, p.id) === original
+            BT.unregister_rpc!(state, rid)
+            BT.untrack_mcp_request!(original, rid)
+            inspected = request(20, "tools/call", Dict("name"=>"bt_dev_inspect",
+                "arguments"=>Dict("section"=>"projects", "project_id"=>p.id)))
+            @test !inspected["isError"]
         end
 
         @testset "a refused channel reaches its local client with the server's reason" begin
@@ -143,10 +168,30 @@
             # accepted but never served.
             hold[] = true
             close(BT.mcp_ctrl_for(state, p.id))
+            @test timedwait(() -> isready(held), 30.0) === :ok
+            parked = take!(held)
+            pong = Channel{Nothing}(1)
+            @async for raw in parked
+                if get(JSON.parse(String(raw)), "request_id", "") == "ready-probe"
+                    put!(pong, nothing)
+                    break
+                end
+            end
+            WorkerLink.WebSockets.send(parked, JSON.json(Dict("op"=>"ping", "request_id"=>"ready-probe")))
+            @test timedwait(() -> isready(pong), 10.0) === :ok
             result = Channel{Any}(1)
             @async put!(result, try request(7, "tools/call",
                 Dict("name" => "bt_julia_list_sessions", "arguments" => Dict())) catch e; e end)
-            @test timedwait(() -> isready(held), 30.0) === :ok
+            sent = Channel{Nothing}(1)
+            @async for raw in parked
+                if get(JSON.parse(String(raw)), "type", "") == "dev_request"
+                    put!(sent, nothing)
+                    break
+                end
+            end
+            # The caller must actually be waiting on this connection, rather
+            # than still waiting for its reconnect handshake to finish.
+            @test timedwait(() -> isready(sent), 10.0) === :ok
             close(relay)
             @test timedwait(() -> isready(result), 10.0) === :ok
             isready(result) || error("disconnected MCP call did not finish")

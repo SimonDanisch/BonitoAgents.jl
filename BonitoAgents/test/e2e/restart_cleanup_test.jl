@@ -24,7 +24,7 @@
     summary(id) = "($(card(id))?.querySelector('.bt-tool-summary')?.textContent || '')"
     body(id) = "($(card(id))?.querySelector('.bt-tool-body')?.innerText || '')"
     slot(id) = "$VP?.querySelector('.bt-taskbar-slot[data-task-id=\"$id\"]')"
-    menu_open = "(() => { const p = $VP; const l = p?.querySelector('.bt-header-menu .bt-menu-list'); " *
+    menu_open = "(() => { const p = $VP; const l = p?.querySelector('.bt-header-menu .bw-menu-list'); " *
                 "return !!l && getComputedStyle(l).display !== 'none'; })()"
 
     SPIN = "println(\"SPIN_PID=\", getpid()); flush(stdout); while true; end"
@@ -58,7 +58,7 @@
             sleep(0.1)
         end
         # The user turns "remote julia" on for this chat, in its ⋯ menu.
-        @test TK.eval_js(server, "(() => { const t = $VP?.querySelector('.bt-header-menu .bt-menu-trigger'); if (!t) return false; t.click(); return true; })()") == true
+        @test TK.eval_js(server, "(() => { const t = $VP?.querySelector('.bt-header-menu .bw-menu-trigger'); if (!t) return false; t.click(); return true; })()") == true
         @test TK.wait_for(server, "the remote julia item", "!!$(remote_item)"; timeout = 30) == true
         @test TK.eval_js(server, "$(remote_item).click(); true") == true
         @test TK.wait_for(server, "remote julia on",
@@ -71,9 +71,9 @@
         end
 
         # The user restarts the chat from its ⋯ menu.
-        @test TK.eval_js(server, "(() => { const t = $VP?.querySelector('.bt-header-menu .bt-menu-trigger'); if (!t) return false; t.click(); return true; })()") == true
+        @test TK.eval_js(server, "(() => { const t = $VP?.querySelector('.bt-header-menu .bw-menu-trigger'); if (!t) return false; t.click(); return true; })()") == true
         @test TK.wait_for(server, "menu opened", menu_open; timeout = 5) == true
-        @test TK.eval_js(server, "(() => { const b = [...$VP.querySelectorAll('.bt-header-menu .bt-menu-item')]" *
+        @test TK.eval_js(server, "(() => { const b = [...$VP.querySelectorAll('.bt-header-menu .bw-menu-item')]" *
             ".find(x => (x.textContent || '').trim().startsWith('Restart session')); if (!b) return false; b.click(); return true; })()") == true
 
         for id in ("spin-a", "spin-b")

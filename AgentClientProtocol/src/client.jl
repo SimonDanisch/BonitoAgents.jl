@@ -260,7 +260,8 @@ end
 #
 # `images` are appended after the text as ACP image content blocks.
 function prompt!(client::Client, text::String;
-                 images::Vector{ImageAttachment} = ImageAttachment[])
+                 images::Vector{ImageAttachment} = ImageAttachment[],
+                 receipt_id::Union{String,Nothing} = nothing)
     blocks = Any[Dict("type" => "text", "text" => text)]
     for img in images
         push!(blocks, Dict(
@@ -270,11 +271,13 @@ function prompt!(client::Client, text::String;
         ))
     end
     params = Dict("sessionId" => client.session_id, "prompt" => blocks)
+    receipt_id === nothing || (params["_meta"] = Dict("bonitoPromptId" => receipt_id))
     return prompt_request(client.conn, params)
 end
 
-# Requires the advertised activeOnly steering extension. A rejection leaves
-# delivery to an ordinary prompt; it must never start an untracked turn.
+# Requires an advertised host-owned fallback: `activeOnly` or `promptRequired`.
+# A rejection leaves delivery to an ordinary prompt; it must never start an
+# untracked turn. Both dialects use the same steering lifecycle.
 function steer!(client::Client, text::String;
                 images::Vector{ImageAttachment} = ImageAttachment[])
     get(client.session_result, "bonitoActiveSteering", false) ||
@@ -282,11 +285,16 @@ function steer!(client::Client, text::String;
     blocks = Any[Dict("type" => "text", "text" => text)]
     append!(blocks, [Dict("type" => "image", "data" => Base64.base64encode(img.data),
                          "mimeType" => img.mime) for img in images])
-    result = send_request(client.conn, "_session/steering",
-        Dict("sessionId" => client.session_id, "prompt" => blocks, "activeOnly" => true), 30.0)
+    params = Dict{String,Any}("sessionId" => client.session_id, "prompt" => blocks)
+    if get(client.session_result, "bonitoSteeringIdleBehavior", "") == "promptRequired"
+        params["_meta"] = Dict("steering" => Dict("idleBehavior" => "promptRequired"))
+    else
+        params["activeOnly"] = true
+    end
+    result = send_request(client.conn, "_session/steering", params, 30.0)
     outcome = get(result, "outcome", "")
     outcome == "injected" && return true
-    outcome in ("notInjected", "failed") && return false
+    outcome in ("notInjected", "failed", "promptRequired") && return false
     error("The agent did not accept the steering message (outcome: $outcome).")
 end
 

@@ -69,7 +69,16 @@ live.
 - Run Julia on another worker from the same chat (`bt_julia_eval(...; worker =
   "name")`), switched on per chat by an admin with **Remote julia**.
 - `remote_session` moves Julia values between machines; `bt_sync_folder`
-  streams folders between workers through the link.
+  streams folders between workers through the link. Use `direction="pull"`
+  to retrieve results or `paths` to batch selected files and recursive folders
+  in one call. Transfers automatically report progress in the chat and sidebar.
+- Successful progress jobs show “Completed”, then clear from the chat and
+  sidebar after five seconds and stay hidden after reload. Running jobs at
+  100% remain visible until completion is confirmed; failures wait for dismissal.
+- Peer coordination uses `bt_chat` and a separate **Chat messaging** switch,
+  off by default in both chats. Dev mode never grants messaging. The server
+  immediately enforces permission revocation, including stale dev-tool calls;
+  queued peer input is paused until explicitly retried.
 - **Continue on** another worker: a new chat there with the project's files and
   the agent's own record of the conversation.
 - A worker that crashed mid-turn tells exactly the chats it cut off to carry on
@@ -93,6 +102,9 @@ live.
 - `bt_show` takes a `title` for what the file shows. The card wears it, with
   the file's name and size beside it, the full path on hover, and a click on it
   opens the file. A picture shown bare keeps it as its caption.
+- Re-showing an overwritten image requests fresh pixels even when Read or
+  another preview already displayed that path. The browser can no longer reuse
+  the first decoded image without contacting the worker-file route.
 - Code views are static and highlighted in a background worker, with Monaco's
   grammars for 90 languages. A 10,000-line result opens without freezing the
   page and stays searchable and copyable.

@@ -82,6 +82,13 @@ tool_error(msg::AbstractString) =
     Dict{String,Any}("content" => [Dict("type" => "text", "text" => "error: " * msg)],
                      "isError" => true)
 
+# Paths may contain underscores or backticks; keep them literal in chat Markdown.
+function inline_code(value::AbstractString)
+    longest = maximum((length(m.match) for m in eachmatch(r"`+", value)); init = 0)
+    fence = repeat("`", longest + 1)
+    return fence * " " * value * " " * fence
+end
+
 # The `worker` argument, or nothing when the call is for this worker.
 function remote_worker(args::AbstractDict)
     w = get(args, "worker", nothing)
@@ -493,27 +500,43 @@ function remote_workers_text()
 end
 
 # ── bt_sync_folder ──────────────────────────────────────────────────────────
-# Copy a folder from this worker to another one, through the server (the two
+# Copy a folder between this worker and another one, through the server (the two
 # workers never talk directly). What makes "run it on the MacBook" practical:
 # the code, its Project.toml/Manifest.toml, and the data have to be there first.
 function sync_folder_handler(args::AbstractDict)
     src    = String(strip(String(get(args, "src", ""))))
     worker = remote_worker(args)
     dst    = get(args, "dst", nothing)
-    isempty(src) && return tool_error("`src` (a folder on this worker) is required")
-    worker === nothing && return tool_error("`worker` (the worker to copy to) is required")
+    direction = get(args, "direction", "push")
+    direction in ("push", "pull") || return tool_error("`direction` must be `push` or `pull`")
+    paths = get(args, "paths", nothing)
+    if paths !== nothing
+        paths isa AbstractVector && !isempty(paths) && all(p -> p isa AbstractString, paths) ||
+            return tool_error("`paths` must be a nonempty list of relative file or folder paths")
+    end
+    isempty(src) && return tool_error("`src` (the source folder) is required")
+    worker === nothing && return tool_error("`worker` (the other worker) is required")
     dst_s = dst isa AbstractString && !isempty(strip(dst)) ? String(strip(dst)) : src
+    # Older servers ignore new arguments. A distinct op makes them refuse a
+    # pull/selection before copying in the wrong direction or sending a full tree.
+    op = direction == "push" && paths === nothing ? "sync_folder" : "sync_folder_v2"
     reply = try
-        call_server("sync_folder"; timeout = 6 * 3600.0, worker = worker, src = src, dst = dst_s)
+        call_server(op; timeout = 6 * 3600.0, worker = worker, src = src, dst = dst_s, direction, paths)
     catch e
         e isa InterruptException && rethrow()
-        return tool_error(sprint(showerror, e))
+        message = sprint(showerror, e)
+        if occursin("unknown dev op 'sync_folder_v2'", message)
+            message = "Update the BonitoAgents server to pull folders or sync selected paths. " * message
+        end
+        return tool_error(message)
     end
     reply isa AbstractDict || return tool_error("unexpected reply from the server: $(repr(reply))")
+    source = direction == "pull" ? worker : "this worker"
+    destination = direction == "pull" ? "this worker" : worker
     return Dict{String,Any}(
         "content" => [Dict("type" => "text",
             "text" => "synced $(get(reply, "files", "?")) files ($(get(reply, "bytes", "?")) bytes) " *
-                      "from $(src) on this worker to $(dst_s) on $(get(reply, "worker", worker))" *
+                      "from $(inline_code(src)) on $(inline_code(source)) to $(inline_code(dst_s)) on $(inline_code(destination))" *
                       (get(reply, "deleted", 0) == 0 ? "" : "; removed $(reply["deleted"]) stale files there"))],
         "isError" => false,
     )
@@ -716,19 +739,33 @@ register!(
 register!(
     "bt_sync_folder",
     """
-    Copy a folder from this worker to ANOTHER worker (through the BonitoAgents
-    server; the two machines never talk directly). Use it before running Julia
-    on that worker with `bt_julia_eval(worker = …)`: a project (its code,
-    Project.toml and Manifest.toml) and the data it needs have to be there.
+    Copy a whole folder or a selected file/folder list between this worker and
+    ANOTHER worker through the BonitoAgents
+    server. `direction="push"` (default): src is HERE, dst is on worker.
+    `direction="pull"`: src is on worker, dst is HERE. Paths are absolute.
+    Example: pull Desktop's /data/results into this worker's /work/results with
+    src="/data/results", worker="Desktop", dst="/work/results", direction="pull".
+    Use push before `bt_julia_eval(worker = …)` to send code/data; use pull to
+    retrieve its results. No direct sockets, SSH or a second chat are needed.
+    A folder is recursive: use ONE call for a whole tree, not a call per file.
+    To batch selected files/subfolders, set src to their common root and pass
+    paths=["report.csv", "renders", "logs/run.log"]. Paths are relative to src;
+    directory entries are recursive and destination structure is preserved.
+    Omit paths for the whole folder. No glob expansion; missing paths fail.
     Re-running only transfers what changed; destination-only files are preserved.
+    Progress is reported automatically in this chat and its sidebar icon.
     Needs the chat's 'remote julia' switch, like remote evals.
     """,
     Dict{String,Any}(
         "type" => "object",
         "properties" => Dict{String,Any}(
-            "src"    => Dict("type"=>"string", "description"=>"Folder on THIS worker (absolute path)"),
-            "worker" => Dict("type"=>"string", "description"=>"The worker to copy to (display name)"),
-            "dst"    => Dict("type"=>"string", "description"=>"Folder on that worker; default: the same path as `src`"),
+            "src"    => Dict("type"=>"string", "description"=>"Source folder (absolute path): here for push, on worker for pull"),
+            "worker" => Dict("type"=>"string", "description"=>"The other worker (display name): destination for push, source for pull"),
+            "dst"    => Dict("type"=>"string", "description"=>"Destination folder (absolute path): on worker for push, here for pull; default: same path as src"),
+            "direction" => Dict("type"=>"string", "enum"=>["push", "pull"], "default"=>"push",
+                                "description"=>"push: this worker to worker; pull: worker to this worker"),
+            "paths" => Dict("type"=>"array", "items"=>Dict("type"=>"string"), "minItems"=>1,
+                            "description"=>"Optional batch of relative files or recursive subfolders under src. Omit to sync the whole tree in one call."),
         ),
         "required" => ["src", "worker"],
     ),

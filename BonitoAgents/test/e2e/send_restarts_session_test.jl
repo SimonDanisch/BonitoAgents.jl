@@ -32,7 +32,7 @@
     @test TK.eval_js(s, "$(allq(".bt-user-msg")).some(e => e.textContent.includes('go on'))")
     @test waitfor("outbox empty", "$(allq(".bt-queue-item")).length === 0")
     @test waitfor("session chip cleared", "!$(q(".bt-header-restart-dead"))")
-    @test TK.eval_js(s, "[...window.__btQueueSeen].every(st => st === 'waiting' || st === 'sending')")
+    @test TK.eval_js(s, "[...window.__btQueueSeen].every(st => ['waiting','sending','submitted'].includes(st))")
 
     # And the restarted session keeps working for the next message.
     TK.send_message(s, "one more")

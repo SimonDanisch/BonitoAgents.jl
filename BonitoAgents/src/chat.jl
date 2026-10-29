@@ -13,6 +13,7 @@ const ChatLib = Bonito.ES6Module(joinpath(@__DIR__, "..", "assets", "bonitoagent
 # nothing` and are never appended to. Mirrors the existing `ChatModel.parent`
 # back-ref pattern, so it's idiomatic here.
 abstract type ChatMsg end
+abstract type SupervisedTask <: ChatMsg end
 
 # A user's submission, pushed onto `ChatModel.user_messages` by the browser send
 # handler and consumed by the `run_chat!` loop. Distinct from `ACP.UserMessage`
@@ -76,11 +77,12 @@ mutable struct ChatRun
     card::Any                      # its `JuliaEvalToolMsg` (typed there); nothing until bound
     known::Bool                    # `started` is its process's own (a status frame came)
     seen::Float64                  # when its process last spoke about it
+    control::Union{Nothing,WeakRef} # owning MCPChannel; completed runs must not retain dead links
 end
 ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
         summary, collected, notified, content, card) =
     ChatRun(id, tool_use_id, worker_id, route, env_path, background, started, status, finished,
-            summary, collected, notified, content, card, false, time())
+            summary, collected, notified, content, card, false, time(), nothing)
 
 # The chat's runs, and the task that tells the agent when ones it has not
 # collected finish (at most one at a time). `runs` holds each id's newest run.
@@ -1484,7 +1486,7 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 
 # Enter the bar (become live): add to the live set, mark membership, make sure
 # the bar's poll loop is running.
-function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg})
+function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg,SupervisedTask})
     added = false
     lock(bar.lock) do
         if !any(t -> t === m, bar.items[])
@@ -1500,7 +1502,7 @@ end
 
 # Leave the bar (become done): finalize the bubble (persist + emit, per type),
 # then drop from the live set and clear membership. Idempotent.
-function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg}; reason::String = "finished")
+function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg,SupervisedTask}; reason::String = "finished")
     bar = m.task_bar
     bar === nothing && return nothing
     m.task_bar = nothing
@@ -2764,7 +2766,7 @@ function Bonito.jsrender(session::Bonito.Session, c::BonitoUpgradeCard)
         end
     end
     btn = DOM.button("Update env";
-        class = "bt-btn bt-worker-upgrade-btn",
+        class = "bw-btn bt-worker-upgrade-btn",
         onclick = js"e => { e.preventDefault(); e.stopPropagation(); $(do_fix).notify(true); }")
     Bonito.jsrender(session, DOM.div(
         DOM.div("Live display needs a newer Bonito"; class = "bt-worker-stale-title"),
@@ -2921,11 +2923,11 @@ function eval_result_node(m::JuliaEvalCall, v)
         (ShareControl(; hint = "Share this live result with anyone who has the link. " *
                           "It lasts until the result is closed or its Julia session ends. " *
                           "Manage passwords and end links in Settings.",
-                      progress = chat.plotpane === nothing ? nothing : chat.plotpane.progress) do
+                      progress = ChatProgress(chat.state, chat.project_id)) do
             share_result!(chat.state, chat.project_id, v.payload)
         end,)
-    return wrap_for_detach(tool_id(m), DOM.div(controls,
-        remote_result(chat.state, v.payload, chat.project_id)))
+    return wrap_for_detach(tool_id(m), DOM.div(FileToolbar("Julia result";actions=controls),
+        remote_result(chat.state, v.payload, chat.project_id);class="bt-output-card"))
 end
 
 # Load the persisted ACP params for `tool_id` and parse the content array back
@@ -3146,19 +3148,25 @@ end
 # would swap in its own opaque placeholder (and the bt_show body would never
 # carry the `.bt-tool-error` the UI/tests key on).
 function Bonito.jsrender(session::Bonito.Session, st::ShowTool)
+    controls = isempty(st.project_id) ? () :
+        (ShareControl(; hint="Share this file with anyone who has the link while its worker is online.",
+                       progress=ChatProgress(st.state, st.project_id)) do
+            share_project_file!(st.state,st.project_id,st.path)
+        end,)
     body = try
-        render_show_file(st, session)
+        kind=file_kind(st.path)
+        if kind isa Union{ImageFile,VideoFile}
+            render_file(kind,InlineView(),FileView(st,InlineView()),session;controls)
+        else
+            DOM.div(FileToolbar(basename(st.path);actions=controls,caption=true),render_show_file(st,session);
+                class="bt-output-card")
+        end
     catch e
         @warn "bt_show: could not render file" path = st.path exception = (e, catch_backtrace())
         DOM.div("could not show $(basename(st.path)): $(sprint(showerror, e))";
             class = "bt-tool-error")
     end
-    controls = isempty(st.project_id) ? () :
-        (ShareControl(; hint = "Share this file with anyone who has the link while its worker is online. " *
-                                     "Manage passwords and end links in Settings.") do
-            share_project_file!(st.state, st.project_id, st.path)
-        end,)
-    return Bonito.jsrender(session, DOM.div(controls, body))
+    return Bonito.jsrender(session,body)
 end
 
 # The server-side path a ShowTool's file resolves to — no IO. Files under the
@@ -3198,10 +3206,12 @@ end
 # resolved against the project's worker root (NOT the server mirror's cwd —
 # those two only coincide because the mirror shadows the tree).
 function show_worker_path(st::ShowTool)
-    isabspath(st.path) && return String(st.path)
+    isabspath(st.path) && return normpath(st.path)
     proj = get(st.state.projects[], st.project_id, nothing)
-    proj === nothing && return String(st.path)
-    return joinpath(proj.worker_path, st.path)
+    proj === nothing && return normpath(st.path)
+    # Markdown's ./ spelling and file-tree paths must identify the same tab,
+    # mirror and progress operation rather than opening duplicate views.
+    return normpath(joinpath(proj.worker_path, st.path))
 end
 
 # Is our mirror copy the CURRENT version, given the worker's stamp right now?
@@ -3336,7 +3346,7 @@ const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg
 const LIGHTBOX_OPEN_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const wrap = event.currentTarget.closest('.bt-media-wrap') || event.currentTarget.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     if (!media) return;
     if (media.tagName === 'VIDEO') {
@@ -3356,8 +3366,10 @@ const COPY_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
     const btn = event.currentTarget;
-    const img = btn.closest('.bt-media-wrap')?.querySelector('img.bt-media');
-    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = '⧉'; }, 1200); };
+    const wrap = btn.closest('.bt-media-wrap') || btn.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
+    const img = wrap?.querySelector('img.bt-media');
+    const label=btn.textContent;
+    const say = t => { btn.textContent = t; setTimeout(() => { btn.textContent = label; }, 1200); };
     if (!img || !img.complete || !navigator.clipboard?.write || !window.ClipboardItem) return say('✕');
     const png = new Promise((resolve, reject) => {
         const cv = document.createElement('canvas');
@@ -3400,7 +3412,7 @@ event => {
 const DOWNLOAD_MEDIA_JS = js"""
 event => {
     event.stopPropagation();
-    const wrap = event.currentTarget.closest('.bt-media-wrap');
+    const wrap = event.currentTarget.closest('.bt-media-wrap') || event.currentTarget.closest('.bt-file-view, .bt-share-page')?.querySelector('.bt-media-wrap');
     const media = wrap && wrap.querySelector('.bt-media');
     const srcEl = media && (media.tagName === 'VIDEO' ? media.querySelector('source') : media);
     const src = srcEl && (srcEl.currentSrc || srcEl.src || srcEl.getAttribute('src'));
@@ -3411,6 +3423,21 @@ event => {
     document.body.appendChild(a); a.click(); a.remove();
 }
 """
+
+# The same menu items run in chat, workspace and public-viewer toolbars.
+function media_menu_items(is_video::Bool; worker_path="",download=true)
+    items=Any[DOM.button("Enlarge";class="bw-menu-item bt-media-enlarge",type="button",
+        title="Enlarge",onclick=LIGHTBOX_OPEN_JS)]
+    is_video || push!(items,DOM.button("Copy image";class="bw-menu-item bt-media-copy",type="button",
+        title="Copy image",onclick=COPY_MEDIA_JS))
+    download && push!(items,DOM.button("Download";class="bw-menu-item bt-media-download",type="button",
+        title="Download",onclick=DOWNLOAD_MEDIA_JS))
+    if !is_video && !isempty(worker_path)
+        push!(items,DOM.button("Set as chat icon";class="bw-menu-item bt-media-chat-icon",type="button",
+            title="Set as chat icon",var"aria-label"="Set as chat icon"))
+    end
+    return items
+end
 
 # A media element (image / video) with click-to-enlarge. `src` can be a streamed
 # proxied-asset url (string), a `Bonito.Asset`, or a data url — anything valid as
@@ -3423,7 +3450,7 @@ event => {
 # its size before the bytes arrive, so nothing below it moves when they do.
 function media_element(src, mime::AbstractString, is_video::Bool;
                        filename::AbstractString = "", worker_path::AbstractString = "",
-                       size::Union{NTuple{2,Int},Nothing} = nothing)
+                       size::Union{NTuple{2,Int},Nothing} = nothing, controls=(), toolbar=true)
     dims = size === nothing ? (;) : (; width = size[1], height = size[2])
     inner = is_video ?
         # `playsinline` is not cosmetic: without it iOS Safari force-enters its
@@ -3437,20 +3464,9 @@ function media_element(src, mime::AbstractString, is_video::Bool;
             style = Styles("max-width" => "100%", "height" => "auto", "display" => "block")) :
         DOM.img(; src, class = "bt-media", onclick = LIGHTBOX_OPEN_JS, onerror = MEDIA_MISSING_JS, dims...,
             style = Styles("max-width" => "100%", "height" => "auto", "display" => "block", "cursor" => "zoom-in"))
-    # Hover action row (Signal-style): enlarge · copy · download. Copy is
-    # image-only (no clipboard-image for video). All revealed on wrap hover.
-    actions = DOM.div(
-        DOM.button("⤢"; class = "bt-media-action bt-media-enlarge", type = "button",
-            title = "Enlarge", onclick = LIGHTBOX_OPEN_JS),
-        (is_video ? () :
-            (DOM.button("⧉"; class = "bt-media-action bt-media-copy", type = "button",
-                title = "Copy image", onclick = COPY_MEDIA_JS),)),
-        DOM.button("⤓"; class = "bt-media-action bt-media-download", type = "button",
-            title = "Download", onclick = DOWNLOAD_MEDIA_JS),
-        (!is_video && !isempty(worker_path) ?
-            (DOM.button("▣"; class = "bt-media-action bt-media-chat-icon", type = "button",
-                title = "Set as chat icon", var"aria-label" = "Set as chat icon"),) : ());
-        class = "bt-media-actions")
+    heading = toolbar ? FileToolbar(isempty(filename) ? (is_video ? "Video" : "Image") : filename;
+        actions=(controls,DOM.div(Menu(media_menu_items(is_video;worker_path);title="File actions");
+            class="bt-media-actions")),caption=true) : ()
     # The error can come before its handler is attached: the session that
     # attaches it starts once its payload is fetched, and a missing file's 404
     # can be back sooner, leaving a broken image where the note belongs. So a
@@ -3464,8 +3480,8 @@ function media_element(src, mime::AbstractString, is_video::Bool;
     })($(inner))"""
     # Its own styles, so it renders the same outside the dashboard (a shared
     # link's page, an app of your own).
-    return DOM.div(MediaStyles, inner, actions, replay_error;
-        class = "bt-media-wrap",
+    return DOM.div(MediaStyles, heading, inner, replay_error;
+        class = "bt-media-wrap" * (toolbar ? " bt-output-card" : ""),
         (isempty(filename) ? (;) : (; dataFilename = String(filename)))...,
         (isempty(worker_path) ? (;) : (; dataWorkerPath = String(worker_path)))...)
 end
@@ -3479,7 +3495,7 @@ end
 function show_media_src(st::ShowTool, session::Union{Bonito.Session,Nothing} = nothing)
     proj = get(st.state.projects[], st.project_id, nothing)
     proj === nothing && return mirror_src(st, session)
-    return worker_file_url(st.state, proj.worker_id, show_worker_path(st))
+    return worker_file_url(st.state, proj.worker_id, show_worker_path(st); fresh = session !== nothing)
 end
 
 # A chat with no project has no worker to link to: the server's copy, fetched
@@ -3531,7 +3547,7 @@ function read_image_element(state::ServerState, project_id::AbstractString,
                 # content holds: the element has its size before it loads.
                 size = something(media_size(state, proj.worker_id, info.path),
                                  image_size(c), Some(nothing))
-                return media_element(worker_file_url(state, proj.worker_id, info.path),
+                return media_element(worker_file_url(state, proj.worker_id, info.path; fresh = true),
                     c.mime_type, is_video; filename = fname, worker_path = info.path, size)
             end
         catch e
@@ -3814,6 +3830,14 @@ end
 # `edit_diff_from_input`), which are known before the result comes back.
 renders_from_input(::ToolMsg) = false
 renders_from_input(m::EditToolMsg) = edit_diff_from_input(m) !== nothing
+
+# Static edit bodies need a new render when streamed input or diff content
+# changes. Status/title updates alone keep the existing body; reactive eval
+# bodies manage their own updates and must never be remounted here.
+tool_body_snapshot(::ToolMsg, content) = nothing
+tool_body_snapshot(m::EditToolMsg, content) =
+    (m.file_path, m.old_string, m.new_string,
+     Tuple((c.path, c.old_text, c.new_text) for c in content if c isa DiffContent))
 
 # Default body: text blocks that ARE a fenced code block become Monaco; prose
 # stays markdown; diff blocks (uncommon outside edit) and images render inline.
@@ -4706,6 +4730,7 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
                 chat_emit(h.chat, d0)
         end
         shown_running = Ref(false)
+        body_snapshot = Ref{Any}(tool_body_snapshot(b, m.content))
         AgentClientProtocol.each_update(m) do snap
             prev_status = h.status
             h.status = snap.status
@@ -4732,6 +4757,11 @@ function process_update!(b::ToolMsg, m::AgentClientProtocol.ToolCall; from::Int 
             pretty_title, _ = pretty_tool_title(h.title)
             d = Dict{String,Any}("type" => "tool_update", "id" => h.id,
                 "status" => h.status, "title" => pretty_title, "summary" => h.summary)
+            next_body = tool_body_snapshot(b, snap.content)
+            if next_body != body_snapshot[]
+                d["refresh_body"] = true
+                body_snapshot[] = next_body
+            end
             # A background subagent: mark the bubble so the browser renders its
             # background/taskbar affordance (the pill itself comes from the shared
             # TaskBar observable via the `push!` above).
@@ -5397,6 +5427,7 @@ function Base.close(model::ChatModel)
     # Stop the TaskBar's own poll loop and drop its live tasks — otherwise the
     # 1 Hz loop spins forever, pinning the model (and its tasks) past teardown.
     close(s.taskbar)
+    detach_process_tasks!(s)
     return nothing
 end
 
@@ -5938,6 +5969,7 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
             # the span: a one-shot response channel that settles with the stopReason.
             try
                 turn = lock(s.lock) do
+                    pause_disallowed_peer_sends!(s)
                     submission !== nothing && submission.status != :sending && return nothing
                     if submission !== nothing && submission.mode === :idle &&
                        (!s.yolo[] || s.stopped[] || !isempty(AgentClientProtocol.open_turns(s)))
@@ -5949,9 +5981,14 @@ function begin_turn(f, chat::ChatModel, user_msg::UserMessage; submission=nothin
                     cancelling(chat) &&
                         error("The agent is still stopping; message has not been sent.")
                     payload = submission === nothing ? (message = user_msg, text = "") : submission_payload(submission)
+                    receipts = submission !== nothing && get(cli.session_result, "bonitoPromptReceipts", false)
+                    receipt_id = receipts ? string(uuid4()) : nothing
                     span = AgentClientProtocol.prompt!(cli, with_prelude(chat, payload.message.text);
-                        images=payload.message.images)
-                    submission === nothing || submission_sent!(s, submission, span; text = payload.text)
+                        images=payload.message.images, receipt_id)
+                    if submission !== nothing
+                        receipts ? submission_submitted!(s, submission, span; text=payload.text, receipt_id) :
+                            submission_sent!(s, submission, span; text=payload.text)
+                    end
                     span
                 end
                 break
@@ -6565,6 +6602,16 @@ struct ChatPermissionHandler <: AgentClientProtocol.Handler
     chat::ChatModel                      # the SHARED parent model
 end
 
+function AgentClientProtocol.on_notification(h::ChatPermissionHandler, method::AbstractString, params)
+    method == "_bonito/prompt_received" || return nothing
+    params isa AbstractDict || return nothing
+    c = client(h.chat.agent)
+    c === nothing && return nothing
+    get(params, "sessionId", nothing) == c.session_id || return nothing
+    confirm_submission!(h.chat, get(params, "messageId", nothing))
+    return nothing
+end
+
 function AgentClientProtocol.on_request(h::ChatPermissionHandler,
                                         method::AbstractString, params)
     method == "session/request_permission" &&
@@ -6853,6 +6900,7 @@ function register_chat_model!(model::ChatModel)
         lock(model.state.lock) do
             model.state.chat_models[model.project_id] = model
         end
+        attach_process_tasks!(s)
         notify_chats!(model.state)
     end
     return nothing
@@ -7783,18 +7831,17 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # ── The ⋯ menu ───────────────────────────────────────────────────────────
     # Every other one-shot action lives here, so the strip only shows what the
     # user reads all the time. Each item notifies `menu_pick` with its action
-    # name and closes the menu; the trigger toggles `bt-menu-open` and installs a
-    # capture-phase document listener that closes on a click outside. One
-    # listener per open (a re-open replaces it), removed on every close path.
+    # name.
     menu_pick = Observable("")
-    # Picking an item closes whatever holds it: the popover on wide panes, and
-    # on narrow panes the expanded ⋯ panel the items are laid out in.
-    close_menu_js = MENU_CLOSE_JS * """
+    # Picking an item closes whatever holds it: the Menu closes its popover by
+    # itself, and on narrow panes this closes the expanded ⋯ panel the items
+    # are laid out in.
+    close_menu_js = """
         const header = event.currentTarget.closest('.bt-header');
         const more = header?.querySelector('.bt-header-more-check');
         if (more) { more.checked = false; header.classList.remove('bt-header-open'); }"""
     menu_item(text, action; class = "", title = "") = DOM.button(text;
-        class = strip("bt-menu-item " * class),
+        class = strip("bw-menu-item " * class),
         title = title,
         onclick = js"""event => {
             $(Bonito.JSString(close_menu_js))
@@ -7814,17 +7861,18 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                       by = w -> w.name)
         isempty(others) && return DOM.div(; class = "bt-menu-group bt-hidden")
         DOM.div(
-            DOM.div("Continue on"; class = "bt-menu-title"),
+            DOM.div("Continue on"; class = "bw-menu-title"),
             (DOM.button(w.name;
-                class = "bt-menu-item bt-menu-continue",
+                class = "bw-menu-item bt-menu-continue",
                 title = "Open a new chat on $(w.name) that picks up here: the files and the agent's memory. This chat stays as it is.",
                 onclick = js"""event => {
                     $(Bonito.JSString(close_menu_js))
                     $(continue_pick).notify($(w.worker_id));
                 }""") for w in others),
-            DOM.div(; class = "bt-menu-sep");
+            DOM.div(; class = "bw-menu-sep");
             class = "bt-menu-group")
     end
+    continuing = Ref(false)
     on(session, continue_pick) do wid
         isempty(wid) && return
         continue_pick[] = ""
@@ -7843,25 +7891,30 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             problem("Wait for the current turn to finish, or stop it, before continuing on $(w.name)")
             return
         end
-        # Copying a big project takes a while; it reports into the WINDOW's one
-        # progress card, which stays up for the whole of it and updates in place.
-        prog = pane === nothing ? nothing : pane.progress
-        if prog !== nothing && is_busy_running(prog[])
-            problem("Something else is already running in this window — wait for it to finish")
+        if continuing[]
+            problem("This chat is already being continued on another worker")
             return
         end
-        prog === nothing || busy_start!(prog, "Continuing on $(w.name)")
+        continuing[] = true
+        job = BonitoMCP.BonitoProgress.progress(ChatProgress(state, project_id), "Continuing on $(w.name)"; unit="files")
+        report = sync_job_progress(job)
         Base.errormonitor(@async try
-            new_p = continue_on!(state, p, wid; progress = (stage, info) ->
-                prog === nothing || busy_event!(prog, stage, info))
-            prog === nothing || busy_done!(prog, new_p.resume_session_id === nothing ?
+            new_p = continue_on!(state, p, wid; progress=report)
+            BonitoMCP.BonitoProgress.update!(job, job.snapshot["completed"]; label="New chat on $(w.name)")
+            report(:completed, (msg=new_p.resume_session_id === nothing ?
                 "New chat on $(w.name). The agent starts fresh there; this chat stays as it is." :
-                "New chat on $(w.name), with the agent's memory. This chat stays as it is.")
+                "New chat on $(w.name), with the agent's memory. This chat stays as it is.",))
             pane === nothing || (pane.navigate[] = new_p.id)
         catch e
             bt = catch_backtrace()
             @warn "continue on worker failed" project = p.name target = w.name exception = (e, bt)
-            problem("Could not continue on $(w.name)", error_detail(e, bt))
+            if e isa InterruptException
+                BonitoMCP.BonitoProgress.cancel!(job)
+            else
+                BonitoMCP.BonitoProgress.fail!(job, error_detail(e, bt))
+            end
+        finally
+            continuing[] = false
         end)
     end
 
@@ -7914,20 +7967,20 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # Gated behind a JS `confirm()` for the same reason as the worker card's
     # remove ✕ — the call must never fire without an explicit OK. It earns that
     # because `bt_dev_control` is NOT scoped to the calling chat: the agent here
-    # can send messages into, restart or close any chat on this server, and move
+    # can inspect, restart or close any chat on this server, and move
     # chats between machines.
     #
-    # Flipping the flag alone would do nothing visible: `dev_mode` is read at
-    # session bring-up (see `set_dev_mode!`), so the session is restarted to
-    # respawn the MCP process with the new environment. A chat with no project
+    # The server revokes access immediately. Restarting also refreshes tool
+    # discovery by respawning MCP with the new environment (`set_dev_mode!`).
+    # A chat with no project
     # has nowhere to persist the flag, so it gets no item. While ON, the menu
     # trigger itself turns red: that this chat's agent can drive the whole
     # server should be legible at a glance, not something you discover by opening
     # the menu.
     # ── Per-chat capability switches (the ⋯ menu) ────────────────────────────
-    # "Dev mode" and "Remote julia" are the same widget: a capability this
-    # chat's agent is granted, off by default, flipped rarely and read almost
-    # never. ONE implementation, because both of them shipped broken in
+    # Dev mode, Remote julia and Chat messaging share one capability widget:
+    # granted to this chat's agent, off by default and flipped rarely.
+    # ONE implementation, because the first two shipped broken in
     # DIFFERENT ways while they were two hand-rolled copies, and neither failure
     # was visible from the UI.
     #
@@ -7961,8 +8014,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             # `hook` is the stable selector the e2e suite queries by; the
             # `bt-cap-*` classes carry the STATE. Keeping them separate means a
             # restyle cannot silently break a test's handle on the control.
-            "bt-menu-item bt-cap-item $(hook)" *
-                (danger ? " bt-menu-danger" : "") *
+            "bw-menu-item bt-cap-item $(hook)" *
+                (danger ? " bw-menu-danger" : "") *
                 (on ? " bt-cap-on" : "") * (busy ? " bt-cap-busy" : "")
         end
         trigger = Observable("")
@@ -8010,6 +8063,14 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 "the evals running there.")
     remote_item = remote.item
 
+    messaging = capability_item("Chat messaging", q -> q.chat_messaging,
+        want -> set_chat_messaging!(viewer, project_id, want);
+        hook = "bt-header-messaging",
+        title = "Allow this agent to send and receive messages with your other opted-in chats. " *
+                "Both chats must enable it. Off by default; disabling pauses messages not yet handed over. " *
+                "Takes effect immediately without restarting the agent.")
+    messaging_item = messaging.item
+
     dev = capability_item("Dev mode", q -> q.dev_mode,
         function (want)
             safe_set!(header_status, want ? "Enabling dev mode…" : "Disabling dev mode…")
@@ -8024,7 +8085,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         hook = "bt-header-devmode",
         danger = true,
         confirm_text = "Enable dev mode for this chat?\n\nIts agent gets tools that " *
-                       "read AND DRIVE this server: it can send messages into, restart " *
+                       "read AND DRIVE this server: it can inspect, restart " *
                        "or close ANY chat here, and move chats between machines.\n\n" *
                        "This restarts the chat session.",
         title = "Dangerous: give this chat's agent live introspection into " *
@@ -8036,19 +8097,14 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     is_admin(viewer) || (remote_item = DOM.div(); devmode_item = DOM.div())
 
     menu_trigger_class = map(session, devmode_on) do on
-        on ? "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger bt-menu-trigger-danger" :
-             "bt-btn bt-btn-secondary bt-btn-sm bt-menu-trigger"
+        on ? "bw-btn-secondary bw-btn-sm bt-menu-trigger-danger" : "bw-btn-secondary bw-btn-sm"
     end
-    menu_trigger = DOM.button("⋯";
-        class = menu_trigger_class,
-        title = "More actions",
-        onclick = MENU_TOGGLE_JS)
     # In the ⋯ menu with every other one-shot action, not as a lone button in
     # the strip. The strip is for what the user READS continuously (the context
     # meter) and for the pickers that describe the session; a verb parked next
     # to them reads as a sixth setting.
     review_item = DOM.button("Review changes";
-        class   = "bt-menu-item bt-header-review",
+        class   = "bw-menu-item bt-header-review",
         title   = "Review this project's uncommitted changes — ask about or comment on any line",
         onclick = js"""event => {
             $(Bonito.JSString(close_menu_js))
@@ -8063,32 +8119,32 @@ function chat_header(session::Bonito.Session, model::ChatModel)
         DOM.a("Export as Markdown";
             href     = "/export/$(project_id)",
             download = export_filename(model),
-            class    = "bt-menu-item bt-header-export",
+            class    = "bw-menu-item bt-header-export",
             title    = "Download this chat as a Markdown file (full tool bodies, files by path)",
             onclick  = js"""event => {
                 $(Bonito.JSString(close_menu_js))
             }""")
 
-    menu = DOM.div(
-        menu_trigger,
-        DOM.div(
+    menu = Menu(
+        [
             review_item,
             export_item,
-            DOM.div(; class = "bt-menu-sep"),
+            DOM.div(; class = "bw-menu-sep"),
             continue_items,
             menu_item("Compact", "compact";
                 title = "Summarize the conversation so far to free up context (/compact)"),
             menu_item("Restart session", "restart"; class = "bt-header-restart",
                 title = "Stop and respawn the agent process for this chat"),
-            pane === nothing ? nothing : DOM.div(; class = "bt-menu-sep"),
+            pane === nothing ? nothing : DOM.div(; class = "bw-menu-sep"),
             pane === nothing ? nothing :
                 menu_item("Debug BonitoAgents", "debug"; class = "bt-header-debug",
                     title = "Open a chat on BonitoAgents' own source on this worker, with live " *
                             "introspection into the server running this window"),
             remote_item,
-            devmode_item;
-            class = "bt-menu-list");
-        class = "bt-menu bt-header-menu")
+            messaging_item,
+            devmode_item,
+        ];
+        title = "More actions", class = "bt-header-menu", trigger_class = menu_trigger_class)
 
     # (The Yolo toggle lives in the composer — see `chat_composer` — not in
     # the header: it repurposes the message input as the reminders editor, so
@@ -8428,7 +8484,7 @@ function chat_composer(session::Session, model::ChatModel)
     cancel_status = DOM.div(
         DOM.span("Stopping the agent…"),
         DOM.button("Force stop"; type="button",
-            class="bt-btn bt-btn-danger bt-btn-sm bt-force-stop-btn",
+            class="bw-btn bw-btn-danger bw-btn-sm bt-force-stop-btn",
             title="End an unresponsive agent connection. Your next message reconnects.");
         class="bt-cancel-status", role="status", var"aria-live"="polite", hidden=true)
     # Attaching had exactly two ways in: paste and drag-drop. Neither exists on
@@ -8479,12 +8535,12 @@ function chat_composer(session::Session, model::ChatModel)
     """
     send_mode = DOM.div(
         DOM.button(DOM.span("Queue when done"; class="bt-send-mode-label"); type="button",
-            class="bt-btn bt-btn-ghost bt-send-mode-trigger",
+            class="bw-btn bw-btn-ghost bt-send-mode-trigger",
             title="Queue for when done", var"aria-label"="Queue for when done",
             var"aria-haspopup"="menu", var"aria-expanded"="false"),
         DOM.div(
             [DOM.button(label; type="button", role="menuitemradio",
-                class="bt-btn bt-btn-ghost bt-send-mode-option",
+                class="bw-btn bw-btn-ghost bt-send-mode-option",
                 var"data-send-mode"=mode, var"aria-checked"=mode == "done" ? "true" : "false")
              for (mode, label) in (("done", "Queue for when done"),
                  ("next", "Queue after current message"), ("interrupt", "Interrupt + send"))];
@@ -9140,6 +9196,7 @@ handle_command!(model::ChatModel, ::Any, cmd::QuestionSkipCommand) =
 
 function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
     isempty(cmd.tool_id) && return nothing
+    managed_process_control!(model, cmd.tool_id) && return nothing
     target = lock(model.lock) do
         idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]
@@ -9515,7 +9572,7 @@ function chat_notice(session::Bonito.Session, model::ChatModel)
     box = DOM.div(
         DOM.details(DOM.summary(; class="bt-session-notice-title"),
                     DOM.div(; class="bt-session-notice-text"); class="bt-session-notice-body"),
-        DOM.button("×"; class="bt-btn bt-btn-ghost bt-btn-sm", type="button",
+        DOM.button("×"; class="bw-btn bw-btn-ghost bw-btn-sm", type="button",
                    title="Dismiss notice");
         class="bt-session-notice", role="status", hidden=true)
     Bonito.onload(session, box, js"""(el) => {
@@ -9722,5 +9779,7 @@ function chat_transcript(session::Session, model::ChatModel)
     # The messages area + the taskbar share a positioning context so the
     # taskbar floats over the MESSAGES, anchored below the (variable-height)
     # header instead of on top of it. The rail positions itself in it too.
-    return DOM.div(messages_container, taskbar, init_script; class = "bt-messages-wrap")
+    return DOM.div(messages_container, taskbar,
+        job_progress_view(session,job_book(model.state,model.project_id)),
+        init_script; class = "bt-messages-wrap")
 end

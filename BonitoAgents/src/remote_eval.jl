@@ -33,19 +33,24 @@ const REMOTE_OPS = ("eval", "continue", "interrupt", "restart", "sessions", "run
 eval_host_key(project_id::AbstractString, worker_id::AbstractString) =
     "$(project_id)\0$(worker_id)"
 
-eval_host_ws(state::ServerState, project_id::AbstractString, worker_id::AbstractString) =
-    lock(state.lock) do
-        get(state.eval_hosts, eval_host_key(project_id, worker_id), nothing)
-    end
+function eval_host_ws(state::ServerState, project_id::AbstractString, worker_id::AbstractString)
+    channels = mcp_channels_for(state, project_id, worker_id)
+    return isempty(channels) ? nothing : first(channels)
+end
 
 # Every live host of one chat, as `(worker_id, ws)`.
 function eval_hosts_of(state::ServerState, project_id::AbstractString)
     prefix = project_id * "\0"
     lock(state.lock) do
-        [(String(k[(length(prefix) + 1):end]), ws) for (k, ws) in state.eval_hosts
-         if startswith(k, prefix)]
+        [(String(k[(length(prefix) + 1):end]), ws) for (k, group) in state.eval_hosts
+         if startswith(k, prefix) for ws in group.channels]
     end
 end
+
+# The new MCP uses this op for pull/selection so older servers fail explicitly
+# instead of silently interpreting the call as a full-folder push.
+dev_op(state::ServerState, ::Val{:sync_folder_v2}, args::AbstractDict, caller::String) =
+    dev_op(state, Val(:sync_folder), args, caller)
 
 """
     set_remote_eval!(state, project_id, on) -> ProjectInfo
@@ -325,26 +330,37 @@ function worker_row(state::ServerState, p::Union{ProjectInfo,Nothing}, w::Worker
 end
 
 """
-    sync_folder!(state, p, w, src, dst; progress = nothing) -> NamedTuple
+    sync_folder!(state, p, w, src, dst; direction = "push", paths = nothing, progress = nothing) -> NamedTuple
 
-Copy `src` (a folder on `p`'s worker) to `dst` on worker `w`, streaming through
-the server without a disk mirror. The destination's own files are the delta
+Copy `src` on `p`'s worker to `dst` on worker `w` (push), or `src` on `w` to
+`dst` on `p`'s worker (pull), streaming through the server without a disk mirror.
+The destination's own files are the delta
 basis. Destination-only files are preserved. Returns the folder size and counts
-of written, deleted (always zero), and unchanged files.
+of written, deleted (always zero), and unchanged files. `paths` selects files
+or recursive subfolders relative to `src`; omit it for the whole folder.
 """
 function sync_folder!(state::ServerState, p::ProjectInfo, w::WorkerInfo,
-                      src::AbstractString, dst::AbstractString; progress = nothing)
-    src_w = get(state.workers[], p.worker_id, nothing)
-    (src_w === nothing || !isopen(src_w)) && error("this chat's own worker is offline")
+                      src::AbstractString, dst::AbstractString;
+                      direction::AbstractString = "push", paths = nothing, progress = nothing)
+    direction in ("push", "pull") || error("`direction` must be `push` or `pull`")
+    own = get(state.workers[], p.worker_id, nothing)
+    (own === nothing || !isopen(own)) && error("this chat's own worker is offline")
+    src_w, dst_w = direction == "pull" ? (w, own) : (own, w)
+    if paths !== nothing
+        paths isa AbstractVector && !isempty(paths) && all(p -> p isa AbstractString, paths) ||
+            error("`paths` must be a nonempty list of relative file or folder paths")
+        can(src_w, "sync_paths") || error("update source worker '$(src_w.name)' to sync selected paths")
+    end
     isempty(strip(src)) && error("`src` is empty")
     isempty(strip(dst)) && error("`dst` is empty")
     started = time()
-    notify_progress(progress, :phase, (msg = "Streaming from $(src_w.name) to $(w.name)…",))
-    source = transfer_channel(state, src_w.worker_id,
-        Dict("direction" => "from_worker", "src_path" => String(src)); timeout = 30.0)
+    notify_progress(progress, :phase, (msg = "Streaming from $(src_w.name) to $(dst_w.name)…",))
+    header = Dict{String,Any}("direction" => "from_worker", "src_path" => String(src))
+    paths === nothing || (header["paths"] = paths)
+    source = transfer_channel(state, src_w.worker_id, header; timeout = 30.0)
     destination = nothing
     try
-        destination = transfer_channel(state, w.worker_id,
+        destination = transfer_channel(state, dst_w.worker_id,
             Dict("direction" => "to_worker", "dst_path" => String(dst)); timeout = 30.0)
         result = RemoteSync.relay_directory(RemoteSync.WebSocketIO(source),
             RemoteSync.WebSocketIO(destination); on_progress = progress)
@@ -358,7 +374,7 @@ function sync_folder!(state::ServerState, p::ProjectInfo, w::WorkerInfo,
         catch e
             e isa WebSockets.WebSocketError && WebSockets.isok(e) || rethrow()
         end
-        @info "folder transfer completed" project_id = p.id source_worker = src_w.worker_id target_worker = w.worker_id files = result.files bytes = result.bytes written = result.written skipped = result.skipped seconds = round(time() - started; digits = 3)
+        @info "folder transfer completed" project_id = p.id source_worker = src_w.worker_id target_worker = dst_w.worker_id files = result.files bytes = result.bytes written = result.written skipped = result.skipped seconds = round(time() - started; digits = 3)
         return result
     catch e
         WorkerLink.abort(source, "folder transfer failed")
@@ -375,7 +391,19 @@ function dev_op(state::ServerState, ::Val{:sync_folder}, args::AbstractDict, cal
     w = remote_target(state, p, args)
     src = String(get(args, "src", ""))
     dst = String(get(args, "dst", src))
-    r = sync_folder!(state, p, w, src, dst)
+    direction = String(get(args, "direction", "push"))
+    paths = get(args, "paths", nothing)
+    label = direction == "pull" ? "Pull from $(w.name)" : "Push to $(w.name)"
+    progress = sync_job_progress(state, p.id, p.worker_id, label)
+    notify_progress(progress, :phase, (msg = "Preparing transfer",))
+    r = try
+        sync_folder!(state, p, w, src, dst; direction, paths, progress)
+    catch e
+        notify_progress(progress, e isa InterruptException ? :cancelled : :failed,
+                        (msg = first(sprint(showerror, e), 4096),))
+        rethrow()
+    end
+    notify_progress(progress, :completed, (msg = "$(r.written) files updated, $(r.skipped) unchanged",))
     return Dict{String,Any}("worker" => w.name, "dst" => dst, "files" => r.files,
                             "bytes" => r.bytes, "written" => r.written,
                             "deleted" => r.deleted, "skipped" => r.skipped)
