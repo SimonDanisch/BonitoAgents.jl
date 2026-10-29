@@ -2,7 +2,10 @@
 # must have a visible way out, without the user knowing the re-cancel timeout.
 @testitem "e2e:force_stop" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
-    visible_pane = "[...document.querySelectorAll('.bt-chatpane')].find(e => e.checkVisibility())"
+    # The pane navigation shows. Not "the first pane that checkVisibility()":
+    # every kept-alive pane passes that (it stays laid out under
+    # content-visibility: hidden), so the answer depended on pane order.
+    visible_pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     pending = "!!($visible_pane)?.querySelector('.bt-cancel-status:not([hidden])')"
     busy = "!!($visible_pane)?.querySelector('.bt-busy-active')"
     says(text) = "($visible_pane)?.textContent.includes($(repr(text))) === true"

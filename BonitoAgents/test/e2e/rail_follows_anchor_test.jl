@@ -46,7 +46,7 @@
     @test TK.wait_for(s, "the chat back",
         "!!document.querySelector('.bt-chatpane[data-pane-pid=\"$(pid)\"][data-bt-settled]') && !!$MSGS?.__bt_chat";
         timeout = 60) == true
-    @test TK.wait_for(s, "older rows not loaded yet", "$MSGS.__bt_chat.plo > 0"; timeout = 10) == true
+    @test TK.wait_for(s, "older rows not loaded yet", "$MSGS.__bt_chat.block.plo > 0"; timeout = 10) == true
 
     # In each frame as painted: the thumb, and where it belongs for the row at
     # the top of the view. Also counted: the transcript's corrections for rows growing
@@ -61,13 +61,13 @@
             set(v) { desc.set.call(this, v); if ((new Error().stack || '').includes('ResizeObserver')) window.__fix++; } });
         window.__frames = []; window.__on = true;
         const sample = () => {
-            const [first] = ch.visibleSpan();
+            const [first] = ch.block.visibleSpan();
             if (first < 0) return;
-            const node = ch.cache.get(ch.order[first]);
+            const node = ch.block.cache.get(ch.block.order[first]);
             const into = node.offsetHeight > 0 ? Math.min(1, Math.max(0, (m.scrollTop - node.offsetTop) / node.offsetHeight)) : 0;
             // The rail's own ends: the last message at the bottom, the first at the top.
-            const f = ch.atTail() && ch.atBottom() ? 1 : ch.plo <= 0 && m.scrollTop <= 1 ? 0 :
-                Math.min(1, (ch.seqPos(ch.order[first]) + into) / Math.max(1, ch.seqLength() - 1));
+            const f = ch.atTail() && ch.atBottom() ? 1 : ch.block.plo <= 0 && m.scrollTop <= 1 ? 0 :
+                Math.min(1, (ch.seqPos(ch.block.order[first]) + into) / Math.max(1, ch.seqLength() - 1));
             // As drawn: the thumb rides an animation (`placeThumb`), so its
             // computed transform, not its style attribute.
             const t = getComputedStyle(thumb).transform;
@@ -90,7 +90,7 @@
     for _ in 1:400
         ECT.send_input(s.browser[], "{type: 'mouseWheel', x: $x, y: $y, deltaX: 0, deltaY: 120, canScroll: true, hasPreciseScrollingDeltas: true}")
         sleep(0.016)
-        TK.eval_js(s, "$MSGS.__bt_chat.plo === 0 && $MSGS.scrollTop <= 1") == true && break
+        TK.eval_js(s, "$MSGS.__bt_chat.block.plo === 0 && $MSGS.scrollTop <= 1") == true && break
     end
     frames = TK.eval_js(s, "(() => { window.__on = false; return window.__frames; })()")
     off = [fr for fr in frames if abs(fr[1] - fr[2]) > 2]

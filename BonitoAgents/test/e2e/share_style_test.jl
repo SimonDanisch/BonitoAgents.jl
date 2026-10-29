@@ -48,9 +48,10 @@
         TK.screenshot(s,joinpath(tempdir(),"bonitoagents-file-toolbar-dashboard-phone.png"))
     end
     TK.screenshot(s,joinpath(tempdir(),"bonitoagents-file-toolbar-dashboard.png"))
-    viewer=TK.another_browser(s)
+    # A recipient opens the share directly. Booting the dashboard first and
+    # navigating away mid-startup can abort one of its pending fetches.
+    viewer=TK.another_browser(s;route=url)
     try
-        TK.eval_js(viewer,"location.href=$(TK.json(url)); true")
         @test TK.wait_for(viewer,"public viewer uses the same widget","!!document.querySelector('.bt-share-page > .bt-file-toolbar-slot .bt-share-download') && document.querySelector('img.bt-media')?.naturalWidth===640";timeout=30)
         @test TK.eval_js(viewer,"($style)(document.querySelector('.bt-file-toolbar'))")==chat_style
         TK.real_click(viewer,".bt-share-bar .bw-menu-trigger")

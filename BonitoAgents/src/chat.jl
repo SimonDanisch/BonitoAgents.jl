@@ -9772,9 +9772,11 @@ function chat_transcript(session::Session, model::ChatModel)
     # The chat module looks for the other widgets once it is connected, on a
     # microtask: by then the whole pane is in the document, wherever the layout
     # put them.
+    # The transcript scrolls on BonitoWidgets' endless-list engine (`RowBlock`),
+    # handed to the chat so both packages run the one copy.
     init_script = js"""
-        $(ChatLib).then(lib => lib.connect($(messages_container), $(model.comm),
-                                           $(init_snapshot)))
+        Promise.all([$(ChatLib), $(BonitoWidgets.ROW_BLOCK_LIB)]).then(([lib, rows]) =>
+            lib.connect($(messages_container), $(model.comm), $(init_snapshot), rows.RowBlock))
     """
     # The messages area + the taskbar share a positioning context so the
     # taskbar floats over the MESSAGES, anchored below the (variable-height)

@@ -142,7 +142,7 @@
                 """(() => {
                     const c = document.querySelector('.bt-messages');
                     const chat = c.__bt_chat;
-                    const node = chat.cache.get(chat.totalCount - 1);
+                    const node = chat.block.cache.get(chat.block.count - 1);
                     if (!node || !node.isConnected) return false;
                     if (!node.classList.contains('bt-agent-msg')) return false;
                     if (!(node.textContent || '').includes('echo: make the last message short')) return false;
@@ -156,7 +156,7 @@
             out = Float64(TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
-                const node = chat.cache.get(chat.totalCount - 1);
+                const node = chat.block.cache.get(chat.block.count - 1);
                 return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
             })()"""))
             # Tail (50px) + gap + the bubble itself: the halfway point sits
@@ -286,7 +286,7 @@
             # While we're at the bottom, the chunks chase us down — followMode
             # stays on, nothing is unread, no pill. Wait out the delay + stream.
             @test TK.wait_for(s, "burst arrived",
-                "(() => { const c=document.querySelector('.bt-messages'); return c.__bt_chat.totalCount >= 3; })()"; timeout = 20) == true
+                "(() => { const c=document.querySelector('.bt-messages'); return c.__bt_chat.block.count >= 3; })()"; timeout = 20) == true
             sleep(0.6)
             @test follow_mode() == true
             @test Int(unread()) == 0
@@ -357,7 +357,7 @@
             let last = -1, n = -2, tries = 0
                 while n != last && tries < 40
                     last = n
-                    n = Int(TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount"))
+                    n = Int(TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.block.count"))
                     tries += 1
                     sleep(0.3)
                 end
@@ -433,7 +433,7 @@
                 """(() => {
                     const c = document.querySelector('.bt-messages');
                     const chat = c.__bt_chat;
-                    const node = chat.cache.get(chat.totalCount - 1);
+                    const node = chat.block.cache.get(chat.block.count - 1);
                     if (!node || !node.isConnected) return false;
                     if (!node.querySelector('pre')) return false;
                     if (!(node.textContent || '').includes('reply row 12')) return false;
@@ -446,7 +446,7 @@
             out = Float64(TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
-                const node = chat.cache.get(chat.totalCount - 1);
+                const node = chat.block.cache.get(chat.block.count - 1);
                 return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
             })()"""))
             @test out > 100
@@ -506,7 +506,7 @@
             out = Float64(TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
-                const node = chat.cache.get(chat.totalCount - 1);
+                const node = chat.block.cache.get(chat.block.count - 1);
                 return c.getBoundingClientRect().bottom - node.getBoundingClientRect().top;
             })()"""))
             @test out > 60
@@ -556,7 +556,7 @@
                 """(() => {
                     const c = document.querySelector('.bt-messages');
                     const chat = c.__bt_chat;
-                    const node = chat.cache.get(chat.totalCount - 1);
+                    const node = chat.block.cache.get(chat.block.count - 1);
                     if (!node || !node.isConnected) return false;
                     if (!node.querySelector('pre')) return false;
                     if (c.querySelector('.bt-busy.bt-busy-active')) return false;
@@ -570,9 +570,9 @@
             tall = TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
-                const node = chat.cache.get(chat.totalCount - 1);
+                const node = chat.block.cache.get(chat.block.count - 1);
                 return {h: Math.round(node.getBoundingClientRect().height), view: c.clientHeight,
-                        total: chat.totalCount, cls: node.className,
+                        total: chat.block.count, cls: node.className,
                         lines: (node.querySelector('pre')?.innerText || '').split('\\n').length};
             })()""")
             tall_enough = tall["h"] > 1.5 * tall["view"] + 100
@@ -584,7 +584,7 @@
             node_top_doc = Float64(TK.eval_js(s, """(() => {
                 const c = document.querySelector('.bt-messages');
                 const chat = c.__bt_chat;
-                const node = chat.cache.get(chat.totalCount - 1);
+                const node = chat.block.cache.get(chat.block.count - 1);
                 return node.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop;
             })()"""))
             # Park far up first (follow off), then scroll DOWN to a position

@@ -14,7 +14,7 @@ WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 AgentClientProtocol = {path = "AgentClientProtocol"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
-BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "sd/shared-ui-widgets"}
+BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 BonitoMCP = {path = "BonitoMCP"}
 BonitoAgents = {path = "BonitoAgents"}
 BonitoWorker = {path = "BonitoWorker"}

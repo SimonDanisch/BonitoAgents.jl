@@ -30,7 +30,7 @@ BonitoAgents = {path = "../BonitoAgents"}
 # too so resolution always honors the sd/llm-improvements tip (which allows
 # Bonito 5) rather than a stale cached tree.
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
-BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "sd/shared-ui-widgets"}
+BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 BonitoMCP = {path = "../BonitoMCP"}
 BonitoWorker = {path = "../BonitoWorker"}
 

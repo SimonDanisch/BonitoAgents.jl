@@ -1081,6 +1081,7 @@ end
 
 Open one Electron window pointed at the dev server. Idempotent — the
 second call closes the prior window and opens a fresh one.
+`route` can also be an absolute URL, for example a public share on another host.
 """
 # `offscreen = true` (the DEFAULT) renders via OSR so requestAnimationFrame runs
 # at ~60fps instead of the ~1.5fps a plain hidden window's compositor produces —
@@ -1093,7 +1094,7 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     ensure_display!()
     old = s.browser[]
     old === nothing || close_browser(old)
-    url = s.h.url * route
+    url = occursin(r"^https?://", route) ? String(route) : s.h.url * route
     # Behind the proxy each browser keeps cookies of its own: Electron's default
     # profile is shared by every window, so a second browser would be logged in
     # as the first. Without a GPU (CI) WebGL runs on SwiftShader, and Chromium
@@ -1810,17 +1811,17 @@ function passkey_login!(s::TestServer)
 end
 
 """
-    another_browser(s) -> TestServer
+    another_browser(s; route = "/") -> TestServer
 
 A second browser on the same server, with cookies of its own: another person
 logged in at the same time (`login!` into it). Everything that takes a
 `TestServer` drives it. Close it with `close_browser!`, never `close`, which
 stops the server.
 """
-function another_browser(s::TestServer)
+function another_browser(s::TestServer; route::AbstractString = "/")
     b = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
                    Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
-    open_browser(b)
+    open_browser(b; route)
     return b
 end
 
