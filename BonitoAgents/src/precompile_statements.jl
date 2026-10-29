@@ -3137,7 +3137,6 @@ const WorkerLink = require(PkgId(UUID("03840273-e5e6-4e74-9050-e95881fcd827"), "
 @precompile(Tuple{typeof(BonitoAgents.normalize_wire), UInt32})
 @precompile(Tuple{typeof(BonitoAgents.normalize_wire), UInt8})
 @precompile(Tuple{typeof(BonitoAgents.normalize_worker_path), String})
-@precompile(Tuple{typeof(BonitoAgents.notebook_source), JSON.Object{String, Any}})
 @precompile(Tuple{typeof(BonitoAgents.open_file!), BonitoAgents.PlotPane, BonitoAgents.ChatModel, String})
 @precompile(Tuple{typeof(BonitoAgents.open_file!), BonitoAgents.PlotPane, BonitoAgents.ChatModel, String}) # recompile
 @precompile(Tuple{typeof(BonitoAgents.open_guard_reject_reason), NamedTuple{(:exists, :isfile, :isdir, :range_reads, :size, :mtime, :path), Tuple{Bool, Bool, Bool, Bool, Int64, Float64, String}}, String})

@@ -425,14 +425,9 @@ function file_viewer(::TableFile, c::FileContent, path::AbstractString, mode::Vi
 end
 
 # ── Jupyter notebook ────────────────────────────────────────────────────────
-# Cells in order: markdown rendered, code in a read-only Monaco with the
+# Cells in order: markdown rendered, code in a read-only CodeView with the
 # notebook's own language, and outputs (stream text, results, images, errors)
 # under each code cell — which is the bit a plain editor can't do at all.
-notebook_source(cell) = begin
-    src = get(cell, "source", "")
-    src isa AbstractString ? String(src) : join(String.(src))
-end
-
 function notebook_output_node(out::AbstractDict)
     otype = String(get(out, "output_type", ""))
     data  = get(out, "data", Dict{String,Any}())
@@ -464,21 +459,20 @@ function notebook_output_node(out::AbstractDict)
 end
 
 function file_viewer(::NotebookFile, c::FileContent, path::AbstractString, mode::ViewMode = InlineView())
-    nb = JSON.parse(content_text(c))
-    lang = get(get(get(nb, "metadata", Dict()), "kernelspec", Dict()), "language", "python")
-    cells = get(nb, "cells", [])
+    nb = BonitoBook.read_ipynb(IOBuffer(content_text(c)); default_language = "python")
+    cells = nb.cells
     isempty(cells) && return DOM.div("(notebook has no cells)"; class = "bt-tool-empty")
     limit = mode isa InlineView ? 12 : length(cells)
     nodes = Any[]
     for cell in Iterators.take(cells, limit)
-        ctype = String(get(cell, "cell_type", "code"))
-        src = notebook_source(cell)
+        ctype = cell.cell_type
+        src = cell.source
         if ctype == "markdown"
             push!(nodes, DOM.div(markdown_preview_node(src, c.link; c.raw_html); class = "bt-fv-nb-cell bt-fv-nb-md"))
         else
-            outs = get(cell, "outputs", [])
+            outs = cell.outputs
             push!(nodes, DOM.div(
-                DOM.div(CodeView(src; language = String(lang)); class = "bt-fv-nb-source"),
+                DOM.div(CodeView(src; language = nb.language); class = "bt-fv-nb-source"),
                 (isempty(outs) ? () :
                     (DOM.div((notebook_output_node(o) for o in outs if o isa AbstractDict);
                              class = "bt-fv-nb-outputs"),));
