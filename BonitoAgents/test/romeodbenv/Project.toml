@@ -1,0 +1,6 @@
+# CPU-only RomeoDB integration tests: no embedding runner or GPU dependencies.
+[deps]
+RomeoDB = "b0bc34ab-3faa-4d3f-891a-2fccc1f41d4b"
+
+[sources]
+RomeoDB = {path = "../../../RomeoDB"}

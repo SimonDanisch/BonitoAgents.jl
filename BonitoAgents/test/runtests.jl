@@ -35,9 +35,10 @@ using ReTestItems, BonitoAgents
 # worker re-resolves on first touch and the render/mount times out. The packages
 # are precompiled in the depot, so this is a fast cache hit; do it once here,
 # before the workers fork.
+# `e2e:romeodb` uses the sibling package through the CPU-only `romeodbenv`.
 let cur = Base.active_project()
     import Pkg
-    for env in ("evalenv", "altenv")
+    for env in ("evalenv", "altenv", "romeodbenv")
         path = joinpath(@__DIR__, env)
         isdir(path) || continue
         try

@@ -1,3 +1,26 @@
+@testitem "unit:installer_ships_romeodb" tags = [:unit] begin
+    using BonitoAgents
+    script = read(joinpath(BonitoAgents.ASSETS_DIR, "install.jl"), String)
+    parsed = Meta.parseall(script)
+    declaration = only(filter(parsed.args) do e
+        e isa Expr && e.head == :const && e.args[1] isa Expr &&
+            e.args[1].head == :(=) && e.args[1].args[1] == :SPECS
+    end)
+    # Evaluate only the installer's declarative package list, never its install
+    # operations. This checks the actual launch artifact without network access.
+    m = Module()
+    Core.eval(m, :(import Pkg))
+    Core.eval(m, :(const REPO = "https://example.test/BonitoAgents.jl"))
+    Core.eval(m, :(const REV = "release-sha"))
+    Core.eval(m, :(const BONITO_REV = "bonito-sha"))
+    specs = Core.eval(m, declaration)
+    core = only(filter(s -> s.name == "RomeoDB", specs))
+    @test core.subdir == "RomeoDB"
+    @test core.rev == "release-sha"
+    @test "RomeoDB" in BonitoAgents.WORKER_REPO_PACKAGES
+    @test !any(s -> s.name in ("Qwen3EmbeddingRunner", "Mantle", "Lava", "DNNKernels"), specs)
+end
+
 # "Add worker" shows `curl -fsSL <server>/install.sh | sh -s <credential>`: the
 # credential is the script's argument, and it has to reach the Julia installer
 # as that one's argument. Older commands set BONITOAGENTS_WORKER_CREDENTIAL,
