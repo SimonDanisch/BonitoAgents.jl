@@ -12,8 +12,8 @@ interactive apps that keep computing on your machine. Your code stays in
 ordinary folders, your transcripts stay on your disk, and the agents run on your
 own subscriptions and keys.
 
-For the whole picture in one go, read [A Day with BonitoAgents](@ref): one
-working day, from the first coffee to the overnight render.
+Read [A Day with BonitoAgents](@ref) for a concrete workflow: reproduce a
+rendering bug, inspect the results, review the patch and share a working demo.
 
 !!! warning
     Use at your own risk: there are no safeguards (yet) preventing an LLM
