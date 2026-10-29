@@ -52,7 +52,7 @@
     @testset "a long history streams in; the block keeps the newest rows" begin
         TK.send_message(s, "scroll $(N)")
         @test TK.wait_for(s, "the whole turn",
-            "(() => { const c = $CHAT; return !!c && c.totalCount >= $(TOTAL); })()"; timeout = 60) == true
+            "(() => { const c = $CHAT; return !!c && c.block.count >= $(TOTAL); })()"; timeout = 60) == true
         @test TK.wait_for(s, "MSG-LAST at the bottom", has("MSG-LAST"); timeout = 20) == true
         @test Int(TK.eval_js(s, ROWS)) <= MAX_WINDOW
         @test TK.eval_js(s, "$CHAT.atBottom()") == true
@@ -75,7 +75,7 @@
     @testset "a scroll right after opening is kept" begin
         TK.navigate(s, "/")
         TK.open_chat(s, pid)
-        @test TK.wait_for(s, "the newest rows", "!!$CHAT && $CHAT.order.length > 0"; timeout = 20) == true
+        @test TK.wait_for(s, "the newest rows", "!!$CHAT && $CHAT.block.order.length > 0"; timeout = 20) == true
         top = TK.eval_js(s, """(() => { const c = $C, ch = $CHAT;
             ch.setFollowMode(false); ch.cancelPendingScroll();
             c.scrollTop = Math.max(0, c.scrollHeight - c.clientHeight - 400);
@@ -100,10 +100,10 @@
             # event is dispatched by hand (the offscreen renderer fires none
             # for a programmatic write); the older rows arrive after it.
             top, plo = TK.eval_js(s, """(() => { const c = $C; c.scrollTop = 0;
-                const top = $TOP_ROW, plo = $CHAT.plo;
+                const top = $TOP_ROW, plo = $CHAT.block.plo;
                 c.dispatchEvent(new Event('scroll'));
                 return [top, plo]; })()""")
-            TK.wait_for(s, "older rows", "$CHAT.plo < $(plo)"; timeout = 10)
+            TK.wait_for(s, "older rows", "$CHAT.block.plo < $(plo)"; timeout = 10)
             sleep(0.2)
             # The row that was at the top is still there, at the same spot.
             after = TK.eval_js(s, """(() => { const c = $C;
@@ -159,7 +159,7 @@
         TK.press_key!(s, "Home")
         @test TK.wait_for(s, "the first message at the top",
             "$(has("MSG-FIRST")) && $C.scrollTop <= 1"; timeout = 15) == true
-        @test TK.eval_js(s, "$CHAT.plo") == 0
+        @test TK.eval_js(s, "$CHAT.block.plo") == 0
         @test TK.eval_js(s, "$CHAT.followMode") == false
         TK.press_key!(s, "End")
         @test TK.wait_for(s, "the last message at the bottom",

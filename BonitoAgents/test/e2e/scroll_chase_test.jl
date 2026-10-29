@@ -113,7 +113,7 @@
 
             # Wait for the bubble to start (held-back delay then chunks land).
             @test TK.wait_for(s, "stream started",
-                "document.querySelector('$P .bt-messages').__bt_chat.totalCount >= 2"; timeout = 20) == true
+                "document.querySelector('$P .bt-messages').__bt_chat.block.count >= 2"; timeout = 20) == true
 
             # Sample the gap several times as the height climbs. At each sample the
             # chase must have re-scrolled us back under threshold — if any sample

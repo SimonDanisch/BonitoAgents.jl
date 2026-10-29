@@ -76,7 +76,7 @@
     wheel(dy) = ECT.send_input(s.browser[], "{type: 'mouseWheel', x: $x, y: $y, deltaX: 0, deltaY: $dy, canScroll: true, hasPreciseScrollingDeltas: true}")
     for _ in 1:600
         wheel(120); sleep(0.016)
-        TK.eval_js(s, "$MSGS.__bt_chat.plo === 0 && $MSGS.scrollTop <= 1") == true && break
+        TK.eval_js(s, "$MSGS.__bt_chat.block.plo === 0 && $MSGS.scrollTop <= 1") == true && break
     end
     for _ in 1:600
         wheel(-120); sleep(0.016)

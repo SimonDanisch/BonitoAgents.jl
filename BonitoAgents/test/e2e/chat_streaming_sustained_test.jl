@@ -103,7 +103,7 @@
         # same introspection contract the virtual_scroll suite uses.)
         @test TK.wait_for(s, "totalCount mirrors the full history",
             "(() => { const c = document.querySelector('.bt-messages').__bt_chat; " *
-            "return !!c && c.totalCount >= $(2 * TURNS); })()"; timeout = 30) == true
+            "return !!c && c.block.count >= $(2 * TURNS); })()"; timeout = 30) == true
 
         # Walk the WHOLE conversation top-to-bottom, materialising each turn's
         # bubble through the virtual scroller (scroll-up → msgs.request →

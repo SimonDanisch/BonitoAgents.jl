@@ -24,7 +24,7 @@
             const ready=setInterval(()=>{
                 const t=document.querySelector($(TK.json(P * ".bt-text-input")));
                 const m=document.querySelector($(TK.json(P * ".bt-messages")));
-                if(!t?.offsetParent || !m?.__bt_chat || !m.__bt_chat.order.length)return;
+                if(!t?.offsetParent || !m?.__bt_chat || !m.__bt_chat.block.order.length)return;
                 clearInterval(ready);t.focus();
                 window.__historyObserver=new MutationObserver(es=>{
                     const n=es.reduce((sum,e)=>sum+e.addedNodes.length+e.removedNodes.length,0);

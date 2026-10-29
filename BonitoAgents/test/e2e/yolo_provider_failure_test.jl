@@ -53,7 +53,7 @@
         @test TK.wait_for(s, "Yolo remains on after reload", yolo_on_js; timeout = 30)
         TK.click(s, ".bt-header-reconnect")
         @test TK.wait_for(s, "the agent reconnected",
-            "!![...document.querySelectorAll('.bt-chatpane')].find(e => e.checkVisibility())" *
+            "!!document.querySelector('.bt-chatpane[aria-hidden=false]')" *
             "?.querySelector('.bt-header-reconnect.bt-hidden')"; timeout = 60)
         @test TK.eval_js(s, yolo_on_js)
         @test TK.eval_js(s, auto_prompts_js) == 0
