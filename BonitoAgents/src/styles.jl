@@ -3165,6 +3165,7 @@ const ChatStyles = Bonito.Styles(
     # Column flex so the thumbnail strip (.bt-attachments) sits above the
     # input row when an attachment is queued.
     CSS(".bt-input-area",
+        "container-type" => "inline-size", "container-name" => "composer",
         "flex-shrink" => "0",
         "border-top" => "1px solid var(--bw-border)",
         "padding" => "12px 14px",
@@ -3587,6 +3588,18 @@ const ChatStyles = Bonito.Styles(
             "align-items" => "center",
             "justify-content" => "flex-end",
             "gap" => "var(--bw-space-1)")),
+    # Chat panes can be narrow inside a wide desktop window (split view or
+    # an app dashboard). Adapt to the available composer width as well.
+    CSS("@container composer (max-width: 600px)",
+        CSS(".bt-input-row", "flex-wrap" => "wrap", "gap" => "var(--bw-space-1)", "row-gap" => "8px"),
+        CSS(".bt-text-input", "flex" => "1 1 100%"),
+        CSS(".bt-attach-btn", "order" => "1", "flex" => "0 0 auto"),
+        CSS(".bt-input-controls",
+            "order" => "2", "flex" => "1 1 0", "min-width" => "0",
+            "justify-content" => "flex-end", "gap" => "var(--bw-space-1)"),
+        CSS(".bt-input-btn-row", "flex" => "1", "min-width" => "0", "gap" => "var(--bw-space-1)"),
+        CSS(".bt-send-mode", "flex" => "1", "min-width" => "0"),
+        CSS(".bt-send-mode-trigger", "width" => "100%")),
     CSS("@media (max-width: 360px)",
         CSS(".bt-input-area", "padding-left" => "var(--bw-space-2)", "padding-right" => "var(--bw-space-2)"),
         CSS(".bt-input-row, .bt-input-controls, .bt-input-btn-row", "gap" => "2px"),
