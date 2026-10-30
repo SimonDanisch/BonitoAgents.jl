@@ -128,4 +128,22 @@
         push!(model.msgs_store, BT.UserMsg("hi"))
         @test !occursin("BonitoBook", BT.export_chat_markdown(model))
     end
+
+    @testset "current plans survive the taskbar-to-history transfer" begin
+        s = BT.shared(model)
+        plan = BT.TodoListMsg([ACP.PlanEntry("Export the current plan", "", "pending")])
+        s.live_todo[] = plan
+        @test occursin("- [ ] Export the current plan", BT.export_chat_markdown(model))
+        @test plan.finished_at === nothing # exporting must not finish active work
+        @test !(plan in s.msgs_store)
+
+        bar = BT.chat_taskbar(model)
+        bar.items[] = Any[plan]
+        s.live_todo[] = nothing # finalize! cleared the live pointer, before send!
+        @test occursin("- [ ] Export the current plan", BT.export_chat_markdown(model))
+        push!(s.msgs_store, plan) # history append, before removal from the bar
+        @test count("- [ ] Export the current plan", BT.export_chat_markdown(model)) == 1
+        bar.items[] = Any[]
+        @test count("- [ ] Export the current plan", BT.export_chat_markdown(model)) == 1
+    end
 end

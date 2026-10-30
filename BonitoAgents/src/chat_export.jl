@@ -285,7 +285,26 @@ its Julia evals are cells (see the notes atop `chat_export.jl`).
 function export_chat_markdown(model::ChatModel)::String
     s = shared(model)
     ex = ChatExport(s.chat_dir)
-    for m in lock(() -> copy(s.msgs_store), s.lock)
+    # A live plan belongs to the taskbar, not history. Snapshot the bar FIRST:
+    # finalize! clears live_todo before appending history, and removes the bar
+    # item only afterwards. Reading in this order covers that transfer gap.
+    bar = chat_taskbar(model)
+    plans = lock(bar.lock) do
+        [TodoListMsg(m.id, copy(m.entries), m.started_at, m.finished_at, nothing)
+         for m in bar.items[] if m isa TodoListMsg]
+    end
+    messages = lock(s.lock) do
+        current = s.live_todo[]
+        if current isa TodoListMsg && !any(m -> m.id == current.id, plans)
+            push!(plans, TodoListMsg(current.id, copy(current.entries), current.started_at, current.finished_at, nothing))
+        end
+        copy(s.msgs_store)
+    end
+    ids = Set(m.id for m in messages if m isa TodoListMsg)
+    for plan in plans
+        plan.id in ids || push!(messages, plan)
+    end
+    for m in messages
         export_md!(ex, m)
     end
     body = take!(ex.io)

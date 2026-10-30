@@ -54,6 +54,7 @@ include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
 include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)
 include("styles.jl")
+include("app_widgets.jl")     # shared server controls available to external app packages
 include("file_widgets.jl")     # shared file heading and actions on every surface
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
@@ -110,6 +111,7 @@ export MeshViewer, media_element
 # is built from, and what it can do with the server. An app package uses these
 # names and nothing else.
 public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, AppKeyedChats, in_scope,
+       AppButton, AppCard, AppModal, AppUIStyles,
        AppCall, AppError,
        app_id, app_title, app_description, app_icon, app_tools, call_tool, chat_pane, app_briefing,
        app_allowed,
