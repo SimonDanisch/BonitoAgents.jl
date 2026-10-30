@@ -1,6 +1,6 @@
 @testitem "e2e:mobile_composer" setup = [SharedServer] tags = [:e2e] begin
     TK = SharedServer.TK
-    screenshot_dir = mktempdir(; prefix="bt-composer-ui-")
+    screenshot_dir = mktempdir(; prefix="bt-composer-ui-", cleanup=false)
     s = SharedServer.server()
     s.agent_fn[] = prompt -> [TK.text("Received: " * prompt), TK.end_turn()]
     pid = TK.new_chat(s; title="Mobile composer")
@@ -51,6 +51,17 @@
         @test TK.wait_for(s, "mobile send button delivers", "$(q(".bt-user-msg"))?.textContent.includes('first line\\nsecond line')";
             timeout=60)
         @test TK.wait_for(s, "composer shrinks after send", "$ta.value==='' && $ta.getBoundingClientRect().height <= 46")
+    end
+
+    # A narrow desktop pane must wrap controls just like a phone, even when
+    # the viewport itself is wide (e.g. an app dashboard beside the chat).
+    TK.set_window_size(s, 1280, 800)
+    try
+        TK.eval_js(s, "$(q(".bt-input-area")).style.width='480px'")
+        @test TK.wait_for(s, "narrow desktop composer keeps full-width editor", "(() => {const t=$ta.getBoundingClientRect(), r=$(q(".bt-input-row")).getBoundingClientRect(), c=$(q(".bt-input-controls")).getBoundingClientRect(); return innerWidth>1000 && t.width>r.width*.9 && c.top>=t.bottom;})()")
+        TK.screenshot(s, joinpath(screenshot_dir, "narrow_desktop_composer.png"))
+    finally
+        TK.eval_js(s, "$(q(".bt-input-area")).style.removeProperty('width')")
     end
 
     # Desktop keeps Enter-to-send, but composition confirmation never sends.
