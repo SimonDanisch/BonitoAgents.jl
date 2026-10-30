@@ -1,7 +1,9 @@
 # Public composition helpers for plugin panes. They carry the same theme and
 # BonitoWidgets controls as the server, including when rendered on their own.
 const APP_CARD_STYLES = Styles(
-    CSS(".bt-app-card", "background" => "var(--bw-bg-panel)", "color" => "var(--bw-text)",
+    # Component variants (worker accents, plugin borders) must override these
+    # defaults regardless of which stylesheet was mounted first.
+    CSS(":where(.bt-app-card)", "background" => "var(--bw-bg-panel)", "color" => "var(--bw-text)",
         "border" => "1px solid var(--bw-border)", "border-radius" => "var(--bw-radius)",
         "box-shadow" => "var(--bw-shadow-sm)"),
     CSS(".bw-btn:disabled", "opacity" => "0.5", "cursor" => "not-allowed"),
@@ -32,7 +34,7 @@ function AppButton(content...; variant::Symbol = :primary, size::Symbol = :norma
     variant in (:primary, :secondary, :ghost, :danger) || throw(ArgumentError("unknown button variant: $variant"))
     size in (:normal, :small) || throw(ArgumentError("unknown button size: $size"))
     classes = join(filter(!isempty, ["bw-btn", variant == :primary ? "" : "bw-btn-$variant", size == :small ? "bw-btn-sm" : "", class]), " ")
-    return DOM.button(AppUIStyles, content...; type = "button", class = classes, attributes...)
+    return DOM.button([AppUIStyles, content]; type = "button", class = classes, attributes...)
 end
 
 """
@@ -43,7 +45,7 @@ and layout belong to the caller. `tag` may be `:div`, `:section` or `:article`.
 """
 function AppCard(content...; class::AbstractString = "", tag::Symbol = :div, attributes...)
     tag in (:div, :section, :article) || throw(ArgumentError("unsupported card tag: $tag"))
-    return getproperty(DOM, tag)(AppUIStyles, content...; class = "bt-app-card " * class, attributes...)
+    return getproperty(DOM, tag)([AppUIStyles, content]; class = "bt-app-card " * class, attributes...)
 end
 
 """
