@@ -596,6 +596,7 @@ function continue_on!(state::ServerState, p::ProjectInfo, target_worker_id::Abst
     new_p.title[] = p.title[]
     # An app's chat continues as the app's chat (`app_chat` takes the newest).
     new_p.app = p.app
+    new_p.app_key = p.app_key
     add_project!(state, new_p; new_chat = false)
     @info "chat continued on another worker" source = p.id new = new_id target = target_w.name carried
     return new_p

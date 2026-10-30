@@ -14,6 +14,10 @@
 #   server, with the calling chat known.
 # - a briefing for its chat's agent (`app_briefing`), in the system prompt.
 #
+# Besides its own chat, an app can start more chats of its own, each with a key
+# it picks (`start_chat!(...; app, key)`): one per project, say. Their pane and
+# briefing are the app's too, and tell them apart by the key (`chat_key`).
+#
 # An app is written against the public names below and nothing else, so it can
 # live in a package of its own (`apps/BonitoTodo/` is built that way).
 
@@ -64,6 +68,15 @@ app_tools(::AgentApp) = AppTool[]
 
 "Markdown appended to the system prompt of the app chat's agent."
 app_briefing(::AgentApp) = ""
+
+"""
+    app_briefing(app, key) -> String
+
+The briefing of the app's chat with `key` (see [`start_chat!`](@ref)): by
+default `app_briefing(app)` for the app's own chat (key "") and nothing for the
+chats it started.
+"""
+app_briefing(app::AgentApp, key::AbstractString) = isempty(key) ? app_briefing(app) : ""
 
 """
     app_allowed(app, user) -> Bool
@@ -157,8 +170,16 @@ struct EveryChat <: ToolScope end
 "Only the app's own chat gets the tool."
 struct AppChat <: ToolScope end
 
+"The chats the app started with a key (see [`start_chat!`](@ref)) get the tool; `in_scope` checks the key with `prefix`."
+struct AppKeyedChats <: ToolScope
+    prefix::String
+end
+AppKeyedChats() = AppKeyedChats("")
+
 in_scope(::EveryChat, ::AgentApp, ::ProjectInfo) = true
-in_scope(::AppChat, app::AgentApp, chat::ProjectInfo) = chat.app == app_id(app)
+in_scope(::AppChat, app::AgentApp, chat::ProjectInfo) = chat.app == app_id(app) && isempty(chat.app_key)
+in_scope(s::AppKeyedChats, app::AgentApp, chat::ProjectInfo) =
+    chat.app == app_id(app) && !isempty(chat.app_key) && startswith(chat.app_key, s.prefix)
 
 """
     AppTool(name, description, params = (;); scope = EveryChat())
@@ -228,10 +249,13 @@ Called once, by the `ServerState` constructor.
 """
 function start_apps!(server::ServerState, apps)
     for A in apps
-        id = app_id(A)
+        # A plugin package is loaded while `serve` is already executing. Its
+        # app-interface methods therefore live in a newer Julia world age than
+        # this precompiled function; cross that boundary here, once per app.
+        id = Base.invokelatest(app_id, A)
         haskey(server.apps, id) && error("two apps with the id '$id'")
-        app = A(AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
-        icon = app_icon(app)
+        app = Base.invokelatest(A, AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
+        icon = Base.invokelatest(app_icon, app)
         icon === nothing || isfile(icon) || error("the icon of app '$id' is not a file: $icon")
         server.apps[id] = app
     end
@@ -268,12 +292,12 @@ end
 """
     app_chat(server, app) -> ProjectInfo | nothing
 
-The app's chat: the newest one marked with its id ("Continue on" leaves the
-original behind), or `nothing` before it was first opened.
+The app's chat: the newest one marked with its id and no key ("Continue on"
+leaves the original behind), or `nothing` before it was first opened.
 """
 function app_chat(server::ServerState, app::AgentApp)
     id = app_id(app)
-    chats = lock(() -> [p for p in values(server.projects[]) if p.app == id], server.lock)
+    chats = lock(() -> [p for p in values(server.projects[]) if p.app == id && isempty(p.app_key)], server.lock)
     return isempty(chats) ? nothing : argmax(p -> p.created, chats)
 end
 
@@ -398,14 +422,23 @@ function find_worker(server::ServerState, user::User, name::AbstractString)
 end
 
 """
-    start_chat!(server, owner, worker, path; title = "", prompt = "") -> ProjectInfo
+    start_chat!(server, owner, worker, path; title = "", prompt = "", app = nothing, key = "") -> ProjectInfo
 
 A new chat in folder `path` on `worker`, belonging to `owner`, brought up and
 sent `prompt` as its first message. Throws [`AppError`](@ref) for a worker that
 isn't connected and for a path that isn't a folder there.
+
+With `app`, the chat is one of that app's, told apart from its others by `key`
+(not empty: "" is the app's own chat): its pane is the app's `chat_pane` and its
+agent gets the app's briefing for that key ([`app_briefing`](@ref)) and the
+tools in scope for it ([`AppKeyedChats`](@ref)). The pane reads the key with
+[`chat_key`](@ref).
 """
 function start_chat!(server::ServerState, owner::User, worker::WorkerInfo, path::AbstractString;
-                     title::AbstractString = "", prompt::AbstractString = "")
+                     title::AbstractString = "", prompt::AbstractString = "",
+                     app::Union{AgentApp,Nothing} = nothing, key::AbstractString = "")
+    app === nothing || !isempty(strip(key)) ||
+        throw(AppError("a chat an app starts needs a key: \"\" is the app's own chat"))
     isopen(worker) || throw(AppError("worker '$(worker.name)' is not connected"))
     st = stat_worker_path(server, worker.worker_id, path)
     st.exists || throw(AppError("there is no folder $path on $(worker.name)"))
@@ -413,12 +446,38 @@ function start_chat!(server::ServerState, owner::User, worker::WorkerInfo, path:
     p = create_project_from_worker!(server, worker.worker_id, normalize_worker_path(st.path);
                                     start_session = false)
     p.owner = owner.name
+    if app !== nothing
+        p.app = app_id(app)
+        p.app_key = String(strip(key))
+    end
     isempty(strip(title)) || (p.title[] = first(strip(title), TITLE_MAX_CHARS))
     isempty(prompt) || (p.auto_prompt = String(prompt))
     lock(server.lock) do; save_projects!(server); end
     # The bring-up sends the prompt (`fire_auto_prompt!`).
     ensure_project_session!(server, p)
     return p
+end
+
+"""
+    chat_key(view) -> String
+
+The key of the app chat `view` shows ("" for the app's own chat), for a
+`chat_pane` that lays out several chats of one app (see [`start_chat!`](@ref)).
+"""
+function chat_key(view::ChatModel)
+    p = get(view.state.projects[], view.project_id, nothing)
+    return p === nothing ? "" : p.app_key
+end
+
+"""
+    chat_file_url(view, path) -> String
+
+The URL a browser loads file `path` from, on the worker the chat `view` shows
+runs on: for a pane that shows files, e.g. as `media_element(url, mime, is_video)`.
+"""
+function chat_file_url(view::ChatModel, path::AbstractString)
+    p = view.state.projects[][view.project_id]
+    return worker_file_url(view.state, p.worker_id, String(path))
 end
 
 """
@@ -489,7 +548,7 @@ end
 "The system-prompt part an app chat's agent gets, or \"\" for an ordinary chat."
 function app_prompt_appendix(server::ServerState, p::ProjectInfo)
     app = app_of(server, p)
-    return app === nothing ? "" : app_briefing(app)
+    return app === nothing ? "" : app_briefing(app, p.app_key)
 end
 
 # ── the dashboard's Apps section ────────────────────────────────────────────

@@ -391,9 +391,9 @@ function sidebar_groups(order::AbstractVector{Pair{String,Symbol}})
     return labels
 end
 
-"Where a chat goes in the sidebar (see `sidebar_groups`)."
+"Where a chat goes in the sidebar (see `sidebar_groups`). An app's own chat is pinned under Apps; the chats it started (with a key) are working chats like any other."
 sidebar_group(p::ProjectInfo, status::Symbol) =
-    !isempty(p.app) ? :app : status === :active ? :active : :other
+    !isempty(p.app) && isempty(p.app_key) ? :app : status === :active ? :active : :other
 
 const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 

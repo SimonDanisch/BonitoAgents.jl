@@ -95,8 +95,9 @@ the server checks itself), still on localhost.
 `manage_harnesses = true` has the server declare the agent adapters, which the
 worker then installs (off by default, so a dev server's worker downloads no Node).
 
-`apps` are the apps the server runs, by type, as for `serve`: an app package in
-development runs with `dev_server(; apps = (BonitoAgents.BUILTIN_APPS..., MyApp))`.
+`apps` are the apps the server runs, by type, as for `serve`. Omit it to use
+the built-ins plus opt-in packages installed in the active environment; pass it
+explicitly for an isolated development rig.
 
 If `claude-agent-acp` isn't on PATH the dashboard still works (worker
 registration, sidebar, project import, file pickers); only opening a
@@ -129,7 +130,7 @@ function dev_server(; port::Union{Int,Nothing}             = nothing,
                       proxy::Union{DevProxy,Nothing}       = nothing,
                       network::Bool                        = false,
                       manage_harnesses::Bool               = false,
-                      apps                                 = BUILTIN_APPS)
+                      apps                                 = nothing)
     (network && proxy !== nothing) &&
         error("dev_server: `network` and `proxy` are two different setups; pick one")
     # port=0 lets the kernel pick a free ephemeral port; Bonito.Server

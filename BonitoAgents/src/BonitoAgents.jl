@@ -87,6 +87,7 @@ include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
 include("chat_messaging.jl")   # opt-in peer coordination, independent of dev tools
 include("diagnostics.jl")      # timings, browser tabs and their consoles, for the dev tools
 include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
+include("plugins.jl")          # opt-in app packages discovered from the server environment
 include("apps/BonitoTodo/BonitoTodo.jl")  # the To-do app, written like an app package: public API only
 include("remote_eval.jl")      # bt_julia_eval(worker = …): eval hosts on other workers, the per-chat switch
 include("remote_values.jl")    # remote_session(…): Julia values between a chat's session and another worker's
@@ -108,16 +109,16 @@ export MeshViewer, media_element
 # The app interface (apps.jl): what an app implements, the chat widgets its pane
 # is built from, and what it can do with the server. An app package uses these
 # names and nothing else.
-public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, in_scope,
+public AgentApp, AppContext, AppTool, Param, ToolScope, EveryChat, AppChat, AppKeyedChats, in_scope,
        AppCall, AppError,
        app_id, app_title, app_description, app_icon, app_tools, call_tool, chat_pane, app_briefing,
        app_allowed,
        ChatHeader, ChatNotice, ChatTranscript, ChatComposer, ChatToolbar,
        ServerState, ProjectInfo, WorkerInfo, User, ChatFolder,
        caller_user, app_chat, chat_title, chat_folders, find_worker, start_chat!,
-       show_chat!, send_message!,
+       chat_key, chat_file_url, show_chat!, send_message!,
        atomic_write_json, load_json_tolerant, relative_time_label,
-       BUILTIN_APPS
+       BUILTIN_APPS, register_app!, registered_apps
 
 # Bake the real browser-driven paths captured from the e2e suite: literal
 # `precompile(...)` calls (see BonitoAgentsApp/precompile/) that run during
