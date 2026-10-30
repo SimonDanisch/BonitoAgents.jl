@@ -64,7 +64,7 @@
 
         # A click asks first where its chat runs.
         TK.click(s, ".bt-app-tile[data-app=\"todo\"] .bt-app-launch")
-        SETUP = "document.querySelector('.bt-modal-overlay .bt-app-setup')"
+        SETUP = "document.querySelector('.bw-modal-overlay .bt-app-setup')"
         @test TK.wait_for(s, "the setup dialog with this worker",
             "!!$SETUP?.querySelector('.bt-app-choice.bt-on .bt-app-choice-name')"; timeout = 15) == true
         worker[] = TK.eval_js(s, "$SETUP.querySelector('.bt-app-choice.bt-on .bt-app-choice-name').textContent")
@@ -75,7 +75,7 @@
         @test TK.wait_for(s, "the app chat with its list",
             "!!$VP?.querySelector('.bt-todo') && !!$VP?.querySelector('.bt-text-input')";
             timeout = 60) == true
-        @test TK.eval_js(s, "!document.querySelector('.bt-modal-overlay')") == true
+        @test TK.eval_js(s, "!document.querySelector('.bw-modal-overlay.bw-modal-open')") == true
         # The ordinary chat widgets are all there, the list above the messages.
         @test TK.eval_js(s, """(() => { const p = $VP, t = p.querySelector('.bt-todo'),
             m = p.querySelector('.bt-messages');
@@ -96,7 +96,7 @@
             "$TILE?.querySelector('.bt-app-status')?.textContent === $(TK.json("on " * worker[]))"; timeout = 20) == true
         TK.click(s, ".bt-app-tile[data-app=\"todo\"] .bt-app-launch")
         @test TK.wait_for(s, "the app chat again", "$VP?.dataset.panePid === $(TK.json(app_pid))"; timeout = 30) == true
-        @test TK.eval_js(s, "!document.querySelector('.bt-modal-overlay')") == true
+        @test TK.eval_js(s, "!document.querySelector('.bw-modal-overlay.bw-modal-open')") == true
 
         # ── the user adds items in the pane ─────────────────────────────────
         function add!(text)

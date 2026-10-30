@@ -249,31 +249,31 @@ file_viewer(::MeshFile, url, path::AbstractString, mode::ViewMode = InlineView()
 # A picture in a bubble at its own size; `worker_path` lets it become the chat's
 # icon (chat_icons.jl).
 file_viewer(::ImageFile, url, path::AbstractString, ::InlineView = InlineView();
-            worker_path = "", size = nothing) =
-    media_element(url, "", false; filename = basename(path), worker_path, size)
+            worker_path = "", size = nothing, controls=()) =
+    media_element(url, "", false; filename = basename(path), worker_path, size, controls)
 
 # Filling a box, it gets a stage: a checkerboard so transparency reads as
 # transparency, and the picture shrunk to fit. The driver reports its pixel size
 # into a file tab's header.
 file_viewer(::ImageFile, url, path::AbstractString, ::PanelView) =
-    DOM.div(FileViewStyles, FileViewDriver(), media_element(url, "", false; filename = basename(path));
+    DOM.div(FileViewStyles, FileViewDriver(), media_element(url, "", false; filename = basename(path),toolbar=false);
             class = "bt-fv-image-stage")
 
-video_viewer(url, path::AbstractString; worker_path = "", size = nothing) =
+video_viewer(url, path::AbstractString; worker_path = "", size = nothing,controls=(),toolbar=true) =
     media_element(url, get(SHOW_VIDEO_MIME, lowercase(splitext(path)[2]), "video/mp4"), true;
-                  filename = basename(path), worker_path, size)
+                  filename = basename(path), worker_path, size,controls,toolbar)
 
 # In a chat bubble the video belongs in the message flow, at its own size.
 file_viewer(::VideoFile, url, path::AbstractString, ::InlineView = InlineView();
-            worker_path = "", size = nothing) =
-    video_viewer(url, path; worker_path, size)
+            worker_path = "", size = nothing,controls=()) =
+    video_viewer(url, path; worker_path, size,controls)
 
 # Filling a box it needs a stage, like a picture does. Without one the element
 # sits at its intrinsic size in the top-left corner of an otherwise empty tab, and
 # a video TALLER than the box runs off the bottom, taking its controls with it,
 # because `media_element` only constrains width.
 file_viewer(::VideoFile, url, path::AbstractString, ::PanelView) =
-    DOM.div(FileViewStyles, video_viewer(url, path); class = "bt-fv-video-stage")
+    DOM.div(FileViewStyles, video_viewer(url, path;toolbar=false); class = "bt-fv-video-stage")
 
 file_viewer(::AudioFile, url, path::AbstractString, ::ViewMode = InlineView()) =
     DOM.div(FileViewStyles,
@@ -292,9 +292,9 @@ view_input(::ParsedKind, fv::FileView, session) = FileContent(last(view_bytes(fv
 
 # In a bubble a picture or a clip knows its worker file: the picture can become
 # the chat's icon, and both take the size the browser measured for that file.
-render_file(kind::Union{ImageFile,VideoFile}, ::InlineView, fv::FileView, session) =
+render_file(kind::Union{ImageFile,VideoFile}, ::InlineView, fv::FileView, session;controls=()) =
     file_viewer(kind, view_input(kind, fv, session), view_path(fv), InlineView();
-                worker_path = show_worker_path(fv.file), size = media_size(fv.file))
+                worker_path = show_worker_path(fv.file), size = media_size(fv.file), controls)
 
 # ── markdown ────────────────────────────────────────────────────────────────
 # The SAME renderer the chat uses for agent messages (`markdown_html`), so a
@@ -425,14 +425,9 @@ function file_viewer(::TableFile, c::FileContent, path::AbstractString, mode::Vi
 end
 
 # ── Jupyter notebook ────────────────────────────────────────────────────────
-# Cells in order: markdown rendered, code in a read-only Monaco with the
+# Cells in order: markdown rendered, code in a read-only CodeView with the
 # notebook's own language, and outputs (stream text, results, images, errors)
 # under each code cell — which is the bit a plain editor can't do at all.
-notebook_source(cell) = begin
-    src = get(cell, "source", "")
-    src isa AbstractString ? String(src) : join(String.(src))
-end
-
 function notebook_output_node(out::AbstractDict)
     otype = String(get(out, "output_type", ""))
     data  = get(out, "data", Dict{String,Any}())
@@ -464,21 +459,20 @@ function notebook_output_node(out::AbstractDict)
 end
 
 function file_viewer(::NotebookFile, c::FileContent, path::AbstractString, mode::ViewMode = InlineView())
-    nb = JSON.parse(content_text(c))
-    lang = get(get(get(nb, "metadata", Dict()), "kernelspec", Dict()), "language", "python")
-    cells = get(nb, "cells", [])
+    nb = BonitoBook.read_ipynb(IOBuffer(content_text(c)); default_language = "python")
+    cells = nb.cells
     isempty(cells) && return DOM.div("(notebook has no cells)"; class = "bt-tool-empty")
     limit = mode isa InlineView ? 12 : length(cells)
     nodes = Any[]
     for cell in Iterators.take(cells, limit)
-        ctype = String(get(cell, "cell_type", "code"))
-        src = notebook_source(cell)
+        ctype = cell.cell_type
+        src = cell.source
         if ctype == "markdown"
             push!(nodes, DOM.div(markdown_preview_node(src, c.link; c.raw_html); class = "bt-fv-nb-cell bt-fv-nb-md"))
         else
-            outs = get(cell, "outputs", [])
+            outs = cell.outputs
             push!(nodes, DOM.div(
-                DOM.div(CodeView(src; language = String(lang)); class = "bt-fv-nb-source"),
+                DOM.div(CodeView(src; language = nb.language); class = "bt-fv-nb-source"),
                 (isempty(outs) ? () :
                     (DOM.div((notebook_output_node(o) for o in outs if o isa AbstractDict);
                              class = "bt-fv-nb-outputs"),));
@@ -758,10 +752,9 @@ has_rendered_view(p::FilePanel) = !(p.kind isa TextFile)
 # value of the root's `data-view`, which the CSS keys on.
 initial_view(p::FilePanel) = has_rendered_view(p) ? "preview" : "source"
 
-# Header action buttons. Kept as plain glyph buttons with real `title`s rather
-# than a menu: there are four of them and they're all one click.
-fv_action_btn(action, glyph, title) =
-    DOM.button(glyph; class = "bt-fv-act", type = "button", title = title, dataFvAction = action)
+# The panel's click handler runs it (`data-fv-action`); the Menu closes on the pick.
+fv_action_btn(action, label, title) =
+    DOM.button(label; class="bw-menu-item bt-fv-act",type="button",title,dataFvAction=action)
 
 """
     disambiguate_labels(paths) -> Vector{String}
@@ -819,12 +812,6 @@ path_span(path::AbstractString; class::AbstractString, title = path) =
 path_span(path::Observable; class::AbstractString) =
     DOM.span(DOM.span(path; class = "bt-path-ltr"); class = class)
 
-# A file of a chat's project can be shared as a link (shares.jl).
-share_btn(p::FilePanel) =
-    isempty(p.view.file.project_id) ? () :
-        (fv_action_btn("share", "↗", "Share a link: anyone with it can open this " *
-                       "while the worker is online (Settings lists and ends links)"),)
-
 function file_panel_header(session::Session, p::FilePanel)
     size_txt = p.size_bytes < 0 ? "" : format_bytes(p.size_bytes)
     toggle = has_rendered_view(p) && p.editor !== nothing ?
@@ -837,27 +824,24 @@ function file_panel_header(session::Session, p::FilePanel)
     # who never hovers a button they already know how to click.
     save_btn = p.editor === nothing ? () :
         (DOM.button("Save", DOM.span("Ctrl+S"; class = "bt-btn-kbd");
-                    class = "bt-btn bt-btn-sm bt-file-editor-save", type = "button",
+                    class = "bw-btn bw-btn-sm bt-file-editor-save", type = "button",
                     title = "Write this file on the worker"),)
     status = p.editor === nothing ? Observable("") : p.editor.status
-    return DOM.div(
-        DOM.span(kind_icon(p.kind); class = "bt-fv-icon"),
-        # The full worker path, ellipsised from the LEFT so the filename — the
-        # part you're looking for — is always visible.
-        path_span(p.worker_path; class = "bt-file-editor-path bt-fv-path"),
-        DOM.span(kind_label(p.kind); class = "bt-fv-badge"),
-        DOM.span(size_txt; class = "bt-fv-size"),
-        DOM.span(""; class = "bt-fv-dims"),
-        DOM.span(status; class = "bt-file-editor-status bt-fv-status"),
-        DOM.div(
-            toggle,
-            fv_action_btn("copy", "⧉", "Copy the worker path"),
-            fv_action_btn("download", "⤓", "Download to this computer"),
-            fv_action_btn("reload", "⟳", "Reload from the worker"),
-            share_btn(p),
-            save_btn;
-            class = "bt-fv-actions");
-        class = "bt-file-editor-header bt-fv-header")
+    share = isempty(p.view.file.project_id) ? () : ShareControl(;hint="Share a link to this file.",
+        progress=ChatProgress(p.view.file.state, p.view.file.project_id)) do
+        share_project_file!(p.view.file.state,p.view.file.project_id,p.worker_path)
+    end
+    items=Any[fv_action_btn("copy","Copy path","Copy the worker path"),
+        fv_action_btn("download","Download","Download to this computer"),
+        fv_action_btn("reload","Reload","Reload from the worker")]
+    p.kind isa Union{ImageFile,VideoFile} && append!(items,media_menu_items(p.kind isa VideoFile;download=false))
+    return FileToolbar(
+        path_span(p.worker_path;class="bt-file-editor-path bt-fv-path");
+        metadata=(DOM.span(kind_label(p.kind);class="bt-fv-badge"),
+            DOM.span(size_txt;class="bt-fv-size"),DOM.span("";class="bt-fv-dims")),
+        actions=(DOM.span(status;class="bt-file-editor-status bt-fv-status"),toggle,share,
+            Menu(items;title="File actions"),save_btn),
+        class="bt-file-editor-header bt-fv-header")
 end
 
 function Bonito.jsrender(session::Session, p::FilePanel)
@@ -919,28 +903,9 @@ function Bonito.jsrender(session::Session, p::FilePanel)
         "?path=" * HTTP.URIs.escapeuri(p.worker_path)
     save_obs = p.editor === nothing ? Observable{Union{Nothing,String}}(nothing) : p.editor.save_content
 
-    # ↗: the link, or why there is none ("link:…" / "error:…"). Made off the
-    # session task: an app is evaluated once first, which can take a minute.
-    share_request = Observable(0)
-    share_answer = Observable("")
-    on(session, share_request) do _
-        Base.errormonitor(@async begin
-            answer = try
-                "link:" * share_project_file!(p.view.file.state, p.view.file.project_id, p.worker_path)
-            catch e
-                (e isa ErrorException || e isa WorkerUnreachableError) || rethrow()
-                @warn "sharing a file failed" path = p.worker_path exception = (e, catch_backtrace())
-                "error:" * first(split(sprint(showerror, e), '\n'))
-            end
-            safe_set!(share_answer, answer)
-        end)
-    end
-
     Bonito.onload(session, node, js"""(root) => {
         const reload = $(p.reload);
         const save   = $(save_obs);
-        const shareRequest = $(share_request);
-        const shareAnswer  = $(share_answer);
         const wpath  = $(p.worker_path);
         const dlurl  = $(download_url);
 
@@ -953,21 +918,6 @@ function Bonito.jsrender(session::Session, p::FilePanel)
             root.__btFlash = setTimeout(() => { if (s.textContent === msg) s.textContent = ''; }, 2500);
         };
         const doSave = () => { const ed = editorOf(); if (ed) save.notify(ed.getValue()); };
-        // The link stays in the status line (selectable) until the next action.
-        shareAnswer.on(m => {
-            const s = root.querySelector('.bt-fv-status');
-            if (!s || !m) return;
-            clearTimeout(root.__btFlash);
-            if (m.startsWith('link:')) {
-                const url = m.slice(5);
-                s.textContent = 'shared: ' + url;
-                ($(COPY_TEXT_JS))(url).then(() => { s.textContent = 'link copied: ' + url; },
-                                            () => { s.textContent = 'shared (copy it from here): ' + url; });
-            } else {
-                s.textContent = 'not shared: ' + m.slice(6);
-            }
-        });
-
         const setView = (v) => {
             root.dataset.view = v;
             root.querySelectorAll('.bt-fv-seg').forEach(
@@ -994,10 +944,6 @@ function Bonito.jsrender(session::Session, p::FilePanel)
                       'reloaded preview — editor keeps your unsaved edits' : 'reloaded');
             } else if (act.dataset.fvAction === 'copy') {
                 ($(COPY_TEXT_JS))(wpath).then(() => flash('path copied'), () => flash('could not copy'));
-            } else if (act.dataset.fvAction === 'share') {
-                const s = root.querySelector('.bt-fv-status');
-                if (s) { clearTimeout(root.__btFlash); s.textContent = 'sharing…'; }
-                shareRequest.notify(Date.now());
             } else if (act.dataset.fvAction === 'download') {
                 if (!dlurl) { flash('no project to download from'); return; }
                 const a = document.createElement('a');

@@ -30,6 +30,14 @@ go. Home and End jump to the first and the last message.
   its call returned, gets a task-bar row until it ends, and shows ✓ or ✗ when
   it does.
 - **Questions** (ACP elicitations) render as forms you answer inline.
+- **Job progress** shows measured work in the chat and in its sidebar icon,
+  including jobs that keep running between agent turns. Unknown totals show
+  indeterminate progress. Agents use `bt_progress` or the Julia
+  `BonitoProgress` API; see [Julia Tools & Live Apps](@ref).
+- **Managed commands** (`bt_process`) stay in the taskbar while their process
+  group runs, even between agent turns. Expand a row for worker, PID, command
+  and output. Stop requests interruption; its menu offers Terminate and Force
+  kill. The row remains until the worker confirms exit.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
 - **Subagents** (for example Claude Code's Task tool) get their own activity
@@ -41,7 +49,18 @@ stops following, with a "move to bottom" control and an unread indicator until
 you return. Sending is never blocked: messages typed during an agent restart
 or reconnect are queued rather than dropped.
 
+**Queue after message** sends input into a running agent when it supports
+steering or acknowledged prompt queueing. With receipts, the message stays in
+the outbox until the agent confirms it was consumed. Stop can discard input
+still waiting inside an adapter: an unconfirmed message stays paused in the
+queue, including after reload, with **Queue again** and **Remove** actions.
+Agents without either capability wait until the current turn finishes.
+
 ## Files and the editor
+
+Agent Markdown links such as `[source](./src/app.jl)` open files on the chat's
+worker, relative to that chat's working directory. Absolute worker paths also
+work. These are workspace links; use Share for a link other people can open.
 
 Every file path in the transcript is a link, and the sidebar has a lazy,
 searchable project file tree (hover a chat, then "▾ files"). Clicking **any**

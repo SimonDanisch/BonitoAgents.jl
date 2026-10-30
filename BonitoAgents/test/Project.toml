@@ -43,3 +43,6 @@ BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 
 WorkerLink = {path = "../../WorkerLink"}
+
+[compat]
+BonitoWidgets = "0.1.3"

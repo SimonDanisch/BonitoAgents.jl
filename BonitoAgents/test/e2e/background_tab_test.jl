@@ -5,7 +5,7 @@
 # queued rAF callbacks simply never fire until the tab refocuses. The chat's
 # auto-scroll used to route a new agent message's scroll-to-bottom through
 # `queueScrollToBottom` (rAF-batched). While the tab was backgrounded the new
-# bubble went into `__bt_chat.cache` but NEVER into the DOM, because the rAF that
+# bubble went into `__bt_chat.block.cache` but NEVER into the DOM, because the rAF that
 # was supposed to scroll to bottom + re-`updateDOM` with the post-scroll visible
 # range never fired. When the user finally re-focused, the queued rAF fired and
 # all the cached-but-invisible bubbles appeared at once — in the wild: "I sent a
@@ -61,7 +61,7 @@
     # followMode path in appendNewMessage that used to defer to rAF).
     @test TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.followMode") == true
 
-    before_total   = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount")
+    before_total   = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.block.count")
     before_bubbles = TK.eval_js(s, "document.querySelectorAll('.bt-agent-msg, .bt-user-msg').length")
 
     # ── Background the tab: pause rAF + flip document.hidden ──────────────────
@@ -111,7 +111,7 @@
         "[...document.querySelectorAll('.bt-agent-msg')].some(b => (b.innerText||'').includes('background-tab message 3'))";
         timeout = 30) == true
 
-    after_total   = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount")
+    after_total   = TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.block.count")
     after_bubbles = TK.eval_js(s, "document.querySelectorAll('.bt-agent-msg, .bt-user-msg').length")
 
     # totalCount went up by 2: the user "background 3" message + ONE agent
@@ -149,7 +149,7 @@
     # flood). totalCount is unchanged by the flush.
     @test TK.eval_js(s,
         "[...document.querySelectorAll('.bt-agent-msg')].filter(b => (b.innerText||'').includes('background-tab message 3')).length") == 1
-    @test TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.totalCount") == after_total
+    @test TK.eval_js(s, "document.querySelector('.bt-messages').__bt_chat.block.count") == after_total
 
     @test isempty(TK.js_errors(s))
 end

@@ -49,7 +49,9 @@ end
 "The tools this process currently offers — the registry minus every gated-off one."
 available_tools() = [t for t in TOOLS if t.available()]
 
+include("workflow.jl")         # agent-independent briefing, MCP instructions + bt_help
 include("server.jl")
+include("BonitoProgress.jl")   # stdlib-only API, also bootstrapped into eval workers
 include("session.jl")          # JuliaSession + SessionManager (subprocess-per-env)
 include("eval_image.jl")       # colour-matrix results → PNG files (PNGFiles, in OUR env)
 include("runs.jl")             # evals as runs (`r4`): background evals, bt_julia_wait
@@ -60,7 +62,10 @@ include("eval_host.jl")        # run_eval_host — serve another worker's chat t
 include("tools/eval.jl")
 include("tools/show.jl")       # bt_show — rich MIME render, audience-tagged
 include("tools/dev.jl")        # bt_dev_* — server introspection; only in a debug chat
+include("tools/chat.jl")       # explicitly opted-in coordination, without dev tools
+include("tools/progress.jl")   # job progress from any agent/language
 include("tools/wait.jl")       # bt_wait  — the one way to actually pause a turn
+include("tools/process.jl")    # worker-owned supervised background commands
 include("tools/share.jl")      # bt_share — a link to a markdown page or an app, for anyone
 include("tools/app_tools.jl")  # the tools the server's apps add, listed + forwarded over the control channel
 include("apps.jl")             # Apps — the App/Context interface apps implement

@@ -46,46 +46,22 @@ own Julia.
 
 ## A day with BonitoAgents
 
-**8:40, laptop, coffee.** The dashboard shows every chat on every machine as a
-live card. Claude Code is refactoring a parser on the laptop, Codex is training
-a model on the desktop with the GPU, Kimi Code is tidying the docs on the home
-server. Each card carries a picture from its chat's latest work, so you can see
-at a glance which one needs you.
+You're fixing a renderer on your GPU desktop from a laptop. Ask an agent to
+reproduce the bug, then inspect its renders, videos, 3D models and benchmark
+tables inside the chat. Open the git diff beside the results and send review
+comments back with their code context.
 
-**9:15.** You ask the desktop's agent how the training run went. It plots the
-loss curves, renders a short video of the predictions and writes a notebook.
-All three open right in the conversation: the PNG and the MP4 inline, the
-notebook with its outputs. A mesh it exported spins in a 3D viewer, a CSV opens
-as a sortable table, the PDF report as a PDF.
+Have the agent build a Bonito app with a slider to explore a parameter.
+Use it in the chat, then share a link so another maintainer can try it in their
+browser, with the computation running on your worker. Videos and reports are
+shareable too; the default tunnel setup lets recipients open links without an
+account.
 
-**11:30.** Codex hits its usage limit in the middle of the task. The chat says
-so in plain words and stops, instead of retrying all morning. You pick Claude
-Code in the chat's header and type "carry on": the new agent gets the
-conversation so far and continues on the same files, on the same machine. Your
-work never belonged to a vendor in the first place.
+If one agent runs out of credits, switch providers in the same chat and keep
+going. Leave the final tests running and check progress from your phone.
 
-**13:00, phone, queue at lunch.** The agent wants to run a database migration
-and asks first. You approve it from your phone, glance at the newest render,
-and photograph the whiteboard sketch for the afternoon's task straight into the
-chat.
-
-**15:00.** You need a quick GUI to explore one parameter. The agent writes it
-and returns it into the conversation as a live app: drag the slider and the
-computation reruns on the desktop. You detach it into its own panel next to the
-source file and keep iterating together.
-
-**17:00.** You read the agent's git diff line by line, ask about one change on
-the spot, and bundle three review notes into one instruction. Then you send a
-colleague a link to the app. They open it on their phone without an account,
-move the slider, and your desktop does the computing.
-
-**18:30.** On the way out you switch on Yolo mode with a reminder: "render the
-HD version, credits at the end". The agent keeps working through the evening on
-its own and stops when it confirms it is done, when it goes in circles, or when
-its provider fails.
-
-The [long version of this story](https://agents.bonito.sh/story.html) links
-every step to the guide behind it.
+[Follow the workflow](https://agents.bonito.sh/story.html), from reproducing the
+bug to sharing a working demo.
 
 ## Bring any agent, keep your work
 
@@ -99,6 +75,14 @@ every step to the guide behind it.
   files, share links and the to-do list are MCP tools, and they render as the
   same cards whichever agent calls them, even though every agent reports tool
   calls differently on the wire.
+- **A shared agent workflow.** MCP instructions and `bt_help` explain progress
+  reporting, worker file links, previews, sharing and background work. Add your
+  own rules in Settings → Agent instructions. See the
+  [workflow and progress guide](docs/src/mcp-tools.md).
+- **Supervised background commands.** `bt_process` launches jobs owned by the
+  worker, with bounded logs and taskbar controls for interruption, termination
+  and forced killing. Jobs survive agent turns and MCP reconnects; chat restart
+  and close request cleanup.
 - **Your files, your history.** Projects are ordinary folders and git checkouts
   on your machines. Transcripts are markdown files in the server's state
   directory. **Discover** imports the Claude Code and Codex sessions you already

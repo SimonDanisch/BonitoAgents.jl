@@ -685,52 +685,57 @@ end
 
 const AdminStyles = Bonito.Styles(
     CSS(".bt-admin-table",
-        "width" => "100%", "border-collapse" => "collapse", "font-size" => "13px"),
+        "width" => "100%", "border-collapse" => "collapse", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-admin-table th, .bt-admin-table td",
         "text-align" => "left", "padding" => "6px 8px",
-        "border-bottom" => "1px solid var(--bt-border)"),
+        "border-bottom" => "1px solid var(--bw-border)"),
     CSS(".bt-admin-table th",
-        "color" => "var(--bt-text-faint)", "font-weight" => "600", "font-size" => "11px",
+        "color" => "var(--bw-text-faint)", "font-weight" => "600", "font-size" => "var(--bw-font-size-xs)",
         "text-transform" => "uppercase", "letter-spacing" => "0.04em"),
     CSS(".bt-admin-form",
         "display" => "flex", "gap" => "8px", "flex-wrap" => "wrap", "align-items" => "center",
         "margin-top" => "10px"),
     CSS(".bt-admin-form input[type=text], .bt-admin-table input[type=text]",
-        "padding" => "5px 8px", "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)", "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text)", "font-size" => "13px"),
+        "padding" => "5px 8px", "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius-sm)", "background" => "var(--bw-bg-panel)",
+        "color" => "var(--bw-text)", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-admin-status",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)", "margin-top" => "8px"),
+        "font-size" => "var(--bw-font-size-sm)", "color" => "var(--bw-text-muted)", "margin-top" => "8px"),
     CSS(".bt-admin-secret",
         "margin-top" => "10px", "user-select" => "all"),
     # Commands with their own Copy buttons: a click must not select the block.
     CSS(".bt-install-issued", "margin-top" => "10px"),
     CSS(".bt-install-again", "margin-top" => "14px"),
     CSS(".bt-admin-muted",
-        "color" => "var(--bt-text-muted)"),
+        "color" => "var(--bw-text-muted)"),
     CSS(".bt-admin-qr",
         "width" => "180px", "image-rendering" => "pixelated", "display" => "block", "margin" => "6px 0"),
     CSS(".bt-admin-uri",
-        "font-size" => "11px", "word-break" => "break-all", "user-select" => "all"),
+        "font-size" => "var(--bw-font-size-xs)", "word-break" => "break-all", "user-select" => "all"),
     CSS(".bt-accounts-table td", "vertical-align" => "middle"),
     # The group picker: a list that opens below its button, left-aligned (it
     # sits at the start of its cell), checkboxes in front of the names.
-    CSS(".bt-group-pick .bt-menu-list",
+    CSS(".bt-group-pick .bw-menu-list",
         "left" => "0", "right" => "auto", "max-height" => "300px", "overflow-y" => "auto"),
-    CSS(".bt-menu-item.bt-group-item",
+    CSS(".bw-menu-item.bt-group-item",
         "display" => "flex", "align-items" => "center", "gap" => "8px"),
     CSS(".bt-group-item input", "margin" => "0"),
     CSS(".bt-group-trigger",
         "display" => "inline-flex", "align-items" => "center", "gap" => "6px", "max-width" => "260px"),
+    # A picker that names its choice, not a ⋯: it keeps the small button's
+    # weight and padding, which the chat's bold ⋯ rule (`.bw-menu-trigger`)
+    # would otherwise take over.
+    CSS(".bw-menu-trigger.bt-group-trigger",
+        "font-weight" => "500", "padding-left" => "9px", "padding-right" => "9px"),
     CSS(".bt-group-label",
         "overflow" => "hidden", "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     CSS(".bt-group-new",
         "display" => "flex", "gap" => "6px", "padding" => "6px 6px 2px",
-        "border-top" => "1px solid var(--bt-border)", "margin-top" => "4px"),
+        "border-top" => "1px solid var(--bw-border)", "margin-top" => "4px"),
     CSS(".bt-group-new input",
         "flex" => "1 1 auto", "min-width" => "0", "padding" => "4px 8px",
-        "border" => "1px solid var(--bt-border)", "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface)", "color" => "var(--bt-text)", "font-size" => "13px"),
+        "border" => "1px solid var(--bw-border)", "border-radius" => "var(--bw-radius-sm)",
+        "background" => "var(--bw-bg-panel)", "color" => "var(--bw-text)", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-worker-sharing", "margin-top" => "0"),
     # A status inside a row of controls sits on the row's line, not below it.
     CSS(".bt-admin-form .bt-admin-status", "margin-top" => "0"),
@@ -741,23 +746,23 @@ const AdminStyles = Bonito.Styles(
     # A checkbox in a `.bt-form`'s value column: box and text on one line.
     CSS(".bt-form .bt-form-check",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "color" => "var(--bt-text)"),
+        "color" => "var(--bw-text)"),
     CSS(".bt-form .bt-form-check input", "width" => "auto", "margin" => "0"),
     CSS(".bt-form .bt-admin-status", "grid-column" => "1 / -1", "margin-top" => "0"),
     # The group picker inside a form: its button keeps its own size, and the
     # form's input styling stays off its checkboxes.
     CSS(".bt-form .bt-group-pick", "justify-self" => "start"),
     CSS(".bt-form .bt-group-item input", "width" => "auto", "padding" => "0"),
-    CSS(".bt-form .bt-group-new input", "padding" => "4px 8px", "font-size" => "13px"),
+    CSS(".bt-form .bt-group-new input", "padding" => "4px 8px", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-account-name", "font-weight" => "600"),
-    CSS(".bt-account-detail", "font-size" => "12px", "overflow-wrap" => "anywhere"),
+    CSS(".bt-account-detail", "font-size" => "var(--bw-font-size-sm)", "overflow-wrap" => "anywhere"),
     CSS("@media (max-width: 560px)",
         CSS(".bt-admin-table th, .bt-admin-table td", "padding" => "6px 4px")),
     CSS(".bt-account-off td:not(.bt-admin-menu-cell)", "opacity" => "0.55"),
     CSS(".bt-account-disabled", "margin-left" => "6px"),
     CSS(".bt-admin-menu-cell", "width" => "1%", "text-align" => "right"),
     CSS(".bt-admin-pre",
-        "white-space" => "pre-wrap", "font-size" => "12px", "max-height" => "240px",
+        "white-space" => "pre-wrap", "font-size" => "var(--bw-font-size-sm)", "max-height" => "240px",
         "overflow" => "auto", "margin-top" => "8px"),
 )
 
@@ -796,33 +801,8 @@ function pickable_groups(state::ServerState)
     return sort!(filter!(!=("admins"), gs))
 end
 
-# The picker's popover. Opening remembers the ticked set; closing (a click
-# outside, or the button again) hands the new set to the caller's `commit`, once
-# and only if it changed: saving on every tick re-rendered the accounts table
-# and closed the list under the pointer.
-const GROUP_PICK_JS = """
-    event.stopPropagation();
-    const m = event.currentTarget.closest('.bt-group-pick');
-    if (m.__close) { m.__close(); return; }
-    const picked = () => [...m.querySelectorAll('.bt-group-item input:checked')].map(i => i.value);
-    const before = JSON.stringify(picked());
-    m.__show = () => {
-        const p = picked();
-        m.querySelector('.bt-group-label').textContent = p.length ? p.join(', ') : m.dataset.empty;
-    };
-    m.classList.add('bt-menu-open');
-    const outside = ev => { if (!m.contains(ev.target)) m.__close(); };
-    m.__close = () => {
-        m.classList.remove('bt-menu-open');
-        document.removeEventListener('click', outside, true);
-        m.__close = null;
-        const now = picked();
-        if (JSON.stringify(now) !== before) commit(now);
-    };
-    document.addEventListener('click', outside, true);"""
-
 """
-    group_picker(groups, current, commit; empty = "none", allow_new = false) -> Node
+    group_picker(groups, current, commit; empty = "none", allow_new = false) -> Menu
 
 Groups are picked, never typed: a button naming the chosen ones, and a list of
 checkboxes over `groups`. `commit` is a JS function called with the chosen names
@@ -832,49 +812,69 @@ function group_picker(groups::Vector{String}, current::Vector{String}, commit::B
                       empty::AbstractString = "none", allow_new::Bool = false)
     item(g) = DOM.label(g in current ? DOM.input(type = "checkbox", value = g, checked = true) :
                                        DOM.input(type = "checkbox", value = g),
-                        g; class = "bt-menu-item bt-group-item")
-    add = js"""event => {
-        const m = event.currentTarget.closest('.bt-group-pick');
-        const field = m.querySelector('.bt-group-new-name');
-        const name = field.value.trim();
-        if (!name) return;
-        let box = [...m.querySelectorAll('.bt-group-item input')].find(i => i.value === name);
-        if (!box) {
-            const row = document.createElement('label');
-            row.className = 'bt-menu-item bt-group-item';
-            box = document.createElement('input');
-            box.type = 'checkbox'; box.value = name;
-            row.append(box, name);
-            m.querySelector('.bt-group-items').append(row);
-        }
-        box.checked = true;
-        field.value = '';
-        m.__show && m.__show();
-    }"""
-    new_row = !allow_new ? nothing : DOM.div(
-        DOM.input(type = "text", placeholder = "new group", class = "bt-group-new-name",
-                  onkeydown = js"""event => { if (event.key === 'Enter') {
-                      event.preventDefault(); event.target.nextElementSibling.click(); } }"""),
-        DOM.button("Add"; class = "bt-btn bt-btn-secondary bt-btn-sm bt-group-add", onclick = add);
-        class = "bt-group-new")
+                        g; class = "bw-menu-item bt-group-item")
     all = sort!(union(groups, current))
-    return DOM.div(
-        DOM.button(DOM.span(isempty(current) ? empty : join(current, ", "); class = "bt-group-label"),
-                   DOM.span("▾"; class = "bt-msearch-caret");
-                   class = "bt-btn bt-btn-secondary bt-btn-sm bt-group-trigger",
-                   onclick = js"""event => {
-                       const commit = $(commit);
-                       $(Bonito.JSString(GROUP_PICK_JS))
-                   }"""),
-        DOM.div(
-            DOM.div((item(g) for g in all); class = "bt-group-items"),
-            isempty(all) && !allow_new ? DOM.div("No groups yet: an admin puts accounts in groups.";
-                                                  class = "bt-menu-title") : nothing,
-            new_row;
-            class = "bt-menu-list",
-            # `__show` keeps the button's label with the ticks.
-            onchange = js"event => { const m = event.currentTarget.closest('.bt-group-pick'); m.__show && m.__show(); }");
-        class = "bt-menu bt-group-pick", dataEmpty = empty)
+    items = DOM.div((item(g) for g in all); class = "bt-group-items")
+    label = DOM.span(isempty(current) ? empty : join(current, ", "); class = "bt-group-label")
+    open = Observable(false)
+    # Opening remembers the ticked set; closing (a click outside, Escape, or the
+    # button again) hands the new set to `commit`, once and only if it changed:
+    # saving on every tick re-rendered the accounts table and closed the list
+    # under the pointer. The button's label follows the ticks.
+    wire = js"""(() => {
+        const open = $(open), items = $(items), label = $(label), commit = $(commit);
+        const picked = () => [...items.querySelectorAll('input:checked')].map(i => i.value);
+        const show = () => {
+            const p = picked();
+            label.textContent = p.length ? p.join(', ') : $(empty);
+        };
+        let before = null;
+        open.on(isopen => {
+            if (isopen) { before = JSON.stringify(picked()); return; }
+            if (before === null) return;
+            const now = picked();
+            if (JSON.stringify(now) !== before) commit(now);
+            before = null;
+        });
+        items.addEventListener('change', show);
+    })()"""
+    hint = isempty(all) && !allow_new ?
+        DOM.div("No groups yet: an admin puts accounts in groups."; class = "bw-menu-title") : nothing
+    return Menu([items, hint, allow_new ? new_group_row(items) : nothing, wire];
+                label = (label, DOM.span("▾"; class = "bt-msearch-caret")), title = "Groups",
+                class = "bt-group-pick", trigger_class = "bw-btn-secondary bw-btn-sm bt-group-trigger",
+                close_on_pick = false, open = open)
+end
+
+# A field and an Add button that put a group nobody is in yet into the picker's
+# `items`, ticked.
+function new_group_row(items)
+    field = DOM.input(type = "text", placeholder = "new group", class = "bt-group-new-name")
+    add = DOM.button("Add"; type = "button", class = "bw-btn bw-btn-secondary bw-btn-sm bt-group-add")
+    wire = js"""(() => {
+        const items = $(items), field = $(field), add = $(add);
+        add.addEventListener('click', () => {
+            const name = field.value.trim();
+            if (!name) return;
+            let box = [...items.querySelectorAll('input')].find(i => i.value === name);
+            if (!box) {
+                const row = document.createElement('label');
+                row.className = 'bw-menu-item bt-group-item';
+                box = document.createElement('input');
+                box.type = 'checkbox'; box.value = name;
+                row.append(box, name);
+                items.append(row);
+            }
+            box.checked = true;
+            field.value = '';
+            // The picker's label follows the ticks on `change`.
+            items.dispatchEvent(new Event('change'));
+        });
+        field.addEventListener('keydown', event => {
+            if (event.key === 'Enter') { event.preventDefault(); add.click(); }
+        });
+    })()"""
+    return DOM.div(field, add, wire; class = "bt-group-new")
 end
 
 text_input(obs::Observable{String}, placeholder::AbstractString) =
@@ -930,7 +930,7 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
             used = [w.name for w in values(workers) if w.credential == c.name]
             DOM.tr(DOM.td(DOM.code(c.name)), DOM.td(isempty(used) ? "not connected yet" : join(used, ", ")),
                    DOM.td(c.owner), DOM.td(Dates.format(c.created, "yyyy-mm-dd")),
-                   DOM.td(DOM.button("Revoke"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                   DOM.td(DOM.button("Revoke"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                                      onclick = js"event => $(revoke).notify($(c.name))")))
         end
         DOM.table(DOM.tr(DOM.th("Credential"), DOM.th("Worker"), DOM.th("Issued by"),
@@ -938,7 +938,7 @@ function worker_install_block(::Union{LoginAuth,NetworkAuth}, session::Bonito.Se
     end
     body = DOM.div(
         AdminStyles,
-        DOM.button("Add worker"; class = "bt-btn bt-btn-sm",
+        DOM.button("Add worker"; class = "bw-btn bw-btn-sm",
                    onclick = js"event => $(add).notify(true)"),
         issued,
         admin_line(status, "bt-admin-status"),
@@ -1001,17 +1001,17 @@ function own_account_section(auth::LoginAuth, session::Bonito.Session, state::Se
         DOM.div(
             PasskeyStyles,
             DOM.div(DOM.span("Signed in as $(user.display_name) ($(user.name)); $(groups)."),
-                    DOM.a("Log out"; href = logout, class = "bt-btn bt-btn-sm bt-btn-secondary");
+                    DOM.a("Log out"; href = logout, class = "bw-btn bw-btn-sm bw-btn-secondary");
                     class = "bt-account-head"),
             passkeys_block(auth, session),
             DOM.div(
                 DOM.span("Password and authenticator"; class = "bt-account-sub"),
-                DOM.button("New password"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                DOM.button("New password"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                            onclick = js"""event => {
                                if (confirm("Replace your password with a new, generated one?"))
                                    $(renew).notify(true);
                            }"""),
-                DOM.button("New authenticator"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                DOM.button("New authenticator"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                            onclick = js"""event => {
                                if (confirm("Replace your authenticator? The codes of the old one stop working."))
                                    $(reauth).notify(true);
@@ -1087,7 +1087,7 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
             msg
         end)
     end
-    add_form = modal(session, adding, "Add account") do
+    add_form = Modal(adding; title = "Add account") do
         field(label, obs, placeholder) = (DOM.label(label), text_input(obs, placeholder))
         DOM.div(
             field("Account", new_name, "login name, e.g. dave"),
@@ -1104,9 +1104,9 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
             DOM.div("The password and authenticator are shown once, after adding.";
                     class = "bt-form-note"),
             admin_line(add_status, "bt-admin-status"),
-            DOM.div(DOM.button("Cancel"; class = "bt-btn bt-btn-secondary",
+            DOM.div(DOM.button("Cancel"; class = "bw-btn bw-btn-secondary",
                                onclick = js"event => $(adding).notify(false)"),
-                    DOM.button("Add account"; class = "bt-btn bt-add-account-submit",
+                    DOM.button("Add account"; class = "bw-btn bt-add-account-submit",
                                onclick = js"event => $(add).notify(true)");
                     class = "bt-form-actions");
             class = "bt-form")
@@ -1114,9 +1114,8 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
 
     # ── The table: who, their groups, their role; everything else in ⋯ ──────
     item(label, verb, name; danger = false, ask = "") = DOM.button(label;
-        class = danger ? "bt-menu-item bt-menu-danger" : "bt-menu-item",
+        class = danger ? "bw-menu-item bw-menu-danger" : "bw-menu-item",
         onclick = js"""event => {
-            $(Bonito.JSString(MENU_CLOSE_JS))
             const ask = $(ask);
             if (!ask || confirm(ask)) $(action).notify([$(verb), $(name), '']);
         }""")
@@ -1135,15 +1134,15 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
                            allow_new = true)),
                 DOM.td(admin ? "admin" : "member",
                        a.disabled ? DOM.span("disabled"; class = "bt-pill bt-pill-warn bt-account-disabled") : nothing),
-                DOM.td(action_menu(
+                DOM.td(Menu([
                     item(admin ? "Make member" : "Make admin", admin ? "member" : "admin", a.name),
                     item(a.disabled ? "Enable" : "Disable", a.disabled ? "enable" : "disable", a.name),
-                    DOM.div(; class = "bt-menu-sep"),
+                    DOM.div(; class = "bw-menu-sep"),
                     item("New password", "password", a.name),
                     item("New authenticator", "authenticator", a.name;
                          ask = "Replace the authenticator of $(a.name)? The codes of the old one stop working."),
-                    DOM.div(; class = "bt-menu-sep"),
-                    item("Remove", "remove", a.name; danger = true, ask = "Remove the account $(a.name)?");
+                    DOM.div(; class = "bw-menu-sep"),
+                    item("Remove", "remove", a.name; danger = true, ask = "Remove the account $(a.name)?")];
                     title = "Actions for $(a.name)"); class = "bt-admin-menu-cell");
                 class = a.disabled ? "bt-account-off" : "", dataAccount = a.name)
         end
@@ -1153,9 +1152,9 @@ function accounts_section(auth::LoginAuth, session::Bonito.Session, state::Serve
     return DOM.div(
         DOM.div(DOM.h2("Accounts"); class = "bt-section"),
         DOM.div(table,
-                DOM.div(DOM.button("Add account…"; class = "bt-btn bt-btn-sm bt-add-account",
+                DOM.div(DOM.button("Add account…"; class = "bw-btn bw-btn-sm bt-add-account",
                                    onclick = js"event => $(adding).notify(true)"),
-                        login_codes_button(auth.config, session);
+                        login_codes_button(auth.config);
                         class = "bt-admin-form"),
                 admin_line(secret, "bt-admin-secret"),
                 admin_line(status, "bt-admin-status");
@@ -1167,17 +1166,17 @@ end
 # notices about new devices, and the rare one-time code that confirms who someone
 # is (the server registers everyone's authenticator, so adding a device normally
 # needs none). Admins read it here.
-login_codes_button(cfg::ProxyConfig, session::Bonito.Session) =
-    cfg.smtp ? nothing : login_codes_button(notifications_file(cfg), session)
+login_codes_button(cfg::ProxyConfig) =
+    cfg.smtp ? nothing : login_codes_button(notifications_file(cfg))
 
-function login_codes_button(file::AbstractString, session::Bonito.Session)
+function login_codes_button(file::AbstractString)
     is_open = Observable(false)
     return DOM.div(
-        DOM.button("Authelia's messages"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+        DOM.button("Authelia's messages"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                    title = "What Authelia would have mailed; this server sends no mail",
                    onclick = js"event => $(is_open).notify(true)"),
         # Read on every open: it is the latest that matters.
-        modal(session, is_open, "Authelia's messages") do
+        Modal(is_open; title = "Authelia's messages") do
             text = isfile(file) ? read(file, String) : ""
             DOM.div(
                 DOM.div("What Authelia would have mailed (this server sends no mail): notices " *
@@ -1217,7 +1216,7 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
                    DOM.td(!isempty(i.account) ? "sets up $(i.account)" : isempty(i.groups) ? "member" : join(i.groups, ", ")),
                    DOM.td(Dates.format(i.created, "yyyy-mm-dd HH:MM")),
                    DOM.td(Dates.format(i.expires, "yyyy-mm-dd HH:MM")),
-                   DOM.td(DOM.button("Revoke"; class = "bt-btn bt-btn-sm bt-btn-secondary",
+                   DOM.td(DOM.button("Revoke"; class = "bw-btn bw-btn-sm bw-btn-secondary",
                                      onclick = js"event => $(revoke).notify($(i.id))")))
         end
         DOM.table(DOM.tr(DOM.th("Invited by"), DOM.th("Groups"), DOM.th("Created (UTC)"),
@@ -1239,7 +1238,7 @@ function invites_section(::LoginAuth, session::Bonito.Session, state::ServerStat
                     end,
                     DOM.label("valid for ", DOM.input(type = "text", value = days, size = 3,
                               oninput = js"event => $(days).notify(event.target.value)"), " days"),
-                    DOM.button("Create invite link"; class = "bt-btn bt-btn-sm",
+                    DOM.button("Create invite link"; class = "bw-btn bw-btn-sm",
                                onclick = js"event => $(create).notify(true)");
                     class = "bt-admin-form"),
             admin_line(link, "bt-admin-secret"),
@@ -1285,7 +1284,7 @@ function adapters_section(session::Bonito.Session, state::ServerState)
                     class = "bt-admin-muted"),
             row("Node", node),
             (row(k, packages[k]) for k in sort!(collect(keys(packages)))),
-            DOM.button("Save"; class = "bt-btn bt-btn-sm", onclick = js"event => $(save).notify(true)"),
+            DOM.button("Save"; class = "bw-btn bw-btn-sm", onclick = js"event => $(save).notify(true)"),
             admin_line(status, "bt-admin-status");
             class = "bt-card"))
 end

@@ -190,7 +190,7 @@
         @testset "Copy button starts transfer and busy card appears" begin
             # Use a CSS selector for the submit button (class-based, not text-search)
             # to scroll it into view — avoids needing querySelectorAll after rapid typing.
-            scroll_into_view!(server, ".bt-form-actions .bt-btn:not(.bt-btn-secondary)")
+            scroll_into_view!(server, ".bt-form-actions .bw-btn:not(.bw-btn-secondary)")
             @test TK.wait_for(server, "Copy button in viewport",
                 "$(btn_center_js("Copy")) !== null"; timeout = 10) == true
             real_click!(ctx, ECT.JS(btn_center_js("Copy")))

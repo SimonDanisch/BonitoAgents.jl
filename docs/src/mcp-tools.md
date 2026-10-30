@@ -8,6 +8,174 @@ agent shares with you, where the result of an eval isn't a screenshot or a text
 dump but the **live value**, rendered into the chat and still wired to the code
 that produced it.
 
+## Agent workflow and discovery
+
+Every chat has a built-in workflow covering worker-side files, previews,
+sharing, progress reporting, persistent Julia sessions, background work and
+waiting. It is delivered through the MCP initialization `instructions` field
+for all providers. The discoverable `bt_help()` tool returns the same briefing
+when an agent needs to reread it after resuming or compacting. MCP clients
+decide how to surface initialization instructions; `bt_help` remains available
+as a tool. Each tool also describes its own arguments and limits.
+
+Add your own server-wide rules in **Settings → Agent instructions**. They are
+stored in the server's `AGENTS.md`, composed with the built-in workflow and any
+app or development briefing, and read on agent session bring-up. Restart an
+existing agent session to receive edits. Claude also receives the briefing via
+its native system-prompt append; other providers use the common MCP path. This
+does not write or replace the project's own `AGENTS.md` or `CLAUDE.md`.
+
+### Worker file links
+
+An agent can write `[source](./src/app.jl)` in its reply. Clicking it opens a
+workspace tab for that file **on the chat's worker**, relative to the chat's
+working directory. It is not relative to the browser URL or an earlier shell
+`cd`. Absolute worker paths work too. For spaces, use an angle-bracket
+destination, such as `[report](<./reports/render notes.md>)`, or percent-encode
+the spaces. Check that a file exists before linking it; a link cannot repair an
+invented path. Use `bt_show` for an inline preview and `bt_share` for a public
+link. Avoid `sandbox:` URLs and paths to the server's internal cache.
+
+## `bt_process`, supervised background commands
+
+Use this for long external commands, independently of the agent provider:
+
+```json
+{"action":"start","id":"encode-1","argv":["ffmpeg","-i","input.mov","out.mp4"],"label":"Encode video"}
+{"action":"wait","id":"encode-1","seconds":600}
+{"action":"output","id":"encode-1","offset":0,"max_bytes":8192}
+```
+
+These are separate MCP calls. The **worker** owns the command, its process
+group or Windows Job Object, output capture and exit record. Agent turns and
+MCP reconnects do not own its lifetime. A launch appears in the existing chat
+taskbar, including its label, worker, PID and directory. Expand the row to see
+output. Its Stop button requests an interrupt; the same menu offers Terminate
+and Force kill. Controls act directly on the worker, without prompting the LLM.
+
+| Action | Meaning |
+|---|---|
+| `start` | Requires a stable `id` for this attempt and an `argv` array. Optional `cwd`, `label` and `env`. The directory defaults to the chat's worker directory. |
+| `list` | This chat's retained jobs on its worker, including completed jobs. |
+| `status` | Lifecycle, command, PID, exit code, signal and a bounded output tail. |
+| `output` | Read from a byte `offset`; continue with `next_offset`. `max_bytes` is 1–65536. |
+| `wait` | Requires `id` and `seconds`, at most 3600. Returns on exit, timeout or an incoming message, with `wait_reason`. It does not stop the job. |
+| `interrupt` | Request SIGINT for the process group. Windows does not support this action; use terminate or kill. |
+| `terminate` | Request graceful termination, SIGTERM on Unix. |
+| `kill` | Force termination of the managed process group or Windows Job Object. |
+
+`argv` is passed as arguments, not interpreted as shell syntax. If a shell is
+needed, invoke it explicitly, for example `["sh","-c","make && make test"]`.
+Do not add `&`, `nohup` or another detached watcher outside the supervisor.
+Start is idempotent: repeating the same `id` returns its existing job rather
+than launching another command. Use a **new id** for a new attempt.
+
+A signal request produces `interrupting`, `terminating` or `killing`; the row
+stays until the worker confirms exit. A failed control request remains visible.
+Completed jobs report `succeeded`, `failed`, `interrupted`, `killed` or `lost`.
+The worker continues tracking the group when the original Unix process exits
+but leaves children running. Job Objects provide descendant ownership on
+Windows. Processes that deliberately escape Unix process groups require stronger
+OS containment; this API is not a sandbox for full-access code.
+
+Closing or restarting a chat requests cleanup of its old session's jobs. A
+session fence prevents delayed cleanup from killing replacement jobs, and
+prevents the old session from launching new work. Disconnection does not imply
+exit: the worker re-announces state on reconnect, and pending cleanup is retried.
+A worker restart reaps its persisted running groups and records those jobs as
+lost. Their retained output remains readable; `output_cursor_reset=true` means
+to restart reading from offset zero. The supervisor captures ownership before
+allowing a command to execute.
+
+Output is a bounded rolling log, up to 8 MiB per job, with up to 256 job records
+per worker and at most 64 active jobs. `output_truncated` reports dropped old
+bytes. Environment overrides are not included in returned records. Progress-only
+context and `BONITOAGENTS_PROCESS_ID` are supplied to launched programs, so a
+coordinator can report progress using the same job id. `bt_progress` measures
+work; it does not replace process supervision.
+
+Use `bt_julia_eval(background=true)` and its run controls for ordinary Julia
+work. Stopping an agent turn leaves managed background jobs running; use the
+job's controls, or restart/close its chat, to end them.
+
+## `bt_progress`, progress in the chat and sidebar
+
+```
+bt_progress(action, id; label?, completed?, total?, unit?, detail?, parent?, primary?, status?)
+```
+
+Progress belongs to a job, independently of whether the agent is busy. A render
+or test batch can keep reporting while the agent waits or works on something
+else. The chat shows the job, and its sidebar icon shows progress for the
+primary job. Updates change the existing display instead of adding messages.
+
+This is the single progress system for work inside a chat. Built-in file
+transfers, sharing and “Continue on worker” report through the same job API as
+`bt_progress` and `BonitoProgress`. They share one compact progress row and the
+sidebar indicator, including completion, failure, dismissal and reload behavior.
+Adapters may translate events from an operation into job updates; they must not
+create another progress store, bar or percentage calculation.
+
+From any MCP client, use a stable job id and report actual completed units:
+
+```json
+{"action":"start","id":"render","label":"Render frames","total":240,"unit":"frames"}
+{"action":"update","id":"render","completed":60,"detail":"Worker 2 finished its batch"}
+{"action":"finish","id":"render"}
+```
+
+These are three separate tool calls. Use `fail` with an error `detail`, or
+`cancel`, when appropriate. An unknown `total` is `null` and shows indeterminate
+progress. Set `status="paused"` on an update to retain a paused job. A new
+`start` with the same id starts a new generation. Use `primary=false` for
+secondary jobs and `parent` to associate child jobs with a parent's id. Do not
+derive percentages from token counts, elapsed time or the act of launching a
+command. The meter reports the underlying job; ending a meter does not stop a
+render, and it does not change YOLO or the agent's busy state.
+
+### Julia code and callbacks
+
+Inside `bt_julia_eval`, `BonitoProgress` is already bound and needs no new
+project dependency or `using` statement. For example, where `render_frame` is
+your application's rendering function:
+
+```julia
+BonitoProgress.progress("Render frames"; id="render", total=240, unit="frames") do job
+    for frame in 1:240
+        render_frame(frame)
+        BonitoProgress.update!(job, frame)
+    end
+end
+```
+
+The do-block finishes on return, reports exceptions as failures and reports an
+interrupt as cancellation, then rethrows. If an API accepts a
+`(completed, total)` callback, a job handle is itself callable:
+
+```julia
+job = BonitoProgress.progress("Render farm"; id="render-farm", unit="frames")
+renderfarm!(...; progress=job) # your existing API's callback
+BonitoProgress.finish!(job)   # after validating the result
+```
+
+With a manually managed handle, call `fail!`, `cancel!` or
+`update!(job, completed; total, status="paused")` for other outcomes. Updates
+are coalesced to at most five per second. Existing ProgressLogging events in
+an eval are forwarded automatically; ProgressMeter is not integrated. The
+repository's `examples/renderfarm_progress.jl` shows pause, failure and flush
+handling for a render coordinator.
+
+For a separate Julia process on the same worker, call
+`bt_progress(action="context")`. It returns `env`, containing progress-only
+environment variables, and `julia_client`, a stdlib-only file. Pass `env` into
+the process environment and load the helper with `julia -L <julia_client>`;
+this is a reporter for an existing external coordinator, not a reason to
+replace `bt_julia_eval` for normal Julia work. Before exiting, call
+`BonitoProgress.flush_progress(job)` and check its Boolean result. Keep the
+context local; it grants progress reporting for this chat and must not appear
+in public output. Other languages can call `bt_progress` over MCP; there is
+currently no equivalent standalone language SDK.
+
 ## `bt_julia_eval`, a shared live REPL
 
 ```
@@ -134,7 +302,7 @@ the context window.
 
 ```
 bt_julia_eval(code; worker = "MacBook", env_path?, timeout?, …)
-bt_sync_folder(src, worker; dst?)
+bt_sync_folder(src, worker; dst?, direction="push", paths?)
 ```
 
 Every eval-family tool takes a `worker`: the display name of another online
@@ -157,10 +325,42 @@ While it is off a call with `worker` fails and tells the agent where the switch
 is. `bt_julia_list_sessions` lists the other workers (and their live sessions)
 so the agent can find the names.
 
-The other machine has its own filesystem: `bt_sync_folder` copies a folder from
-the chat's worker to the target (through the server's mirror, so a second call
-only moves what changed): the project, its `Project.toml`/`Manifest.toml`, the
-data. It needs the same switch.
+The other machine has its own filesystem. `bt_sync_folder` streams folders
+through the server's existing worker connections, transferring only changes
+and preserving destination-only files. It needs the same switch.
+
+- `direction="push"` (default): `src` is on this chat's worker; `dst` is on `worker`.
+- `direction="pull"`: `src` is on `worker`; `dst` is on this chat's worker.
+
+Both paths are absolute; omitted `dst` defaults to the same path as `src`.
+For example, retrieve results from Desktop into this chat's worker:
+
+```julia
+bt_sync_folder(src="/data/results", worker="Desktop",
+               dst="/work/results", direction="pull")
+```
+
+No direct sockets, SSH setup or second chat are needed. Remote Julia evals
+do not change this tool's source: direction is relative to the chat's worker.
+
+Folders are recursive: use **one call for the whole tree**, rather than one
+call per file. For a selected batch, set `src` to a common root and pass relative
+files or subfolders in `paths`. Subfolders are recursive, overlapping selections
+are deduplicated, and destination paths retain their structure:
+
+```julia
+bt_sync_folder(src="/data/results", worker="Desktop", dst="/work/results",
+               direction="pull", paths=["summary.csv", "frames", "logs/render.log"])
+```
+
+Omit `paths` for the whole folder. Paths are literal (no glob expansion); missing
+or escaping paths fail. Update the server for pull/batch support and the source
+worker for selections. Older versions refuse the new operations instead of
+accidentally pushing in the wrong direction or sending the entire folder.
+Every transfer automatically reports measured file counts and transferred bytes
+through the existing chat progress bar and sidebar indicator. Completion is shown
+after the destination confirms its writes; failures remain visible. No separate
+`bt_progress` call or repeated sync polling is needed.
 
 ### Julia values between machines
 
@@ -188,6 +388,35 @@ usable. Needs the chat's *remote julia* switch, like everything above.
 The route: the session connects to its worker's relay over loopback TCP, the
 server checks the switch, has the chat's eval host on the other worker connect
 the session asked for, and pipes the two together; it never reads the values.
+
+## `bt_chat`, opt-in coordination
+
+```julia
+bt_chat(action="list")
+bt_chat(action="send", project_id="<peer id>", text="The render is ready.")
+```
+
+Chat messaging is **off by default**, including after upgrading existing chats.
+The user enables **Chat messaging** in the ⋯ menus of **both** chats before
+agents can exchange messages. Only opted-in chats owned by the same user appear
+in the list. Use this tool when the user has authorized coordination.
+
+The permission is independent of dev mode and takes effect without restarting
+the agent. Turning either chat's switch off immediately rejects new sends and
+pauses queued peer input that has not been handed over. It remains paused across
+reloads and re-enabling; the user can queue it again or remove it. Messages already
+handed to an agent remain part of its conversation.
+
+Sending returns `status="queued"`, a message id and a server UTC timestamp.
+Acceptance is not confirmation that the receiving agent has received/read it or
+finished work. Peer messages follow the existing queue-after-current-message
+delivery path, including supported steering and wakeups during `bt_wait` or
+managed-process waits. Sender chat/worker identity and send/dispatch timestamps
+are attached automatically. The receiving agent can use the same tool to reply.
+
+The legacy `bt_dev_control(op="send_message")` uses the same opt-in checks. Dev
+mode does not grant messaging, and stale dev-tool calls are refused by the server
+as soon as dev mode is switched off.
 
 ## `bt_share`, a link for anyone
 

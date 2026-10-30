@@ -41,6 +41,7 @@ RemoteSync = {path = "../RemoteSync"}
 WorkerLink = {path = "../WorkerLink"}
 
 [compat]
+BonitoWidgets = "0.1.3"
 Colors = "0.12, 0.13"
 HTTP = "2"
 JSON = "1"

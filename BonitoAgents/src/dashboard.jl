@@ -744,7 +744,7 @@ const DashboardStyles = Bonito.Styles(
     # Tokens, reset, buttons and menus come from the shared base (styles.jl):
     # the dashboard can be mounted without ChatStyles, and must still agree
     # with it on every one of them.
-    BASE_CSS...,
+    BASE_STYLES,
 
     # ── Shell ────────────────────────────────────────────────────────────────
     # No own max-width: the whole app is bounded by `.bt-shell` (defined in
@@ -757,8 +757,8 @@ const DashboardStyles = Bonito.Styles(
     # the viewport with nowhere to scroll on mobile.
     CSS(".bt-dash",
         "font-family"  => "'Inter', system-ui, -apple-system, sans-serif",
-        "font-size"    => "14px", "line-height" => "1.5",
-        "color"        => "var(--bt-text)", "background" => "var(--bt-bg)",
+        "font-size"    => "var(--bw-font-size)", "line-height" => "1.5",
+        "color"        => "var(--bw-text)", "background" => "var(--bw-bg)",
         "flex"         => "1 1 auto", "min-height" => "0",
         "overflow-y"   => "auto",
         "padding"      => "32px 24px",
@@ -799,7 +799,7 @@ const DashboardStyles = Bonito.Styles(
         "justify-content" => "space-between", "gap" => "16px",
         "margin-bottom" => "4px"),
     CSS(".bt-header h1",
-        "font-size" => "22px", "font-weight" => "600",
+        "font-size" => "var(--bw-font-size-xl)", "font-weight" => "600",
         "letter-spacing" => "-0.01em", "margin" => "0",
         "display" => "flex", "align-items" => "center", "gap" => "10px"),
     # The hexagon logo next to the wordmark — same asset as the favicon.
@@ -808,7 +808,7 @@ const DashboardStyles = Bonito.Styles(
         "display" => "block", "flex-shrink" => "0",
         "user-select" => "none"),
     CSS(".bt-tagline",
-        "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+        "color" => "var(--bw-text-muted)", "font-size" => "var(--bw-font-size-ui)"),
     # The wordmark, and the Settings button at the far end of its line.
     CSS(".bt-header-top",
         "display" => "flex", "align-items" => "center",
@@ -822,15 +822,15 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-stats",
         "display" => "flex", "gap" => "20px", "flex-wrap" => "wrap",
         "padding" => "12px 16px", "margin-top" => "16px",
-        "background" => "var(--bt-surface)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
-        "font-size" => "13px"),
+        "background" => "var(--bw-bg-panel)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius)",
+        "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-stat",
         "display" => "flex", "align-items" => "center", "gap" => "6px"),
     CSS(".bt-stat-value", "font-weight" => "600"),
-    CSS(".bt-stat-label", "color" => "var(--bt-text-muted)"),
-    CSS(".bt-stat-sep",   "color" => "var(--bt-text-faint)"),
+    CSS(".bt-stat-label", "color" => "var(--bw-text-muted)"),
+    CSS(".bt-stat-sep",   "color" => "var(--bw-text-faint)"),
 
     # ── Section headings ─────────────────────────────────────────────────────
     CSS(".bt-section",
@@ -838,9 +838,9 @@ const DashboardStyles = Bonito.Styles(
         "justify-content" => "space-between",
         "margin" => "32px 0 12px"),
     CSS(".bt-section h2",
-        "font-size" => "11px", "font-weight" => "600",
+        "font-size" => "var(--bw-font-size-xs)", "font-weight" => "600",
         "letter-spacing" => "0.08em", "text-transform" => "uppercase",
-        "color" => "var(--bt-text-muted)", "margin" => "0"),
+        "color" => "var(--bw-text-muted)", "margin" => "0"),
     # Action buttons of a section, grouped as one unit on the right instead of
     # space-between scattering each button across the full row.
     CSS(".bt-section-actions",
@@ -861,17 +861,17 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-settings-row",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between", "flex-wrap" => "wrap",
-        "gap" => "var(--bt-space-3) var(--bt-space-4)",
+        "gap" => "var(--bw-space-3) var(--bw-space-4)",
         "padding" => "14px 16px"),
     CSS(".bt-settings-row + .bt-settings-row",
-        "border-top" => "1px solid var(--bt-border)"),
+        "border-top" => "1px solid var(--bw-border)"),
     CSS(".bt-settings-text", "flex" => "0 1 auto", "min-width" => "0"),
     # Dotted underline: the standing "there is a tooltip here" affordance, the
     # same one `.bt-path-link` uses for a clickable path.
     CSS(".bt-settings-title",
-        "font-weight" => "600", "font-size" => "13px",
+        "font-weight" => "600", "font-size" => "var(--bw-font-size-ui)",
         "text-decoration" => "underline dotted",
-        "text-decoration-color" => "var(--bt-text-faint)",
+        "text-decoration-color" => "var(--bw-text-faint)",
         "text-underline-offset" => "3px",
         "cursor" => "help"),
     CSS(".bt-settings-control",
@@ -884,17 +884,17 @@ const DashboardStyles = Bonito.Styles(
 
     # ── Card ─────────────────────────────────────────────────────────────────
     CSS(".bt-card",
-        "background" => "var(--bt-surface)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
+        "background" => "var(--bw-bg-panel)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius)",
         "padding" => "14px 16px",
         "margin-bottom" => "8px",
         "display" => "flex", "flex-direction" => "column",
         "align-items" => "stretch", "gap" => "8px",
         "transition" => "border-color 120ms ease, box-shadow 120ms ease"),
     CSS(".bt-card:hover",
-        "border-color" => "var(--bt-border-strong)",
-        "box-shadow" => "var(--bt-shadow-sm)"),
+        "border-color" => "var(--bw-border-strong)",
+        "box-shadow" => "var(--bw-shadow-sm)"),
     # The top row of a worker card — what `.bt-card` itself used to be (title +
     # actions on one line). The card is now a column so the nested project
     # `<details>` can sit beneath the row INSIDE the same pill chrome.
@@ -904,7 +904,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-card-body",
         "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-card-title",
-        "font-weight" => "600", "font-size" => "14px",
+        "font-weight" => "600", "font-size" => "var(--bw-font-size)",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
         "min-width" => "0"),
     # Name spans inside titles: don't break on hyphens, ellipsis when too long
@@ -920,16 +920,16 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-card-remove",
         "flex-shrink" => "0",
         "cursor" => "pointer",
-        "color" => "var(--bt-text-faint)",
+        "color" => "var(--bw-text-faint)",
         "font-size" => "13px",
         "line-height" => "1",
         "padding" => "2px 6px",
-        "border-radius" => "var(--bt-radius-sm)",
+        "border-radius" => "var(--bw-radius-sm)",
         "user-select" => "none",
         "transition" => "background 80ms, color 80ms"),
     CSS(".bt-card-remove:hover",
         "background" => "rgba(239,68,68,0.12)",
-        "color" => "var(--bt-error)"),
+        "color" => "var(--bw-error)"),
     # Inline-editable variant for the worker name. Reads as plain text until
     # the user clicks/focuses it; on focus we surface a soft border so it's
     # discoverable that the field is editable.
@@ -938,7 +938,7 @@ const DashboardStyles = Bonito.Styles(
         "background" => "transparent",
         "padding" => "2px 6px",
         "margin" => "-2px -6px",
-        "border-radius" => "var(--bt-radius-sm)",
+        "border-radius" => "var(--bw-radius-sm)",
         "font" => "inherit",
         "color" => "inherit",
         "min-width" => "0",
@@ -950,22 +950,22 @@ const DashboardStyles = Bonito.Styles(
         "cursor" => "text",
         "transition" => "background 80ms, box-shadow 80ms"),
     CSS("input.bt-card-name-edit:hover",
-        "background" => "var(--bt-surface-2)"),
+        "background" => "var(--bw-bg-subtle)"),
     CSS("input.bt-card-name-edit:focus",
-        "background" => "var(--bt-surface-2)",
-        "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)"),
+        "background" => "var(--bw-bg-subtle)",
+        "box-shadow" => "inset 0 0 0 1px var(--bw-border-strong)"),
     # Worker initials `[XX]` tag — small monospace input next to the name.
     # Width fits ~4 chars + padding; sits flush, shows a subtle pill outline
     # so it reads as a tag rather than free text.
     CSS("input.bt-card-initials",
-        "border" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bw-border)",
+        "background" => "var(--bw-bg-subtle)",
         "padding" => "1px 6px",
         "border-radius" => "999px",
         "font-family" => "ui-monospace, monospace",
-        "font-size" => "11px",
+        "font-size" => "var(--bw-font-size-xs)",
         "font-weight" => "600",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bw-text-muted)",
         "letter-spacing" => "0.04em",
         "text-align" => "center",
         "width" => "44px",
@@ -974,39 +974,39 @@ const DashboardStyles = Bonito.Styles(
         "cursor" => "text",
         "transition" => "background 80ms, box-shadow 80ms"),
     CSS("input.bt-card-initials:hover",
-        "background" => "var(--bt-surface)"),
+        "background" => "var(--bw-bg-panel)"),
     CSS("input.bt-card-initials:focus",
-        "background" => "var(--bt-surface)",
-        "box-shadow" => "inset 0 0 0 1px var(--bt-border-strong)",
-        "color" => "var(--bt-text)"),
+        "background" => "var(--bw-bg-panel)",
+        "box-shadow" => "inset 0 0 0 1px var(--bw-border-strong)",
+        "color" => "var(--bw-text)"),
     # Machine identity is shared with every chat badge and border.
     CSS(".bt-worker-card", "border-left" => "4px solid var(--bt-worker)"),
     CSS(".bt-worker-card input.bt-card-initials, .bt-worker-card span.bt-card-initials",
         "background" => "var(--bt-worker)", "color" => "white",
         "border" => "1px solid var(--bt-worker)",
-        "padding" => "4px 6px", "border-radius" => "var(--bt-radius-sm)"),
+        "padding" => "4px 6px", "border-radius" => "var(--bw-radius-sm)"),
     # `[XX]` pill in front of a project's title — read-only mirror of the
     # worker's initials. Same pill shape as the editable input above so the
     # tag reads consistently across worker / project cards.
     CSS(".bt-card-worker-tag",
-        "border" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface-2)",
+        "border" => "1px solid var(--bw-border)",
+        "background" => "var(--bw-bg-subtle)",
         "padding" => "1px 6px",
         "border-radius" => "999px",
         "font-family" => "ui-monospace, monospace",
-        "font-size" => "11px",
+        "font-size" => "var(--bw-font-size-xs)",
         "font-weight" => "600",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bw-text-muted)",
         "letter-spacing" => "0.04em",
         "flex-shrink" => "0"),
     # Folder name shown under the title as a meta line. Same tone as the
     # rest of `.bt-card-meta`; explicit class so the test suite can target it.
     CSS(".bt-card-folder-name",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bw-text-muted)",
         "font-family" => "ui-monospace, monospace",
-        "font-size" => "12px"),
+        "font-size" => "var(--bw-font-size-sm)"),
     CSS(".bt-card-meta",
-        "color" => "var(--bt-text-muted)", "font-size" => "12px",
+        "color" => "var(--bw-text-muted)", "font-size" => "var(--bw-font-size-sm)",
         "margin-top" => "2px",
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "white-space" => "nowrap", "overflow" => "hidden",
@@ -1020,8 +1020,8 @@ const DashboardStyles = Bonito.Styles(
         "align-items" => "center"),
     CSS(".bt-mono",
         "font-family" => "ui-monospace, monospace",
-        "font-size" => "11.5px",
-        "color" => "var(--bt-text-faint)"),
+        "font-size" => "var(--bw-font-size-sm)",
+        "color" => "var(--bw-text-faint)"),
 
     # ── Status dot ───────────────────────────────────────────────────────────
     CSS(".bt-dot",
@@ -1029,17 +1029,17 @@ const DashboardStyles = Bonito.Styles(
         "width" => "8px", "height" => "8px",
         "border-radius" => "50%", "flex-shrink" => "0"),
     CSS(".bt-dot-online",
-        "background" => "var(--bt-success)",
+        "background" => "var(--bw-success)",
         "box-shadow" => "0 0 0 3px rgba(16,185,129,0.18)"),
-    CSS(".bt-dot-offline", "background" => "var(--bt-error)"),
-    CSS(".bt-dot-unknown", "background" => "var(--bt-text-faint)"),
+    CSS(".bt-dot-offline", "background" => "var(--bw-error)"),
+    CSS(".bt-dot-unknown", "background" => "var(--bw-text-faint)"),
 
     # ── Pill (small text-bearing badge) ──────────────────────────────────────
     CSS(".bt-pill",
         "display" => "inline-flex", "align-items" => "center",
         "padding" => "1px 8px",
         "border-radius" => "999px",
-        "font-size" => "11px", "font-weight" => "500",
+        "font-size" => "var(--bw-font-size-xs)", "font-weight" => "500",
         "letter-spacing" => "0.02em",
         # Keep pill text on a single line and don't let the flex parent
         # shrink the pill below its content width — otherwise "not backed
@@ -1050,7 +1050,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-pill-online",
         "background" => "rgba(16,185,129,0.12)", "color" => "#047857"),
     CSS(".bt-pill-muted",
-        "background" => "var(--bt-surface-2)", "color" => "var(--bt-text-muted)"),
+        "background" => "var(--bw-bg-subtle)", "color" => "var(--bw-text-muted)"),
     CSS(".bt-pill-warn",
         "background" => "rgba(234,179,8,0.15)", "color" => "#a16207"),
     CSS(".bt-pill-syncing",
@@ -1059,13 +1059,13 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-pill-error",
         "background" => "rgba(239,68,68,0.12)", "color" => "#b91c1c"),
 
-    # (Buttons: `.bt-btn` and its variants live in BASE_CSS, styles.jl.)
+    # (Buttons: `.bw-btn` and its variants come from BonitoWidgets, via BASE_STYLES.)
 
     # ── Forms ────────────────────────────────────────────────────────────────
     CSS(".bt-form",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
+        "background" => "var(--bw-bg-subtle)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius)",
         "padding" => "16px", "margin-top" => "12px",
         "display" => "grid",
         # minmax(0, 1fr) lets the column shrink below content min-width so the
@@ -1073,7 +1073,7 @@ const DashboardStyles = Bonito.Styles(
         "grid-template-columns" => "120px minmax(0, 1fr)",
         "gap" => "12px 16px", "align-items" => "start"),
     CSS(".bt-form label",
-        "color" => "var(--bt-text-muted)", "font-size" => "13px",
+        "color" => "var(--bw-text-muted)", "font-size" => "var(--bw-font-size-ui)",
         "padding-top" => "8px"),
     # A note that belongs to the field ABOVE it, not to a label: it sits in the
     # value column, where the input it explains is. Dropped into the grid as a
@@ -1081,7 +1081,7 @@ const DashboardStyles = Bonito.Styles(
     # four lines.
     CSS(".bt-form-note",
         "grid-column" => "2",
-        "font-size" => "11px", "color" => "var(--bt-text-muted)",
+        "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)",
         "margin-top" => "-6px"),
     # An input that paints its own `background` must paint its own `color` too —
     # otherwise the text is the UA's `fieldtext` and follows the OS color scheme
@@ -1089,16 +1089,16 @@ const DashboardStyles = Bonito.Styles(
     # already pins that, this is the belt to its braces.
     CSS(".bt-form input, .bt-form select",
         "padding" => "8px 10px",
-        "border" => "1px solid var(--bt-border-strong)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "font-size" => "14px",
-        "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bw-border-strong)",
+        "border-radius" => "var(--bw-radius-sm)",
+        "font-size" => "var(--bw-font-size)",
+        "background" => "var(--bw-bg-panel)",
+        "color" => "var(--bw-text)",
         "width" => "100%", "box-sizing" => "border-box",
         "outline" => "none",
         "transition" => "border-color 120ms, box-shadow 120ms"),
     CSS(".bt-form input:focus, .bt-form select:focus",
-        "border-color" => "var(--bt-accent)",
+        "border-color" => "var(--bw-accent)",
         "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
     CSS(".bt-form-actions",
         "grid-column" => "1 / -1",
@@ -1106,36 +1106,36 @@ const DashboardStyles = Bonito.Styles(
         "justify-content" => "flex-end",
         "padding-top" => "4px"),
     CSS(".bt-form-hint",
-        "color" => "#047857", "font-size" => "12px", "margin-top" => "4px"),
+        "color" => "#047857", "font-size" => "var(--bw-font-size-sm)", "margin-top" => "4px"),
 
     # ── Notices ──────────────────────────────────────────────────────────────
     CSS(".bt-error",
         "background" => "#fef2f2", "color" => "#b91c1c",
         "border" => "1px solid #fee2e2",
         "padding" => "10px 12px",
-        "border-radius" => "var(--bt-radius-sm)",
-        "font-size" => "13px", "margin-top" => "12px"),
+        "border-radius" => "var(--bw-radius-sm)",
+        "font-size" => "var(--bw-font-size-ui)", "margin-top" => "12px"),
     CSS(".bt-empty",
-        "color" => "var(--bt-text-faint)", "font-size" => "13px",
+        "color" => "var(--bw-text-faint)", "font-size" => "var(--bw-font-size-ui)",
         "padding" => "20px",
         "text-align" => "center",
-        "border" => "1px dashed var(--bt-border)",
-        "border-radius" => "var(--bt-radius)"),
+        "border" => "1px dashed var(--bw-border)",
+        "border-radius" => "var(--bw-radius)"),
 
     # ── Folder picker ────────────────────────────────────────────────────────
     CSS(".bt-picker",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius-sm)",
         "padding" => "6px",
-        "background" => "var(--bt-surface)",
+        "background" => "var(--bw-bg-panel)",
         "max-height" => "260px", "overflow-y" => "auto",
-        "font-family" => "ui-monospace, monospace", "font-size" => "12px"),
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-sm)"),
     CSS(".bt-picker-row",
         "padding" => "5px 8px",
         "border-radius" => "4px", "cursor" => "pointer",
         "transition" => "background 80ms"),
     CSS(".bt-picker-row:hover",
-        "background" => "var(--bt-surface-2)"),
+        "background" => "var(--bw-bg-subtle)"),
     CSS(".bt-picker-cur",
         "display" => "flex", "align-items" => "center",
         "gap" => "8px", "margin-bottom" => "8px",
@@ -1154,23 +1154,23 @@ const DashboardStyles = Bonito.Styles(
         "box-sizing" => "border-box",
         "min-width" => "0",
         "padding" => "6px 8px",
-        "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text)",   # see `.bt-form input` — never inherit fieldtext
-        "border" => "1px solid var(--bt-border-strong)",
-        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bw-bg-panel)",
+        "color" => "var(--bw-text)",   # see `.bt-form input` — never inherit fieldtext
+        "border" => "1px solid var(--bw-border-strong)",
+        "border-radius" => "var(--bw-radius-sm)",
         "font-family" => "ui-monospace, monospace",
-        "font-size" => "12px"),
+        "font-size" => "var(--bw-font-size-sm)"),
     CSS(".bt-picker-exist",
-        "font-size" => "11px",
+        "font-size" => "var(--bw-font-size-xs)",
         "min-height" => "14px"),
     CSS(".bt-picker-exist-missing",
-        "color" => "var(--bt-warning)"),
+        "color" => "var(--bw-warning)"),
     CSS(".bt-picker-exist-file",
         "color" => "#b91c1c"),
     CSS(".bt-picker-loading",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "color" => "var(--bt-text-muted)",
-        "padding" => "12px", "font-size" => "12px"),
+        "color" => "var(--bw-text-muted)",
+        "padding" => "12px", "font-size" => "var(--bw-font-size-sm)"),
 
     # ── Discover panel (collapsable <details>) ───────────────────────────────
     # `<details>` keeps the worker pill compact by default; clicking the header
@@ -1182,7 +1182,7 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-card > details.bt-discover-panel",
         "background" => "transparent",
         "border" => "none",
-        "border-top" => "1px solid var(--bt-border)",
+        "border-top" => "1px solid var(--bw-border)",
         "border-radius" => "0",
         "padding" => "8px 0 0", "margin" => "0"),
     CSS(".bt-card > details.bt-discover-panel[open]", "padding-bottom" => "4px"),
@@ -1195,8 +1195,8 @@ const DashboardStyles = Bonito.Styles(
         "gap" => "10px",
         # The toggle is meant to be unobtrusive — small text, muted by default,
         # full-color on hover (the :hover rule below).
-        "font-size" => "12px",
-        "color" => "var(--bt-text-muted)"),
+        "font-size" => "var(--bw-font-size-sm)",
+        "color" => "var(--bw-text-muted)"),
     CSS("details[open] > .bt-discover-header", "margin-bottom" => "10px"),
     # Hide the default disclosure triangle (Chrome / Safari).
     CSS(".bt-discover-header::-webkit-details-marker", "display" => "none"),
@@ -1204,14 +1204,14 @@ const DashboardStyles = Bonito.Styles(
     # surfaces feel like one design language.
     CSS(".bt-discover-header::before",
         "content" => "\"▸\"",
-        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "color" => "var(--bw-text-faint)", "font-size" => "10px",
         "flex-shrink" => "0"),
     CSS("details.bt-discover-panel[open] > .bt-discover-header::before",
         "content" => "\"▾\""),
     CSS(".bt-discover-header:hover",
-        "background" => "var(--bt-surface)"),
+        "background" => "var(--bw-bg-panel)"),
     CSS(".bt-discover-title",
-        "font-weight" => "500", "font-size" => "12px",
+        "font-weight" => "500", "font-size" => "var(--bw-font-size-sm)",
         "flex" => "1 1 auto", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
@@ -1220,18 +1220,18 @@ const DashboardStyles = Bonito.Styles(
         "flex-shrink" => "0"),
 
     CSS(".bt-section-label",
-        "font-size" => "10.5px", "font-weight" => "600",
+        "font-size" => "var(--bw-font-size-xs)", "font-weight" => "600",
         "letter-spacing" => "0.08em", "text-transform" => "uppercase",
-        "color" => "var(--bt-text-faint)",
+        "color" => "var(--bw-text-faint)",
         "margin" => "12px 4px 6px"),
     CSS(".bt-session-row",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between",
         "gap" => "8px",
         "padding" => "10px 12px",
-        "background" => "var(--bt-surface)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
+        "background" => "var(--bw-bg-panel)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius-sm)",
         "margin-bottom" => "6px",
         "transition" => "border-color 120ms"),
     # `min-width: 0` lets the path ellipsize instead of pushing the
@@ -1239,9 +1239,9 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-session-info",
         "min-width" => "0", "flex" => "1 1 auto"),
     CSS(".bt-session-row:hover",
-        "border-color" => "var(--bt-border-strong)"),
+        "border-color" => "var(--bw-border-strong)"),
     CSS(".bt-session-name",
-        "font-weight" => "600", "font-size" => "13px",
+        "font-weight" => "600", "font-size" => "var(--bw-font-size-ui)",
         "display" => "flex", "align-items" => "center", "gap" => "6px",
         "min-width" => "0"),
     # The name string lives inside this span (rather than as a raw text
@@ -1254,8 +1254,8 @@ const DashboardStyles = Bonito.Styles(
         "white-space" => "nowrap",
         "min-width" => "0"),
     CSS(".bt-session-path",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
-        "color" => "var(--bt-text-muted)", "margin-top" => "2px",
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-xs)",
+        "color" => "var(--bw-text-muted)", "margin-top" => "2px",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     # First-user-prompt preview shown in place of the path inside group rows.
@@ -1263,23 +1263,23 @@ const DashboardStyles = Bonito.Styles(
     # not metadata. One-line ellipsis; truncation happens server-side at
     # PREVIEW_MAX_CHARS so the layout stays predictable.
     CSS(".bt-session-preview",
-        "font-size" => "11.5px",
-        "color" => "var(--bt-text-muted)", "margin-top" => "2px",
+        "font-size" => "var(--bw-font-size-sm)",
+        "color" => "var(--bw-text-muted)", "margin-top" => "2px",
         "font-style" => "italic",
         "overflow" => "hidden",
         "text-overflow" => "ellipsis", "white-space" => "nowrap"),
     CSS(".bt-session-meta",
-        "font-size" => "11px",
-        "color" => "var(--bt-text-faint)", "margin-top" => "2px"),
+        "font-size" => "var(--bw-font-size-xs)",
+        "color" => "var(--bw-text-faint)", "margin-top" => "2px"),
 
     # ── Project-group disclosure (two-level session list) ────────────────────
     # One <details> per project cwd; expands to reveal child .bt-session-row
     # widgets. Chevron is a CSS `::before` content swap on `[open]`, never a
     # `transform: rotate()` — same reason documented for `.bt-subsection-*`.
     CSS(".bt-group",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius-sm)",
+        "background" => "var(--bw-bg-panel)",
         "margin-bottom" => "6px",
         "overflow" => "hidden"),
     CSS(".bt-group-summary",
@@ -1287,62 +1287,62 @@ const DashboardStyles = Bonito.Styles(
         "padding" => "10px 12px",
         "cursor" => "pointer",
         "list-style" => "none",
-        "background" => "var(--bt-surface)"),
+        "background" => "var(--bw-bg-panel)"),
     CSS(".bt-group-summary::-webkit-details-marker", "display" => "none"),
     CSS(".bt-group-summary::before",
         "content" => "\"▸\"",
-        "color" => "var(--bt-text-faint)", "font-size" => "10px",
+        "color" => "var(--bw-text-faint)", "font-size" => "10px",
         "flex-shrink" => "0"),
     CSS("details.bt-group[open] > .bt-group-summary::before",
         "content" => "\"▾\""),
     CSS(".bt-group-summary:hover",
-        "background" => "var(--bt-surface-2)"),
+        "background" => "var(--bw-bg-subtle)"),
     CSS(".bt-group-name",
-        "font-weight" => "600", "font-size" => "13px",
+        "font-weight" => "600", "font-size" => "var(--bw-font-size-ui)",
         "flex-shrink" => "0"),
     CSS(".bt-group-path",
-        "font-family" => "ui-monospace, monospace", "font-size" => "11px",
-        "color" => "var(--bt-text-muted)",
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-xs)",
+        "color" => "var(--bw-text-muted)",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap", "min-width" => "0",
         "flex" => "1 1 auto"),
     CSS(".bt-group-meta",
-        "font-size" => "11px", "color" => "var(--bt-text-faint)",
+        "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-faint)",
         "flex-shrink" => "0"),
     # "+ New thread" in a folder's summary row — reveal on hover so it doesn't
     # clutter the collapsed list.
     CSS(".bt-new-thread",
         "flex-shrink" => "0",
-        "font-size" => "11px", "font-weight" => "500",
-        "color" => "var(--bt-accent)", "cursor" => "pointer",
-        "padding" => "2px 8px", "border-radius" => "var(--bt-radius-sm)",
+        "font-size" => "var(--bw-font-size-xs)", "font-weight" => "500",
+        "color" => "var(--bw-accent)", "cursor" => "pointer",
+        "padding" => "2px 8px", "border-radius" => "var(--bw-radius-sm)",
         "white-space" => "nowrap",
         "opacity" => "0", "transition" => "opacity 80ms, background 80ms"),
     CSS(".bt-group-summary:hover .bt-new-thread", "opacity" => "1"),
-    CSS(".bt-new-thread:hover", "background" => "var(--bt-surface-2)"),
+    CSS(".bt-new-thread:hover", "background" => "var(--bw-bg-subtle)"),
     CSS(".bt-group-body",
         "padding" => "8px 10px 4px",
-        "border-top" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface-2)"),
+        "border-top" => "1px solid var(--bw-border)",
+        "background" => "var(--bw-bg-subtle)"),
     # Child rows inside a group — drop their own border so the group's
     # border carries the visual outer frame.
     CSS(".bt-group-body .bt-session-row",
-        "border" => "1px solid var(--bt-border)",
-        "background" => "var(--bt-surface)"),
+        "border" => "1px solid var(--bw-border)",
+        "background" => "var(--bw-bg-panel)"),
 
     # ── Spinner ──────────────────────────────────────────────────────────────
     CSS(".bt-spinner-row",
         "display" => "flex", "align-items" => "center", "gap" => "8px",
-        "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+        "color" => "var(--bw-text-muted)", "font-size" => "var(--bw-font-size-ui)"),
     # Per-side borders so the accent arc shows (the `border` shorthand was
     # overriding `border-top-color` → uniform grey ring, invisible rotation).
     CSS(".bt-spinner",
         "width" => "14px", "height" => "14px",
         "border-radius" => "50%", "box-sizing" => "border-box",
-        "border-top" => "2px solid var(--bt-accent)",
-        "border-right" => "2px solid var(--bt-border)",
-        "border-bottom" => "2px solid var(--bt-border)",
-        "border-left" => "2px solid var(--bt-border)",
+        "border-top" => "2px solid var(--bw-accent)",
+        "border-right" => "2px solid var(--bw-border)",
+        "border-bottom" => "2px solid var(--bw-border)",
+        "border-left" => "2px solid var(--bw-border)",
         "will-change" => "transform",   # compositor-driven; survives main-thread jank
         "animation" => "bt-spin 0.7s steps(8) infinite",
         "flex-shrink" => "0"),
@@ -1380,10 +1380,10 @@ const DashboardStyles = Bonito.Styles(
         "width" => "30px", "height" => "30px",
         "border-radius" => "50%",
         "box-sizing" => "border-box",
-        "border-top" => "3px solid var(--bt-accent)",
-        "border-right" => "3px solid var(--bt-border)",
-        "border-bottom" => "3px solid var(--bt-border)",
-        "border-left" => "3px solid var(--bt-border)",
+        "border-top" => "3px solid var(--bw-accent)",
+        "border-right" => "3px solid var(--bw-border)",
+        "border-bottom" => "3px solid var(--bw-border)",
+        "border-left" => "3px solid var(--bw-border)",
         "flex-shrink" => "0",
         "will-change" => "transform",
         "animation" => "bt-spin 0.7s steps(8) infinite"),
@@ -1396,38 +1396,38 @@ const DashboardStyles = Bonito.Styles(
     CSS(".bt-loading-done .bt-loading-spinner", "display" => "none"),
     CSS(".bt-loading-glyph", "font-size" => "28px", "opacity" => "0.7"),
     CSS(".bt-loading-title",
-        "font-size" => "15px", "font-weight" => "600",
-        "color" => "var(--bt-text)"),
+        "font-size" => "var(--bw-font-size-lg)", "font-weight" => "600",
+        "color" => "var(--bw-text)"),
     CSS(".bt-loading-sub",
-        "font-size" => "13px", "color" => "var(--bt-text-muted)",
+        "font-size" => "var(--bw-font-size-ui)", "color" => "var(--bw-text-muted)",
         "max-width" => "360px", "line-height" => "1.5"),
 
     # ── Open chat link ───────────────────────────────────────────────────────
     CSS(".bt-link",
-        "color" => "var(--bt-accent)", "text-decoration" => "none",
-        "font-size" => "13px", "font-weight" => "500",
+        "color" => "var(--bw-accent)", "text-decoration" => "none",
+        "font-size" => "var(--bw-font-size-ui)", "font-weight" => "500",
         "padding" => "6px 10px",
-        "border-radius" => "var(--bt-radius-sm)",
+        "border-radius" => "var(--bw-radius-sm)",
         "display" => "inline-flex", "align-items" => "center", "gap" => "6px",
         "transition" => "background 120ms"),
     CSS(".bt-link:hover",
         "background" => "rgba(59,130,246,0.08)"),
     CSS(".bt-link-loading",
-        "color" => "var(--bt-text-muted)", "pointer-events" => "none"),
+        "color" => "var(--bw-text-muted)", "pointer-events" => "none"),
     # Pure UI feedback for the "Open chat →" link. JS just adds the
     # `.bt-link-clicked` class on click; the CSS animation flashes the link
     # and self-clears via `animation-fill-mode: forwards`. No server-side
     # observable, no @async timer — the new tab loading IS the feedback.
     CSS(".bt-link-clicked",
         "background" => "rgba(59,130,246,0.18)",
-        "color" => "var(--bt-text-muted)",
+        "color" => "var(--bw-text-muted)",
         "pointer-events" => "none",
         "animation" => "bt-link-flash 1.6s ease-out forwards"),
     CSS("@keyframes bt-link-flash",
         CSS("0%",   "background" => "rgba(59,130,246,0.32)"),
         CSS("60%",  "background" => "rgba(59,130,246,0.18)"),
         CSS("100%", "background" => "transparent",
-                    "color"      => "var(--bt-accent)")),
+                    "color"      => "var(--bw-accent)")),
 
     # "Open chat on <worker>" — link styled wrapper containing a label and a
     # native <select>. Dropdown stays inline so the whole control reads as a
@@ -1435,15 +1435,15 @@ const DashboardStyles = Bonito.Styles(
     # picking a different one → click handler runs the move sequence.
     CSS(".bt-open-on", "gap" => "4px"),
     CSS(".bt-open-on-label",
-        "color" => "var(--bt-accent)",
+        "color" => "var(--bw-accent)",
         "font-weight" => "500"),
     CSS(".bt-open-on-select",
         "background"     => "transparent",
-        "border"         => "1px solid var(--bt-border)",
-        "border-radius"  => "var(--bt-radius-sm)",
-        "color"          => "var(--bt-accent)",
+        "border"         => "1px solid var(--bw-border)",
+        "border-radius"  => "var(--bw-radius-sm)",
+        "color"          => "var(--bw-accent)",
         "font-weight"    => "500",
-        "font-size"      => "13px",
+        "font-size"      => "var(--bw-font-size-ui)",
         "padding"        => "2px 4px",
         "cursor"         => "pointer"),
     CSS(".bt-open-on-select:hover",
@@ -1453,7 +1453,7 @@ const DashboardStyles = Bonito.Styles(
     # Used by the Discover Import button — JS flips this class on click for
     # instant visual feedback (the WS round-trip to surface the busy card
     # can take tens of ms; the click should respond immediately).
-    CSS(".bt-btn.bt-clicked",
+    CSS(".bw-btn.bt-clicked",
         "opacity" => "0.55", "cursor" => "wait",
         "pointer-events" => "none"),
 
@@ -1465,20 +1465,20 @@ const DashboardStyles = Bonito.Styles(
 
     # ── Install hint (empty-state with copy button) ──────────────────────────
     CSS(".bt-install-block",
-        "background" => "var(--bt-surface-2)",
-        "border" => "1px solid var(--bt-border)",
-        "border-radius" => "var(--bt-radius)",
+        "background" => "var(--bw-bg-subtle)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius)",
         "padding" => "16px 18px"),
     CSS(".bt-install-os",
-        "color" => "var(--bt-text-faint)", "font-size" => "11px",
+        "color" => "var(--bw-text-faint)", "font-size" => "var(--bw-font-size-xs)",
         "font-weight" => "600", "letter-spacing" => "0.04em",
         "text-transform" => "uppercase", "margin-top" => "12px"),
     CSS(".bt-install-cmd",
         "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between", "gap" => "8px",
         "background" => "#0f172a", "color" => "#e2e8f0",
-        "font-family" => "ui-monospace, monospace", "font-size" => "12.5px",
-        "padding" => "10px 12px", "border-radius" => "var(--bt-radius-sm)",
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-ui)",
+        "padding" => "10px 12px", "border-radius" => "var(--bw-radius-sm)",
         "margin-top" => "4px"),
     # One click selects the whole command, for copying it by hand.
     CSS(".bt-install-cmd code",
@@ -1489,35 +1489,35 @@ const DashboardStyles = Bonito.Styles(
         "color" => "#e2e8f0",
         "border" => "1px solid rgba(255,255,255,0.12)",
         "padding" => "4px 10px", "border-radius" => "4px",
-        "font-size" => "12px", "cursor" => "pointer",
+        "font-size" => "var(--bw-font-size-sm)", "cursor" => "pointer",
         "transition" => "background 120ms"),
     CSS(".bt-install-copy:hover",
         "background" => "rgba(255,255,255,0.12)"),
 
     # ── Global agent instructions (AGENTS.md) editor ─────────────────────────
     CSS(".bt-agents-hint",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "font-size" => "var(--bw-font-size-sm)", "color" => "var(--bw-text-muted)",
         "line-height" => "1.5"),
     CSS(".bt-agents-textarea",
         "width" => "100%", "box-sizing" => "border-box",
         "padding" => "10px 12px",
-        "border" => "1px solid var(--bt-border-strong)",
-        "border-radius" => "var(--bt-radius-sm)",
-        "background" => "var(--bt-surface)",
-        "color" => "var(--bt-text)",
+        "border" => "1px solid var(--bw-border-strong)",
+        "border-radius" => "var(--bw-radius-sm)",
+        "background" => "var(--bw-bg-panel)",
+        "color" => "var(--bw-text)",
         "font-family" => "ui-monospace, SFMono-Regular, Menlo, monospace",
-        "font-size" => "12.5px", "line-height" => "1.5",
+        "font-size" => "var(--bw-font-size-ui)", "line-height" => "1.5",
         "resize" => "vertical",
         "outline" => "none",
         "transition" => "border-color 120ms, box-shadow 120ms"),
     CSS(".bt-agents-textarea:focus",
-        "border-color" => "var(--bt-accent)",
+        "border-color" => "var(--bw-accent)",
         "box-shadow" => "0 0 0 3px rgba(59,130,246,0.18)"),
     CSS(".bt-agents-actions",
         "display" => "flex", "align-items" => "center", "gap" => "10px",
         "justify-content" => "flex-end"),
     CSS(".bt-agents-status",
-        "font-size" => "12px", "color" => "var(--bt-text-muted)",
+        "font-size" => "var(--bw-font-size-sm)", "color" => "var(--bw-text-muted)",
         "flex" => "1 1 auto", "min-width" => "0",
         "overflow" => "hidden", "text-overflow" => "ellipsis",
         "white-space" => "nowrap"),
@@ -1532,7 +1532,7 @@ const DashboardStyles = Bonito.Styles(
             "flex-direction" => "column",
             "align-items" => "flex-start",
             "gap" => "4px"),
-        CSS(".bt-tagline", "font-size" => "12px"),
+        CSS(".bt-tagline", "font-size" => "var(--bw-font-size-sm)"),
         # Section headings: h2 takes the full first row, action buttons
         # wrap onto a second row right-aligned. Without this, the buttons
         # squeeze in next to the tiny "PROJECTS" h2 and "+ New project"
@@ -1546,7 +1546,7 @@ const DashboardStyles = Bonito.Styles(
             "grid-template-columns" => "minmax(0, 1fr)",
             "gap" => "8px"),
         CSS(".bt-form label",
-            "padding-top" => "0", "font-size" => "12px"),
+            "padding-top" => "0", "font-size" => "var(--bw-font-size-sm)"),
         # One column here, so the note can't sit in a second one.
         CSS(".bt-form-note", "grid-column" => "1"),
         # Cards: body + actions stack instead of sitting on one row. The card
@@ -1779,7 +1779,7 @@ end
 function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPicker)
     setup_remote_picker_listeners!(session, p)
 
-    up_btn     = Bonito.Button("↑"; style=nothing, class = "bt-btn bt-btn-secondary",
+    up_btn     = Bonito.Button("↑"; style=nothing, class = "bw-btn bw-btn-secondary",
                                title = "Up one level")
     on(session, up_btn.value) do clicked
         clicked || return
@@ -1838,7 +1838,7 @@ function remote_folder_picker_render(session::Bonito.Session, p::RemoteFolderPic
         end
         rows = isempty(entries) ?
             [DOM.div("(empty folder)";
-                class = "bt-picker-row", style = Styles("color" => "var(--bt-text-faint)"))] :
+                class = "bt-picker-row", style = Styles("color" => "var(--bw-text-faint)"))] :
             [DOM.div("📁 $(e.name)";
                 class   = "bt-picker-row",
                 onclick = js"event => $(p.path).notify($(js_path(joinpath(wdir, e.name))));")
@@ -2194,7 +2194,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     # instructions, accounts) is on the Settings page; this is its door.
     settings_link = current_view === nothing ? nothing :
         DOM.button("Settings";
-            class = "bt-btn bt-btn-secondary bt-btn-sm bt-open-settings",
+            class = "bw-btn bw-btn-secondary bw-btn-sm bt-open-settings",
             title = "Defaults, agent instructions, accounts",
             onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
 
@@ -2307,8 +2307,8 @@ function copy_project_controls(session::Bonito.Session, state::ServerState, busy
         open || (error_obs[] = "")
     end
 
-    submit = Bonito.Button("Copy"; style = nothing, class = "bt-btn")
-    cancel = Bonito.Button("Cancel"; style = nothing, class = "bt-btn bt-btn-secondary")
+    submit = Bonito.Button("Copy"; style = nothing, class = "bw-btn")
+    cancel = Bonito.Button("Cancel"; style = nothing, class = "bw-btn bw-btn-secondary")
     on(session, submit.value) do clicked
         clicked || return
         refuse_if_busy(busy, error_obs, "Can't copy right now") && return
@@ -2345,7 +2345,7 @@ function copy_project_controls(session::Bonito.Session, state::ServerState, busy
         is_open[] = false
     end
 
-    button = Bonito.Button("Copy project…"; style = nothing, class = "bt-btn bt-btn-secondary")
+    button = Bonito.Button("Copy project…"; style = nothing, class = "bw-btn bw-btn-secondary")
     on(session, button.value) do clicked
         clicked || return
         mine = [w.worker_id for w in values(state.workers[]) if visible(state, w)]
@@ -2382,7 +2382,7 @@ function copy_project_controls(session::Bonito.Session, state::ServerState, busy
         (isempty(msg) || open != when_open) ? DOM.div() : DOM.div(msg; class = "bt-error")
     end
 
-    form = modal(session, is_open, "Copy project") do
+    form = Modal(is_open; title = "Copy project") do
         DOM.div(
             DOM.label("Source worker"),
             worker_select(src_worker, "bt-cp-src-worker"),
@@ -2420,9 +2420,9 @@ end
 """
     agents_md_section(session, state)
 
-The global agent instructions (AGENTS.md): a system-prompt appendix every agent
-session gets, on every worker (state_dir/AGENTS.md; see `system_prompt_meta`).
-Read at session bring-up, so a save applies to the NEXT chat opened.
+The global agent instructions (state_dir/AGENTS.md), included in the MCP
+briefing and Claude's native system-prompt append. Read at session bring-up,
+so a save applies to new or restarted agent sessions.
 """
 function agents_md_section(session::Bonito.Session, state::ServerState)
     status = Observable("")
@@ -2440,8 +2440,8 @@ function agents_md_section(session::Bonito.Session, state::ServerState)
     return DOM.div(
         DOM.div(DOM.h2("Agent instructions"); class = "bt-section"),
         DOM.div(
-            DOM.div("AGENTS.md, appended to the system prompt of every agent session " *
-                    "on every worker: shared conventions, house rules, tool guidance.";
+            DOM.div("Shared instructions for every worker, applied when an agent session " *
+                    "starts or restarts alongside the built-in workflow guidance.";
                     class = "bt-agents-hint"),
             DOM.textarea(global_agents_md(state);
                 class = "bt-agents-textarea", rows = 6,
@@ -2449,7 +2449,7 @@ function agents_md_section(session::Bonito.Session, state::ServerState)
             DOM.div(
                 DOM.span(status; class = "bt-agents-status"),
                 DOM.button("Save";
-                    class = "bt-btn bt-btn-sm",
+                    class = "bw-btn bw-btn-sm",
                     onclick = js"""event => {
                         const ta = event.target.closest('.bt-agents-block')
                                        .querySelector('textarea');
@@ -2506,8 +2506,8 @@ function worker_install_block(::LocalAuth, session::Bonito.Session, state::Serve
     # commands are right there.
     install_body = DOM.div(
         DOM.div(install_headline;
-                style = Styles("color" => "var(--bt-text-muted)",
-                                "font-size" => "13px",
+                style = Styles("color" => "var(--bw-text-muted)",
+                                "font-size" => "var(--bw-font-size-ui)",
                                 "margin-bottom" => "4px")),
         install_command_row("Linux / macOS", install_unix),
         install_command_row("Windows (PowerShell)", install_win);
@@ -2567,7 +2567,7 @@ function debug_section(session::Bonito.Session, state::ServerState,
             onchange = js"event => $(chosen).notify(event.target.value)")
     end
     btn = DOM.button(map(s -> isempty(s) ? "Debug BonitoAgents" : s, status);
-        class = "bt-btn bt-btn-secondary bt-debug-btn",
+        class = "bw-btn bw-btn-secondary bt-debug-btn",
         title = "Open a chat on the BonitoAgents source, checked out on the chosen " *
                 "worker, with live introspection into this server",
         onclick = js"event => $(status).notify('__click__')")

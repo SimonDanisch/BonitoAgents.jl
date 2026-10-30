@@ -88,16 +88,16 @@ window.btPasskeys = window.btPasskeys || (() => {
 const PasskeyStyles = Bonito.Styles(
     CSS(".bt-account-head", "display" => "flex", "align-items" => "center",
         "justify-content" => "space-between", "gap" => "12px"),
-    CSS(".bt-card a.bt-btn", "text-decoration" => "none"),
+    CSS(".bt-card a.bw-btn", "text-decoration" => "none"),
     CSS(".bt-passkeys", "margin-top" => "12px"),
-    CSS(".bt-passkeys-title", "font-weight" => "600", "font-size" => "13px", "margin-bottom" => "2px"),
+    CSS(".bt-passkeys-title", "font-weight" => "600", "font-size" => "var(--bw-font-size-ui)", "margin-bottom" => "2px"),
     CSS(".bt-account-fallback", "margin-top" => "14px", "padding-top" => "12px",
-        "border-top" => "1px solid var(--bt-border)"),
-    CSS(".bt-account-sub", "color" => "var(--bt-text-muted)", "font-size" => "13px"),
+        "border-top" => "1px solid var(--bw-border)"),
+    CSS(".bt-account-sub", "color" => "var(--bw-text-muted)", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-passkey-row", "display" => "flex", "align-items" => "center", "gap" => "10px",
-        "padding" => "6px 0", "font-size" => "13px"),
+        "padding" => "6px 0", "font-size" => "var(--bw-font-size-ui)"),
     CSS(".bt-passkey-row .bt-passkey-name", "font-weight" => "600"),
-    CSS(".bt-passkey-row .bt-passkey-meta", "color" => "var(--bt-text-muted)", "flex" => "1"))
+    CSS(".bt-passkey-row .bt-passkey-meta", "color" => "var(--bw-text-muted)", "flex" => "1"))
 
 """
     passkeys_block(auth, session)
@@ -107,7 +107,7 @@ here. Behind the proxy: a link to Authelia's settings, where they are made.
 """
 passkeys_block(auth::ProxyAuth, ::Bonito.Session) =
     DOM.a("Add a passkey"; href = portal_url(auth) * "/settings/two-factor-authentication",
-          class = "bt-btn bt-btn-sm bt-btn-secondary")
+          class = "bw-btn bw-btn-sm bw-btn-secondary")
 
 function passkeys_block(::TunnelAuth, session::Bonito.Session)
     root = DOM.div(
@@ -116,7 +116,7 @@ function passkeys_block(::TunnelAuth, session::Bonito.Session)
                 "on its own: no password, no code."; class = "bt-admin-muted"),
         DOM.div(; class = "bt-passkey-list"),
         DOM.div(DOM.input(type = "text", placeholder = "name, e.g. Proton Pass", class = "bt-passkey-name-input"),
-                DOM.button("Add a passkey"; class = "bt-btn bt-btn-sm bt-passkey-add", type = "button");
+                DOM.button("Add a passkey"; class = "bw-btn bw-btn-sm bt-passkey-add", type = "button");
                 class = "bt-admin-form"),
         DOM.div(; class = "bt-admin-status bt-passkey-status");
         class = "bt-passkeys")
@@ -143,7 +143,7 @@ function passkeys_block(::TunnelAuth, session::Bonito.Session)
                     (c.last_used_at ? ', last used ' + day(c.last_used_at) : ', not used yet') +
                     (c.verified ? '' : '; asks for a code as well');
                 const rm = document.createElement('button');
-                rm.className = 'bt-btn bt-btn-sm bt-btn-secondary';
+                rm.className = 'bw-btn bw-btn-sm bw-btn-secondary';
                 rm.type = 'button';
                 rm.textContent = 'Remove';
                 rm.onclick = async () => {

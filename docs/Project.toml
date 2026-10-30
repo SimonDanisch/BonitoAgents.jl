@@ -31,3 +31,6 @@ Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "master"}
+
+[compat]
+BonitoWidgets = "0.1.3"

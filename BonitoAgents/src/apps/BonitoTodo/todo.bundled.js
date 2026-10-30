@@ -122,8 +122,8 @@ function item(t) {
         body.append(m);
     }
     const actions = el('div', 'bt-todo-actions');
-    if (!done) actions.append(button('Start chat', 'bt-btn bt-btn-secondary bt-btn-sm bt-todo-start', 'start', "Ask this chat's agent to start a chat for it in the right project"));
-    actions.append(button('×', 'bt-btn bt-btn-ghost bt-btn-sm bt-todo-remove', 'remove', 'Remove'));
+    if (!done) actions.append(button('Start chat', 'bw-btn bw-btn-secondary bw-btn-sm bt-todo-start', 'start', "Ask this chat's agent to start a chat for it in the right project"));
+    actions.append(button('×', 'bw-btn bw-btn-ghost bw-btn-sm bt-todo-remove', 'remove', 'Remove'));
     row.append(check, body, actions);
     return row;
 }

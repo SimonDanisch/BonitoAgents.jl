@@ -152,6 +152,8 @@ end
 By default, a tool simulator that runs the BonitoMCP handler in the test
 process. This does NOT test agent/MCP launch or environment propagation.
 Pass `real_process=true` to launch MCP from the worker-supplied ACP config.
+Use `arguments=Dict(...)` for tool arguments named `id`, since `id` here names
+the tool call card.
 The simulator uses: Malt worker per `env_path`,
 real `--project` activation, real captured stdout/value/errors. The
 dispatcher executes it in the test process and pipes the resulting MCP
@@ -439,13 +441,16 @@ commands(cmds::AbstractVector) = Dict("type" => "commands",
         end for c in cmds])
 
 """
-    delay(ms) -> Dict
+    delay(ms; until_file = "") -> Dict
 
 Agent event that sleeps `ms` milliseconds in the mock WITHOUT ending the
 turn, so frames already emitted (a pinned todo, an in-progress tool) stay
 live while the test asserts against them.
+With `until_file`, the test releases the delay by creating that file after
+observing the intermediate DOM; `ms` remains the upper bound.
 """
-delay(ms::Real) = Dict("type" => "delay", "ms" => Float64(ms))
+delay(ms::Real; until_file::AbstractString = "") =
+    Dict("type" => "delay", "ms" => Float64(ms), "until_file" => String(until_file))
 
 """
     error_reply(message) -> Dict
@@ -669,7 +674,10 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
                       browser_height::Int = 820,
                       ignore_cancel::Bool = false,
                       prompt_queueing::Bool = true,
+                      prompt_receipts::Bool = true,
+                      receipt_delay_ms::Int = 0,
                       active_steering::Bool = false,
+                      steering_idle_behavior::String = "",
                       scenario::Union{String,Nothing} = nothing,
                       cancel_delay_ms::Union{Int,Nothing} = nothing,
                       mock::Bool = true,
@@ -737,6 +745,9 @@ function dev_server(; agent::Function = (_msg -> end_turn()),
     # test can drive the chat's re-cancel → force-close escalation.
     ignore_cancel && (agent_env["BT_MOCK_ACP_IGNORE_CANCEL"] = "1")
     agent_env["BT_MOCK_ACP_PROMPT_QUEUEING"] = string(prompt_queueing)
+    agent_env["BT_MOCK_ACP_PROMPT_RECEIPTS"] = string(prompt_receipts)
+    agent_env["BT_MOCK_ACP_RECEIPT_DELAY_MS"] = string(receipt_delay_ms)
+    agent_env["BT_MOCK_ACP_STEERING_IDLE_BEHAVIOR"] = steering_idle_behavior
     agent_env["BT_MOCK_ACP_ACTIVE_STEERING"] = string(active_steering)
     # Opt-in: run a BUILT-IN MockACP scenario instead of the dispatcher. The
     # dispatcher is scripted from the test process and is therefore always a
@@ -901,8 +912,9 @@ function invoke_mcp(client, ev::AbstractDict, mcp_env)
     tool = String(get(ev, "tool", "bt_julia_eval"))
     # Everything besides the event bookkeeping IS the tool's argument dict —
     # `mcp_call` sugar (bt_eval / bt_continue) puts args at the top level.
-    args = Dict{String,Any}(String(k) => v for (k, v) in ev
-                            if String(k) ∉ ("type", "tool", "id"))
+    args = get(ev,"arguments",nothing)
+    args === nothing && (args = Dict{String,Any}(String(k) => v for (k, v) in ev
+                            if String(k) ∉ ("type", "tool", "id")))
 
     tool_id = String(get(ev, "id", "te_$(rand(UInt32))"))
     # Real claude opens the tool bubble BEFORE the MCP call runs, streams the
@@ -1069,6 +1081,7 @@ end
 
 Open one Electron window pointed at the dev server. Idempotent — the
 second call closes the prior window and opens a fresh one.
+`route` can also be an absolute URL, for example a public share on another host.
 """
 # `offscreen = true` (the DEFAULT) renders via OSR so requestAnimationFrame runs
 # at ~60fps instead of the ~1.5fps a plain hidden window's compositor produces —
@@ -1081,7 +1094,7 @@ function open_browser(s::TestServer; width::Int = s.browser_size[1],
     ensure_display!()
     old = s.browser[]
     old === nothing || close_browser(old)
-    url = s.h.url * route
+    url = occursin(r"^https?://", route) ? String(route) : s.h.url * route
     # Behind the proxy each browser keeps cookies of its own: Electron's default
     # profile is shared by every window, so a second browser would be logged in
     # as the first. Without a GPU (CI) WebGL runs on SwiftShader, and Chromium
@@ -1406,6 +1419,20 @@ function click(s::TestServer, selector::AbstractString)
     })()""")
     ok === true || error("click: no element matched $sel")
     return s
+end
+
+"Toggle the current chat's messaging permission through its actual menu."
+function set_chat_messaging(s::TestServer, enabled::Bool = true)
+    pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
+    menu = "$pane.querySelector('.bt-header-menu')"
+    item = "$menu.querySelector('.bt-header-messaging')"
+    wait_for(s, "messaging switch ready", "!!$item")
+    eval_js(s, "$item.classList.contains('bt-cap-on')") == enabled && return nothing
+    eval_js(s, "if (!$menu.classList.contains('bw-menu-open')) $menu.querySelector('.bw-menu-trigger').click(); true")
+    wait_for(s, "chat menu open", "$menu.classList.contains('bw-menu-open')")
+    eval_js(s, "$item.click(); true")
+    wait_for(s, "messaging switch applied", "$item.classList.contains('bt-cap-on') === $(enabled)")
+    return nothing
 end
 
 """
@@ -1784,17 +1811,17 @@ function passkey_login!(s::TestServer)
 end
 
 """
-    another_browser(s) -> TestServer
+    another_browser(s; route = "/") -> TestServer
 
 A second browser on the same server, with cookies of its own: another person
 logged in at the same time (`login!` into it). Everything that takes a
 `TestServer` drives it. Close it with `close_browser!`, never `close`, which
 stops the server.
 """
-function another_browser(s::TestServer)
+function another_browser(s::TestServer; route::AbstractString = "/")
     b = TestServer(s.h, s.agent_fn, s.dispatcher_sock, s.dispatcher_port, s.dispatcher_task,
                    Ref{Any}(nothing), Ref(false), s.browser_size, s.admin, s.otp_used, s.extra_workers)
-    open_browser(b)
+    open_browser(b; route)
     return b
 end
 
@@ -1927,16 +1954,16 @@ function add_account_ui!(s::TestServer, name::AbstractString; display_name::Abst
                          groups::AbstractString = "")
     to_settings(s)
     eval_js(s, accounts_js("sec.querySelector('.bt-add-account').click() || true"))
-    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bt-modal-card .bt-add-account-submit')"); timeout = 10)
+    wait_for(s, "the Add account form", accounts_js("!!sec.querySelector('.bw-modal-card .bt-add-account-submit')"); timeout = 10)
     eval_js(s, accounts_js("""(() => {
-        const form = sec.querySelector('.bt-modal-card .bt-form');
+        const form = sec.querySelector('.bw-modal-card .bt-form');
         const set = (label, v) => {
             const el = [...form.querySelectorAll('label')].find(l => l.textContent.trim() === label).nextElementSibling;
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v);
             el.dispatchEvent(new Event('input', {bubbles: true})); };
         set('Account', $(json(name))); set('Full name', $(json(display_name)));
         return true; })()"""))
-    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bt-modal-card .bt-group-pick')"),
+    isempty(groups) || pick_groups!(s, accounts_js("sec.querySelector('.bw-modal-card .bt-group-pick')"),
                                     strip.(split(groups, ','; keepempty = false)))
     sleep(0.3)   # the inputs reach the server before the click that reads them
     eval_js(s, accounts_js("sec.querySelector('.bt-add-account-submit').click() || true"))
@@ -1959,8 +1986,9 @@ function account_action!(s::TestServer, name::AbstractString, label::AbstractStr
     ok = eval_js(s, accounts_js("""(() => {
         const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
         if (!row) return 'no row';
-        row.querySelector('.bt-menu-trigger').click();
-        const b = [...row.querySelectorAll('.bt-menu-open .bt-menu-item')].find(x => x.textContent.trim() === $(json(label)));
+        // The actions menu, not the group picker (a menu too) in the same row.
+        row.querySelector('.bt-admin-menu-cell .bw-menu-trigger').click();
+        const b = [...row.querySelectorAll('.bw-menu-open .bw-menu-item')].find(x => x.textContent.trim() === $(json(label)));
         if (!b) return 'no item';
         window.confirm = () => true;   // "Remove" asks first
         b.click(); return true; })()"""))
@@ -1980,8 +2008,8 @@ function pick_groups!(s::TestServer, picker_js::AbstractString, groups::Abstract
     # before its click handler is, and a click then does nothing.
     wait_for(s, "the group list open", """(() => { const m = $(picker_js);
         if (!m) return false;
-        if (!m.classList.contains('bt-menu-open')) m.querySelector('.bt-group-trigger').click();
-        return m.classList.contains('bt-menu-open'); })()"""; timeout = 20)
+        if (!m.classList.contains('bw-menu-open')) m.querySelector('.bt-group-trigger').click();
+        return m.classList.contains('bw-menu-open'); })()"""; timeout = 20)
     ok = eval_js(s, """(() => {
         const m = $(picker_js);
         const want = $(json(collect(String, groups)));

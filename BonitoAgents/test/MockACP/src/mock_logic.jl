@@ -982,7 +982,11 @@ function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
             # cancel (otherwise cancel would make every delay bail and the stream
             # races to `end_turn`, ending the turn instead of wedging).
             remaining = Float64(get(ev, "ms", 0)) / 1000
+            until_file = String(get(ev, "until_file", ""))
             while remaining > 0 && !(cancelled[] && !IGNORE_CANCEL)
+                # A browser test can release a stream only after observing
+                # its intermediate DOM, independent of machine speed.
+                !isempty(until_file) && isfile(until_file) && break
                 slice = min(remaining, 0.05)
                 sleep(slice)
                 remaining -= slice
@@ -1093,9 +1097,11 @@ function dispatch_loop()
             # the server reads it to decide whether to persist the session id.
             resp(id, Dict("protocolVersion" => 1,
                           "agentCapabilities" => Dict("loadSession" => true,
-                              "_meta" => Dict("claudeCode" => Dict("promptQueueing" =>
+                              "_meta" => Dict("promptReceipts" => get(ENV, "BT_MOCK_ACP_PROMPT_RECEIPTS", "false") == "true",
+                                  "claudeCode" => Dict("promptQueueing" =>
                                   get(ENV, "BT_MOCK_ACP_PROMPT_QUEUEING", "true") == "true"))),
                           "_meta" => Dict("steering" => Dict("supported" => true,
+                              "idleBehavior" => get(ENV, "BT_MOCK_ACP_STEERING_IDLE_BEHAVIOR", ""),
                               "activeOnly" => get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"))))
         elseif method == "session/new" && id !== nothing
             set_mcp_config!(get(msg, "params", Dict()))
@@ -1149,10 +1155,11 @@ function dispatch_loop()
         elseif method == "_session/steering" && id !== nothing
             params = get(msg, "params", Dict())
             if ACTIVE_PROMPTS[] == 0
-                resp(id, Dict("outcome" => "notInjected"))
+                resp(id, Dict("outcome" => get(get(get(params,"_meta",Dict()),"steering",Dict()),"idleBehavior","") == "promptRequired" ? "promptRequired" : "notInjected"))
                 continue
             end
-            @assert get(params, "activeOnly", false) === true
+            @assert get(params, "activeOnly", false) === true ||
+                get(get(get(params,"_meta",Dict()),"steering",Dict()),"idleBehavior","") == "promptRequired"
             LAST_PROMPT[] = join(String(get(b, "text", "")) for b in get(params, "prompt", Any[])
                 if get(b, "type", "") == "text")
             resp(id, Dict("outcome" => "injected"))
@@ -1160,6 +1167,7 @@ function dispatch_loop()
                 Base.errormonitor(@async handle_prompt(nothing, SCENARIO; prompt_text))
             end
         elseif method == "session/prompt" && id !== nothing
+            overlapping = ACTIVE_PROMPTS[] > 0
             if ACTIVE_PROMPTS[] > 0 && get(ENV, "BT_MOCK_ACP_ACTIVE_STEERING", "false") == "true"
                 resp_error(id, -32600, "Overlapping session/prompt is unsupported; use steering")
                 continue
@@ -1180,8 +1188,24 @@ function dispatch_loop()
             # (the `hang_*` scenarios) still parks in its own task, leaving the
             # loop free to read the eventual stdin EOF / cancel.
             ACTIVE_PROMPTS[] += 1
-            let prompt_text = LAST_PROMPT[], prompt_id = id
+            let prompt_text = LAST_PROMPT[], prompt_id = id, prompt_params = params, overlapping = overlapping
                 @async try
+                    # Reproduce the SDK queue: receiving an ACP request is not
+                    # consuming the user message. Stop can discard it first.
+                    receipt_delay = overlapping ? parse(Int, get(ENV, "BT_MOCK_ACP_RECEIPT_DELAY_MS", "0")) : 0
+                    deadline = time() + receipt_delay / 1000
+                    while time() < deadline && !cancelled[]
+                        sleep(0.02)
+                    end
+                    if receipt_delay > 0 && cancelled[]
+                        resp(prompt_id, Dict("stopReason" => "cancelled"))
+                        return
+                    end
+                    receipt_id = get(get(prompt_params, "_meta", Dict()), "bonitoPromptId", nothing)
+                    if receipt_id !== nothing && get(ENV, "BT_MOCK_ACP_PROMPT_RECEIPTS", "false") == "true"
+                        emit(Dict("jsonrpc" => "2.0", "method" => "_bonito/prompt_received",
+                            "params" => Dict("sessionId" => SESSION, "messageId" => receipt_id)))
+                    end
                     handle_prompt(prompt_id, SCENARIO; prompt_text)
                 catch e
                     # A scenario-side throw shouldn't kill the dispatcher; the

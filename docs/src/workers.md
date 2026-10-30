@@ -110,7 +110,8 @@ It waits for a turn in flight to end (stop it or wait), so the new chat starts
 from a finished answer. If the record can't be carried (a provider without a
 movable record, the source offline, a failed transfer) the new chat starts
 fresh. With the source worker offline, only a project the server holds a synced
-copy of can be continued. The window's progress card says which happened.
+copy of can be continued. The source chat's progress row and sidebar indicator
+track the copy and report its outcome, using the same jobs as Julia progress.
 
 ## Running Julia on another machine
 

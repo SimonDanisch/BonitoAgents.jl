@@ -91,9 +91,9 @@
     end
 
     # Is the visible pane's ⋯ menu open (its list rendered)?
-    menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bt-menu-list'); " *
+    menu_open = "(() => { const p=$VP; const l=p && p.querySelector('.bt-header-menu .bw-menu-list'); " *
                 "return !!l && getComputedStyle(l).display !== 'none'; })()"
-    menu_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bt-menu-item') : [])]" *
+    menu_items = "(() => { const p=$VP; return [...(p ? p.querySelectorAll('.bt-header-menu .bw-menu-item') : [])]" *
                  ".map(b => (b.textContent||'').trim()); })()"
 
     @testset "⋯ menu: opens, lists the actions, closes outside, item reaches Julia" begin
@@ -101,10 +101,10 @@
         # one-shot actions are NOT a row of buttons any more.
         @test TK.eval_js(s, vpHas(".bt-header-session")) == true
         @test TK.eval_js(s, vpHas(".bt-header-review")) == true
-        @test TK.eval_js(s, vpHas(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.eval_js(s, vpHas(".bt-header-menu .bw-menu-trigger")) == true
         @test TK.eval_js(s, menu_open) == false
 
-        @test TK.eval_js(s, vpClick(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.eval_js(s, vpClick(".bt-header-menu .bw-menu-trigger")) == true
         @test TK.wait_for(s, "menu opened", menu_open; timeout = 5) == true
         items = TK.eval_js(s, menu_items)
         for expected in ("Compact", "Restart session", "Debug BonitoAgents", "Dev mode")
@@ -121,9 +121,9 @@
         # An item click reaches Julia cleanly and closes the menu: Compact sends
         # `/compact` as a turn, which the echo agent answers.
         before_errs = length(TK.js_errors(s))
-        @test TK.eval_js(s, vpClick(".bt-header-menu .bt-menu-trigger")) == true
+        @test TK.eval_js(s, vpClick(".bt-header-menu .bw-menu-trigger")) == true
         @test TK.wait_for(s, "menu opened again", menu_open; timeout = 5) == true
-        @test TK.eval_js(s, "(() => { const p=$VP; const b=[...p.querySelectorAll('.bt-header-menu .bt-menu-item')]" *
+        @test TK.eval_js(s, "(() => { const p=$VP; const b=[...p.querySelectorAll('.bt-header-menu .bw-menu-item')]" *
             ".find(x => (x.textContent||'').trim() === 'Compact'); if(!b) return false; b.click(); return true; })()") == true
         @test TK.wait_for(s, "menu closed by the item", menu_open * " === false"; timeout = 5) == true
         @test TK.wait_for(s, "compact went through as a turn",

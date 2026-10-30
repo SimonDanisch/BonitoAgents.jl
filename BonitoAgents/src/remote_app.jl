@@ -556,23 +556,23 @@ end
 #   mcp → server:  {"type": "interrupt_result", "request_id", "interrupted": n}
 # Replies route through the same `pending_rpcs` machinery as worker RPCs.
 
-mcp_ctrl_for(state::ServerState, project_id::AbstractString) =
-    lock(state.lock) do
-        get(state.mcp_ctrl, String(project_id), nothing)
-    end
+function mcp_ctrl_for(state::ServerState, project_id::AbstractString)
+    channels = mcp_channels_for(state, project_id)
+    return isempty(channels) ? nothing : first(channels)
+end
 
 # A confirmed message in the active turn should release voluntary waits,
 # without cancelling the turn or interrupting the work it is waiting for.
 function wake_agent_waits!(model)
-    ws = mcp_ctrl_for(model.state, model.project_id)
-    ws === nothing && return nothing
-    try
-        HTTP.WebSockets.send(ws, JSON.json(Dict("op" => "wake_waits")))
-    catch e
-        (e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError ||
-         e isa EOFError || e isa WorkerLink.LinkDead ||
-         (e isa ErrorException && !isopen(ws))) || rethrow()
-        @warn "Could not wake agent waits after message delivery" project_id=model.project_id exception=(e, catch_backtrace())
+    for ws in mcp_channels_for(model.state, model.project_id)
+        try
+            HTTP.WebSockets.send(ws, JSON.json(Dict("op" => "wake_waits")))
+        catch e
+            (e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError ||
+             e isa EOFError || e isa WorkerLink.LinkDead ||
+             (e isa ErrorException && !isopen(ws))) || rethrow()
+            @warn "Could not wake agent waits after message delivery" project_id=model.project_id exception=(e, catch_backtrace())
+        end
     end
     return nothing
 end
@@ -585,14 +585,20 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
     s = shared(model)
     id = String(get(args, "tool_id", ""))
     return lock(s.lock) do
+        any(e -> e isa PendingSend && e.status === :submitted && e.mode === :next &&
+                has_other_turn(s, e.span.turn),
+            s.pending_sends) && return true
         # An older turn's wait cannot consume this turn's initial prompt as
         # new input if its tool card has not been rendered yet.
-        baseline = maximum((e.span.nstore0 for e in s.pending_sends
-            if e isa PendingSend && e.status === :sent && e.span !== nothing); init = 0)
+        # An overlapping prompt must not hide input from the earlier turn's
+        # wait. Its newer baseline includes the correction we need to notice.
+        baseline = minimum((e.span.nstore0 for e in s.pending_sends
+            if e isa PendingSend && e.status === :sent && e.span !== nothing); init = typemax(Int))
+        baseline == typemax(Int) && (baseline = 0)
         input = false
         for i in length(s.msgs_store):-1:(baseline + 1)
             msg = s.msgs_store[i]
-            if msg isa MCPToolMsg && tool_key(msg) == "bt_wait" &&
+            if msg isa MCPToolMsg && tool_key(msg) in ("bt_wait","bt_process") &&
                     (isempty(id) || tool_id(msg) == id)
                 return input
             end
@@ -606,7 +612,7 @@ function handle_mcp_ctrl_frame!(state, ws, d, project_id, host_worker)
     if get(d, "type", "") == "run_update"
         # A run started, ended or was collected (eval_runs.jl). Unsolicited,
         # like the stdout chunks; from an eval host it carries its worker.
-        run_update!(state, project_id, host_worker, d)
+        run_update!(state, project_id, host_worker, d; control=ws)
     elseif get(d, "type", "") == "process_update"
         # One of the chat's processes started or stopped (processes.jl).
         record_process!(state, project_id, host_worker, d)
@@ -715,11 +721,21 @@ live control channel (the agent or its MCP server is not up yet).
 function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
                                  env_path::Union{AbstractString,Nothing} = nothing,
                                  timeout::Real = 15.0)
-    ws = mcp_ctrl_for(state, project_id)
-    ws === nothing && error(
+    channels = mcp_channels_for(state, project_id)
+    isempty(channels) && error(
         "no MCP control channel for this chat — the agent's MCP server " *
         "has no channel through its worker (not started yet)")
-    n = interrupt_over_channel!(state, ws, env_path, timeout, "interrupt_eval")
+    n = 0
+    errors = Exception[]
+    for ws in channels
+        try
+            n += interrupt_over_channel!(state, ws, env_path, timeout, "interrupt_eval")
+        catch e
+            e isa InterruptException && rethrow()
+            push!(errors, e)
+            @warn "interrupt on an MCP client failed" project_id exception=(e, catch_backtrace())
+        end
+    end
     # The chat's evals on OTHER workers (remote_eval.jl) are stopped the same
     # way, through their hosts' channels.
     for (wid, hws) in eval_hosts_of(state, project_id)
@@ -730,6 +746,7 @@ function interrupt_project_eval!(state::ServerState, project_id::AbstractString;
             @warn "interrupt on an eval host failed" project_id worker_id = wid exception = e
         end
     end
+    n == 0 && !isempty(errors) && throw(first(errors))
     return n
 end
 
@@ -741,9 +758,14 @@ host on the run's worker. False when that process says it had already finished.
 """
 function interrupt_run!(state::ServerState, project_id::AbstractString, run::ChatRun;
                         timeout::Real = 15.0)
-    ws = isempty(run.worker_id) ? mcp_ctrl_for(state, project_id) :
-                                  eval_host_ws(state, project_id, run.worker_id)
-    ws === nothing && error("the process running $(run.id) is not connected")
+    ws = if run.control === nothing
+        channels = mcp_channels_for(state, project_id, run.worker_id)
+        length(channels) > 1 && error("the owning MCP client for $(run.id) has not announced its run yet")
+        isempty(channels) ? nothing : only(channels)
+    else
+        run.control.value
+    end
+    (ws === nothing || !isopen(ws)) && error("the process running $(run.id) is not connected")
     return interrupt_over_channel!(state, ws, nothing, timeout, "interrupt $(run.id)";
                                    run = run.id) > 0
 end
@@ -779,7 +801,9 @@ const INJECTED_MCP_NAME = "btworker"
 # (BonitoWorker's `inject_mcp_grant`), so neither a server address nor a secret
 # is handed to the MCP process or anything it spawns.
 function mcp_env(state::ServerState, project_id::AbstractString)
-    env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id))
+    env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => String(project_id),
+        "BONITOAGENTS_INSTRUCTIONS" => agents_prompt_appendix(state, project_id),
+        "BONITOAGENTS_PROCESS_EPOCH" => managed_process_epoch(state,project_id))
     # The ONE thing that turns on the `bt_dev_*` server-introspection tools in
     # that chat's MCP process. Keyed on the project's persisted `dev_mode` flag,
     # so a normal chat can never see them — not even one whose cwd happens to be

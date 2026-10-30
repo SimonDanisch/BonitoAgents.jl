@@ -57,6 +57,9 @@ taskbar_todo_rows(::Any) = nothing
 # fallback returns the snapshot label unchanged.
 taskbar_slot_label(::Any, fallback) = fallback
 taskbar_dismiss_only(::Any) = false
+taskbar_extra_controls(session, bar, source) = ()
+taskbar_slot(session, bar, item, head, source) = DOM.div(head;
+    class="bt-taskbar-slot", dataTaskId=item.id, dataMsgIndex=string(item.msg_index))
 
 """
     TaskBar() -> TaskBar
@@ -169,6 +172,7 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
         title = dismiss ? "Dismiss task entry (does not stop the agent)" : "Stop",
         aria_label = dismiss ? "Dismiss task entry" : "Stop",
         onclick = js"event => { event.stopPropagation(); $(bar.stop_request).notify($(item.id)); }"))
+    append!(head, taskbar_extra_controls(session,bar,item.source))
     if item.kind === :todo
         ents = taskbar_todo_rows(item.source)
         ents === nothing && (ents = item.entries)
@@ -195,8 +199,7 @@ function render_taskbar_item(session::Bonito.Session, bar::TaskBar, item::Taskba
                 class = "bt-taskbar-slot bt-taskbar-todo",
                 dataTaskId = item.id, dataMsgIndex = string(item.msg_index))
     else
-        DOM.div(head; class = "bt-taskbar-slot",
-                dataTaskId = item.id, dataMsgIndex = string(item.msg_index))
+        taskbar_slot(session,bar,item,head,item.source)
     end
 end
 

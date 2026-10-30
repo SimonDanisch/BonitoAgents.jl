@@ -36,7 +36,7 @@
     sleep(2)
 
     @testset "far from the view, the rows stay and hold no diffs" begin
-        @test TK.eval_js(s, "$CH.order.length === $CH.totalCount") == true     # nothing dropped
+        @test TK.eval_js(s, "$CH.block.order.length === $CH.block.count") == true     # nothing dropped
         n = Int(TK.eval_js(s, DIFFS))
         @test 0 < n < N ÷ 2
         # Freed, or never built: a body far away waits until the reader is near.

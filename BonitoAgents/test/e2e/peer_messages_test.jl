@@ -2,7 +2,7 @@
     TK = SharedServer.TK
     target = Ref("")
     agent(prompt) = if prompt == "coordinate"
-        [TK.mcp_call("bt_dev_control"; real_process = true, op = "send_message",
+        [TK.mcp_call("bt_chat"; real_process = true, action = "send",
                      project_id = target[], text = "GPU is available", id = "peer-send"),
          TK.text("Coordination sent")]
     elseif prompt == "keep working"
@@ -17,11 +17,10 @@
         TK.open_browser(s)
         sender = TK.new_chat(s; title = "Sending agent")
         pane = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
-        TK.eval_js(s, "window.confirm = () => true; $pane.querySelector('.bt-header-menu .bt-menu-trigger').click(); " *
-            "$pane.querySelector('.bt-header-devmode').click()")
-        @test TK.wait_for(s, "sender dev tools enabled",
-            "$pane.querySelector('.bt-header-devmode')?.classList.contains('bt-cap-on') === true"; timeout = 30)
+        TK.set_chat_messaging(s)
+        @test TK.eval_js(s, "!$pane.querySelector('.bt-header-devmode').classList.contains('bt-cap-on')")
         target[] = TK.new_chat(s; title = "Receiving agent")
+        TK.set_chat_messaging(s)
         TK.send_message(s, "keep working")
         @test TK.wait_for(s, "receiver working", "$pane.textContent.includes('Working on the original task')"; timeout = 60)
         TK.open_chat(s, sender)
@@ -52,6 +51,7 @@
         # With no active turn the same tool goes through ordinary prompt
         # delivery. It must stamp that path too, rather than only steering.
         target[] = TK.new_chat(s; title = "Idle receiver")
+        TK.set_chat_messaging(s)
         TK.open_chat(s, sender)
         TK.send_message(s, "coordinate")
         TK.open_chat(s, target[])

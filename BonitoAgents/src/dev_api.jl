@@ -183,8 +183,8 @@ jsonable(x) = string(x)
 # allow-list because it is the one request/reply path an MCP process has.
 # `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
 const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console, :wait_input,
-                          :remote_eval, :remote_workers, :sync_folder, :share,
-                          :app_tools, :app_call)
+                          :remote_eval, :remote_workers, :sync_folder, :sync_folder_v2, :share,
+                          :app_tools, :app_call, :managed_process, :chat_messaging)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :continue_project, :set_title)
@@ -203,9 +203,17 @@ channel, never by the request, so an op that grants something per chat
 that into a tool error naming the op), so a typo can't come back as an empty
 success.
 """
-dev_request(state::ServerState, op::AbstractString, args::AbstractDict,
-            caller::AbstractString = "") =
-    dev_op(state, Val(known_or_throw(Symbol(op), DEV_OPS, "dev op")), args, String(caller))
+function dev_request(state::ServerState, op::AbstractString, args::AbstractDict,
+                     caller::AbstractString = "")
+    name = known_or_throw(Symbol(op), DEV_OPS, "dev op")
+    # MCP tool lists are cached by agents and their environment is spawn-time
+    # state. Revocation must be checked against the live project on EVERY call.
+    if !isempty(caller) && name in (:inspect, :logs, :memory, :control, :timings, :console)
+        p = get(state.projects[], String(caller), nothing)
+        p !== nothing && p.dev_mode || error("Dev mode is off for this chat. This dev tool is no longer permitted. Use bt_chat for explicitly enabled chat messaging.")
+    end
+    return dev_op(state, Val(name), args, String(caller))
+end
 
 # The dev ops don't care who asked; the remote-eval ops (remote_eval.jl) do and
 # define the 4-argument method themselves.
@@ -253,7 +261,7 @@ function dev_section(state::ServerState, ::Val{:overview}, ::String)
             "chat_models"     => length(chat_ids),
             "bound_sessions"  => length(bound),
             "eval_bridges"    => lock(() -> length(state.eval_workers), state.lock),
-            "mcp_channels"    => lock(() -> length(state.mcp_ctrl), state.lock),
+            "mcp_channels"    => lock(() -> sum(g -> length(g.channels), values(state.mcp_ctrl); init=0), state.lock),
             "pending_rpcs"    => lock(() -> length(state.pending_rpcs), state.lock),
             "pending_chunks"  => lock(() -> length(state.pending_chunks), state.lock),
             # Browser tabs the server serves, and those whose socket is gone but
@@ -330,6 +338,7 @@ function project_report(p::ProjectInfo)
         # to read back.
         "dev_mode"          => p.dev_mode,
         "remote_eval"       => p.remote_eval,
+        "chat_messaging"    => p.chat_messaging,
         # The app this chat belongs to (apps.jl), "" for an ordinary chat.
         "app"               => p.app,
         "app_key"           => p.app_key,
@@ -356,6 +365,7 @@ function chat_report(state::ServerState, project_id::AbstractString, m)
     agent = sh.agent
     return Dict{String,Any}(
         "project_id"     => String(project_id),
+        "mcp_clients"    => length(mcp_channels_for(state, project_id)),
         "cwd"            => m.cwd,
         "chat_dir"       => m.chat_dir,
         "messages"       => nmsgs,
@@ -636,7 +646,7 @@ function registry_counts(state::ServerState)
         "eval_bridges"         => length(bridges),
         "eval_parked_bytes"    => parked,
         "eval_stream_sinks"    => lock(() -> length(state.eval_stream_sinks), state.lock),
-        "mcp_channels"         => lock(() -> length(state.mcp_ctrl), state.lock),
+        "mcp_channels"         => lock(() -> sum(g -> length(g.channels), values(state.mcp_ctrl); init=0), state.lock),
         "pending_rpcs"         => lock(() -> length(state.pending_rpcs), state.lock),
         "pending_chunks"       => lock(() -> length(state.pending_chunks), state.lock),
         "worker_links"         => lock(() -> length(state.worker_links), state.lock),
@@ -797,26 +807,16 @@ function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDic
 end
 
 function dev_control(state::ServerState, ::Val{:send_message}, args::AbstractDict, caller::String)
+    isempty(caller) || return send_peer_message!(state, caller, args)
     p = dev_project(state, String(get(args, "project_id", "")))
     text = String(get(args, "text", ""))
     isempty(strip(text)) && error("`text` is empty — nothing to send")
-    # Caller identity comes from the authenticated MCP channel, never tool args.
-    origin = if isempty(caller)
-        nothing
-    else
-        source = dev_project(state, caller)
-        worker = get(state.workers[], source.worker_id, nothing)
-        PeerMessageOrigin(string(uuid4()), source.id, source.title[], source.worker_id,
-            worker === nothing ? source.worker_id : worker.name, now(UTC))
-    end
+    # No caller is the server's trusted local API, acting as the user. All
+    # authenticated MCP callers went through the peer capability check above.
     model = ensure_project_session!(state, p)
     model === nothing && error("could not bring up a chat session for '$(p.id)'")
-    send_message!(model, UserMsg(text); mode = :next, origin)
+    send_message!(model, UserMsg(text); mode = :next)
     result = Dict{String,Any}("ok" => true, "project_id" => p.id, "sent_chars" => length(text))
-    if origin !== nothing
-        result["message_id"] = origin.id
-        result["sent_at"] = message_timestamp(origin.sent_at)
-    end
     return result
 end
 
@@ -954,12 +954,13 @@ Throws by name if there is no such project.
 Writes only on an actual change, so a toggle can be clicked repeatedly without
 rewriting `projects.json` each time.
 
-The caller is responsible for RESTARTING the chat afterwards. `dev_mode` is read
-at session bring-up and nowhere else: `mcp_env` bakes
+The caller restarts the chat to refresh tool discovery. The server also checks
+the live flag on each dev-tool request, so disabling it revokes stale calls
+immediately. `mcp_env` bakes
 `BONITOAGENTS_DEV_TOOLS` into the MCP process's environment when it is spawned,
 and `agents_prompt_appendix` composes the briefing into the system prompt at
-`open_session`. A live session keeps whatever it started with, so flipping the
-flag without a restart changes what is on disk and nothing the agent can see.
+`open_session`. A live session may retain old tool names, but the server still
+refuses their calls immediately when the flag is off.
 """
 function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
     p = dev_project(state, project_id)

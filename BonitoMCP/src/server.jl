@@ -63,6 +63,7 @@ function dispatch!(out, req::AbstractDict)
             "protocolVersion" => PROTOCOL_VERSION,
             "capabilities" => Dict("tools" => Dict("listChanged" => false)),
             "serverInfo" => Dict("name" => SERVER_NAME, "version" => SERVER_VERSION),
+            "instructions" => workflow_instructions(),
         ))
     elseif method == "notifications/initialized"
         # Notification, no response
@@ -90,8 +91,14 @@ function dispatch!(out, req::AbstractDict)
         # `tools/list`. A name that isn't ours goes to the server's apps.
         # Record requestId → env_path for the eval family so a later
         # `notifications/cancelled` can target just this session (M9).
-        track = tool_name in EVAL_TOOL_NAMES
-        track && note_inflight_request!(id, get(args, "env_path", nothing))
+        control = tool_name in ("bt_process","bt_wait")
+        track = tool_name in EVAL_TOOL_NAMES || control
+        if control
+            args["_mcp_request_id"] = id
+            note_inflight_request!(id,"\0bonito-control")
+        elseif track
+            note_inflight_request!(id, get(args, "env_path", nothing))
+        end
         try
             result = call_tool(tool_name, args)
             result === nothing ?
@@ -141,6 +148,19 @@ function handle_cancelled!(req::AbstractDict)
     # evals — never silently fail to stop a runaway computation.
     target_env = rid === nothing ? :unknown :
         @lock SERVER.inflight_lock get(SERVER.inflight, rid, :unknown)
+    if target_env isa String && startswith(target_env,"\0bonito-")
+        # Cancelling a process launch/status/wait call never cancels a job or
+        # unrelated Julia evaluation. Only the explicit job controls do that.
+        if startswith(target_env,"\0bonito-wait:")
+            key = target_env[length("\0bonito-wait:")+1:end]
+            lock(SERVER.waits.lock) do
+                for wake in SERVER.waits.active
+                    string(objectid(wake)) == key && isopen(wake) && close(wake)
+                end
+            end
+        end
+        return nothing
+    end
     n = target_env === :unknown ?
         interrupt_in_flight!(nothing) :
         interrupt_in_flight!(target_env; scope_temp = target_env === nothing)

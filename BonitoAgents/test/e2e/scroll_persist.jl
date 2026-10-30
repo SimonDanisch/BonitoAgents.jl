@@ -82,7 +82,7 @@ function run_suite(server)
             for turn in 1:2
                 TK.send_message(server, "fill 100")
                 @test TK.wait_for(server, "history fill $(turn)",
-                    "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=$(turn*101); })()"; timeout = 40) == true
+                    "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.block.count>=$(turn*101); })()"; timeout = 40) == true
             end
             sleep(0.6)   # let the fill's final scroll-to-bottom chase settle
             # Park off-bottom as a real user scroll would (followMode false);

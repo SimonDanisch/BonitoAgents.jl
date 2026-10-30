@@ -47,12 +47,14 @@ bonito_asset(parts::AbstractString...) =
 
 include("identity.jl")         # User, LocalAuth/ProxyAuth: who is on the other end (the proxy authenticates)
 include("state.jl")            # WorkerInfo, ProjectInfo, ServerState (single source of truth)
+include("job_progress.jl")     # durable job telemetry and its compact chat/sidebar views
 include("tunnel.jl")           # behind a tunnel: the login gate before every route
 include("progress.jl")         # notify_progress + the window's ONE progress card (BusyState)
 include("worker_client.jl")    # probe(...), connect_worker(...) — needs ACP
 include("transport.jl")        # ACP bring-up payload helpers (mcp list, system prompt)
 include("agents.jl")           # WorkerAgent (server-side live agent over the worker WS)
 include("styles.jl")
+include("file_widgets.jl")     # shared file heading and actions on every surface
 include("plotpane.jl")         # PlotPane handle (window-scoped; built by install_workspace!)
 include("taskbar.jl")          # TaskBar component (state-first pin-board)
 include("code_view.jl")        # CodeView / DiffView: read-only code as static DOM, highlighted by Monaco
@@ -67,6 +69,7 @@ include("lens.jl")             # lens search: parse + fuzzy filter + saved lense
 include("mcp_relay.jl")
 include("remote_app.jl")       # eval-result bridge — live worker Bonito results in the browser
 include("eval_runs.jl")        # Julia runs (`r4`): cards that outlive their call, task bar, finish notes
+include("managed_processes.jl") # worker-supervised commands, independent of ACP providers
 include("workspace_stage.jl")  # BonitoWidgets.Workspace stage + app detach controller
 include("persistence.jl")
 include("chat_icons.jl")        # durable, user-controlled chat image identities
@@ -81,6 +84,7 @@ include("file_tree.jl")        # WorkerFileTree — lazy, searchable project fil
 include("sidebar.jl")          # project_sidebar + auto-generated icons
 include("github.jl")           # "From GitHub" project template
 include("dev_api.jl")          # inspection API + the "Debug BonitoAgents" chat
+include("chat_messaging.jl")   # opt-in peer coordination, independent of dev tools
 include("diagnostics.jl")      # timings, browser tabs and their consoles, for the dev tools
 include("apps.jl")             # apps: permanent server parts with a chat, a pane and MCP tools of their own
 include("plugins.jl")          # opt-in app packages discovered from the server environment

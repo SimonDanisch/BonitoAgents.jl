@@ -12,7 +12,8 @@
     TK = S.TK
     ECT = TK.ECT
 
-    s.agent_fn[] = p -> occursin("work", p) ?
+    s.agent_fn[] = p -> occursin("long work", p) ?
+        [TK.delay(20000), TK.text("done working"), TK.end_turn()] : occursin("work", p) ?
         [TK.delay(4000), TK.text("done working"), TK.end_turn()] : [TK.text("ok"), TK.end_turn()]
     # Names that would sort these two apart (a first): the order below is the
     # turns', not the names'.
@@ -25,6 +26,11 @@
     @test TK.wait_for(s, "a answered",
         "[...document.querySelectorAll('.bt-chatpane[aria-hidden=false] .bt-agent-msg')].some(m => m.innerText.trim() === 'ok')";
         timeout = 60) == true
+    older = TK.new_chat(s; cwd = mkpath(joinpath(root, "mmm-groups")))
+    TK.send_message(s, "hello")
+    @test TK.wait_for(s, "older inactive chat answered",
+        "[...document.querySelectorAll('.bt-chatpane[aria-hidden=false] .bt-agent-msg')].some(m => m.innerText.trim() === 'ok')";
+        timeout = 60)
     z = TK.new_chat(s; cwd = mkpath(joinpath(root, "zzz-groups")))
     TK.send_message(s, "hello")
 
@@ -44,10 +50,13 @@
     # entering and leaving the sidebar, which a scripted cursor never does.
     ctx = s.browser[]
     function mouse_to(js)
+        # Navigation restores the sidebar before the lazily mounted chat pane.
+        TK.wait_for(s, "chat ready for pointer input",
+            "!!document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages')"; timeout = 30)
         x, y = round.(Int, TK.eval_js(s, js))
         ECT.send_input(ctx, "{type: 'mouseMove', x: $(x), y: $(y)}")
     end
-    away = "(() => { const r = [...document.querySelectorAll('.bt-messages')].find(e => e.offsetParent).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
+    away = "(() => { const r = document.querySelector('.bt-chatpane[aria-hidden=false] .bt-messages').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
     over = "(() => { const r = $(row(a)).getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; })()"
     mouse_to(away)
 
@@ -100,6 +109,31 @@
 
     # Moved, never rebuilt.
     @test TK.eval_js(s, "$(row(z)) === window.__zRow") == true
+
+    @testset "finishing moves to the top of inactive chats while others keep working" begin
+        open!(z)
+        TK.send_message(s, "long work")
+        @test TK.wait_for(s, "z works", active(z); timeout = 20)
+        open!(a)
+        TK.send_message(s, "work")
+        @test TK.wait_for(s, "both working", "$(active(a)) && $(active(z))"; timeout = 20)
+        mouse_to(away)
+        @test TK.wait_for(s, "a finished and z still works", "!$(active(a)) && $(active(z))"; timeout = 15)
+        @test TK.wait_for(s, "a heads the inactive group",
+            "$(PLACE(z))[0] === 0 && $(PLACE(a))[0] === 1 && $(PLACE(a))[1] === 'Other chats' && " *
+            "$(PLACE(older))[0] === 2"; timeout = 10)
+
+        # A page reload keeps the order and does not make the opened chat newer.
+        TK.navigate(s, "/?pid=$a")
+        @test TK.wait_for(s, "reload keeps active and recent inactive chats first",
+            "!!$(row(a)) && !!$(row(z)) && $(active(z)) && " *
+            "$(PLACE(z))[0] === 0 && $(PLACE(a))[0] === 1"; timeout = 10)
+        mouse_to(away)
+        @test TK.wait_for(s, "z finishes most recently", "!$(active(z))"; timeout = 30)
+        @test TK.wait_for(s, "z becomes the newest inactive chat",
+            "$(PLACE(z))[0] === 0 && $(PLACE(a))[0] === 1 && $(PLACE(older))[0] === 2"; timeout = 10)
+    end
+
     @test isempty(TK.js_errors(s))
     s.agent_fn[] = S.default_agent
 end

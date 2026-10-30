@@ -57,7 +57,7 @@ const DEVMODE_ON = """(!!$(DEVMODE_BTN)?.classList.contains('bt-cap-on'))"""
 # Open the visible pane's ⋯ menu and click the item with `cls`: what a user does.
 click_menu_item(server, cls) = TK.eval_js(server, """(() => {
     const p = $(VISIBLE_PANE);
-    const t = p && p.querySelector('.bt-header-menu .bt-menu-trigger');
+    const t = p && p.querySelector('.bt-header-menu .bw-menu-trigger');
     const b = p && p.querySelector($(repr(cls)));
     if (!t || !b) return false;
     t.click(); b.click(); return true; })()""")
@@ -129,7 +129,7 @@ function run_suite(server)
             @test TK.wait_for(server, "the debug chat reads ON", DEVMODE_ON; timeout = 60) == true
             @test TK.eval_js(server, DEVMODE_LABEL) == "Dev mode"
             @test TK.eval_js(server,
-                "!!$(VISIBLE_PANE)?.querySelector('.bt-menu-trigger.bt-menu-trigger-danger')") === true
+                "!!$(VISIBLE_PANE)?.querySelector('.bw-menu-trigger.bt-menu-trigger-danger')") === true
 
             # An ordinary chat starts OFF, and the same control is present there:
             # granting dev mode by hand is exactly what this item adds.
@@ -137,7 +137,7 @@ function run_suite(server)
             @test TK.wait_for(server, "the ordinary chat reads OFF",
                 "$(DEVMODE_LABEL) === 'Dev mode' && !$(DEVMODE_ON)"; timeout = 60) == true
             @test TK.eval_js(server,
-                "!!$(VISIBLE_PANE)?.querySelector('.bt-menu-trigger.bt-menu-trigger-danger')") === false
+                "!!$(VISIBLE_PANE)?.querySelector('.bw-menu-trigger.bt-menu-trigger-danger')") === false
 
             # Declining the confirm must leave it OFF. This is the assertion the
             # whole gate exists for — the tools it hands out can drive every chat

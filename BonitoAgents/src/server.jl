@@ -496,15 +496,20 @@ function add_download_routes!(srv::Bonito.Server, state::ServerState)
     end)
 end
 
-# These URLs depend only on persisted worker identity, path, and the server's
+# URL signatures depend only on persisted worker identity, path, and the server's
 # URL key. Signing limits access to files exposed by the UI, including bt_show
 # files outside the project tree. No browser/eval session owns or unregisters them.
 worker_file_token(state::ServerState, worker_id::String, path::String) =
     bytes2hex(SHA.hmac_sha256(state.url_key, codeunits(JSON.json([worker_id, path]))))
 
-function worker_file_url(state::ServerState, worker_id::String, path::String)
+function worker_file_url(state::ServerState, worker_id::String, path::String; fresh::Bool = false)
     token = worker_file_token(state, worker_id, path)
-    return "/worker-file/$(HTTP.escapeuri(worker_id))?path=$(HTTP.escapeuri(path))&token=$token"
+    url = "/worker-file/$(HTTP.escapeuri(worker_id))?path=$(HTTP.escapeuri(path))&token=$token"
+    # An already displayed <img> lets Chromium reuse decoded pixels for the
+    # same URL without any HTTP revalidation, even with Cache-Control:no-cache.
+    # New previews need a new request identity. The signature remains tied to
+    # worker/path, so old links survive session teardown and range reads work.
+    return fresh ? url * "&view=$(uuid4())" : url
 end
 
 # A worker from before range reads cannot stream a file, and a file is never

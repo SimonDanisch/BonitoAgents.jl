@@ -124,7 +124,7 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
             isempty(s.meta) ? DOM.span() : DOM.div(s.meta; class = "bt-session-meta");
             class = "bt-session-info"),
         DOM.div(btn_label;
-            class   = "bt-btn bt-btn-secondary",
+            class   = "bw-btn bw-btn-secondary",
             style   = Styles("cursor" => "pointer", "flex-shrink" => "0"),
             # The delegated listener reads these three to construct the
             # `notify(...)` payload. `js_path` normalises backslashes (Windows

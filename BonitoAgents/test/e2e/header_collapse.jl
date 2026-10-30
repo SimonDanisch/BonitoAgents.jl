@@ -90,14 +90,14 @@ panel_geometry_ok(s) = TK.eval_js(s, """(() => {
 flat_menu_ok(s) = TK.eval_js(s, """(() => {
     const p = $(PANE);
     const men  = p && p.querySelector('.bt-header-menu');
-    const list = men && men.querySelector('.bt-menu-list');
+    const list = men && men.querySelector('.bw-menu-list');
     const acts = p && p.querySelector('.bt-header-actions');
     if (!list || !acts) return 'missing-el';
-    if (men.classList.contains('bt-menu-open')) return 'popover-state';
+    if (men.classList.contains('bw-menu-open')) return 'popover-state';
     if (getComputedStyle(list).position !== 'static') return 'list-not-in-flow';
     const l = list.getBoundingClientRect(), a = acts.getBoundingClientRect();
     if (l.top < a.top - 1 || l.bottom > a.bottom + 1) return 'list-outside-panel';
-    const items = [...list.querySelectorAll('.bt-menu-item')].filter(b => b.offsetParent !== null);
+    const items = [...list.querySelectorAll('.bw-menu-item')].filter(b => b.offsetParent !== null);
     if (items.length < 3) return 'too-few-items:' + items.length;
     for (const b of items) {
         const r = b.getBoundingClientRect();
@@ -177,7 +177,7 @@ end
 # header?
 menu_intact(s) = TK.eval_js(s, """(() => {
     const p = $(PANE);
-    const b = p && p.querySelector('.bt-header-menu .bt-menu-trigger');
+    const b = p && p.querySelector('.bt-header-menu .bw-menu-trigger');
     const hdr = p && p.querySelector('.bt-header');
     if (!b || !hdr) return 'missing';
     const r = b.getBoundingClientRect(), h = hdr.getBoundingClientRect();
@@ -238,7 +238,7 @@ function run_suite(server)
             @test visible(s, ".bt-header-menu")
             # No menu inside the menu: the panel shows the actions themselves,
             # not a second ⋯ button that would open a popover over it.
-            @test !visible(s, ".bt-header-menu .bt-menu-trigger")
+            @test !visible(s, ".bt-header-menu .bw-menu-trigger")
             @test visible(s, ".bt-header-menu .bt-header-review")
             @test visible(s, ".bt-header-menu .bt-header-restart")
             @test flat_menu_ok(s) == "ok"
@@ -283,8 +283,8 @@ function run_suite(server)
             @test visible(s, ".bt-lens-bar")
             @test visible(s, ".bt-header-env")
             # …and the actions menu is a popover again: trigger shown, list not.
-            @test visible(s, ".bt-header-menu .bt-menu-trigger")
-            @test !visible(s, ".bt-header-menu .bt-menu-list")
+            @test visible(s, ".bt-header-menu .bw-menu-trigger")
+            @test !visible(s, ".bt-header-menu .bw-menu-list")
         finally
             TK.set_window_size(s, 1280, 820)
         end

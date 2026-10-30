@@ -53,7 +53,7 @@ function run_suite(server)
         # Keep the deadline under the shared runner, including after another
         # test navigates/reloads the page; hidden chats must not supply it.
         @test TK.wait_for(server, "browser totalCount",
-            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.totalCount>=502; })()"; timeout = 20) == true
+            "(() => { const c=document.querySelector('.bt-messages'); return c&&c.__bt_chat&&c.__bt_chat.block.count>=502; })()"; timeout = 20) == true
     end
     return server
 end

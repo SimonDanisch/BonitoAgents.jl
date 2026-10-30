@@ -225,9 +225,12 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     meta = get(caps, "_meta", Dict{String,Any}())
     a.client.session_result["bonitoPromptQueueing"] =
         get(get(meta, "claudeCode", Dict{String,Any}()), "promptQueueing", false) === true
+    a.client.session_result["bonitoPromptReceipts"] = get(meta, "promptReceipts", false) === true
     steering = get(get(ACP._result_dict(init), "_meta", Dict{String,Any}()), "steering", Dict{String,Any}())
+    a.client.session_result["bonitoSteeringIdleBehavior"] = get(steering, "idleBehavior", "")
     a.client.session_result["bonitoActiveSteering"] =
-        get(steering, "supported", false) === true && get(steering, "activeOnly", false) === true
+        get(steering, "supported", false) === true &&
+        (get(steering, "activeOnly", false) === true || get(steering, "idleBehavior", "") == "promptRequired")
     a.replay = msgs
     return a
     finally

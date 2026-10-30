@@ -73,6 +73,19 @@ let cell(i) = """{"cell_type":"code","execution_count":$i,"metadata":{},"source"
     write(joinpath(VIEW_CWD, "long.ipynb"),
           """{"nbformat":4,"nbformat_minor":5,"metadata":{},"cells":[$(join(cell.(1:30), ","))]}""")
 end
+# Saved notebook outputs use the same reader as BonitoBook's runnable import.
+# Cover string and line-array sources and outputs, including an actual image.
+write(joinpath(VIEW_CWD, "saved.ipynb"), TK.json(Dict(
+    "metadata" => Dict("kernelspec" => Dict("language" => "python")),
+    "cells" => [
+        Dict("cell_type" => "markdown", "source" => "# Saved notebook"),
+        Dict("cell_type" => "code", "source" => ["print('saved')\n", "42"], "outputs" => [
+            Dict("output_type" => "stream", "text" => ["saved stdout\n", "second line"]),
+            Dict("output_type" => "execute_result", "data" => Dict("text/plain" => "42")),
+            Dict("output_type" => "display_data", "data" => Dict("image/png" => base64encode(PNG_BYTES))),
+            Dict("output_type" => "error", "traceback" => ["Traceback", "ValueError: saved failure"]),
+        ]),
+    ])))
 # A unit square as two triangles — the mesh viewer must report exactly this.
 write(joinpath(VIEW_CWD, "square.obj"),
       "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n")
@@ -263,6 +276,23 @@ function run_suite(server)
                 return nb.scrollHeight > nb.clientHeight + 200 &&
                     cells.every(c => c.scrollHeight <= c.clientHeight + 1);
             })()""") === true
+        end
+
+        @testset "a saved notebook shows markdown, code and existing outputs" begin
+            TK.eval_js(server, open_file("saved.ipynb"))
+            @test TK.wait_for(server, "saved notebook outputs", """(() => {
+                const nb = document.querySelector('$(view_sel("saved.ipynb")) .bt-fv-notebook');
+                if (!nb) return false;
+                const img = nb.querySelector('.bt-fv-nb-image');
+                const output = nb.querySelector('.bt-fv-nb-outputs');
+                return nb.querySelector('h1')?.textContent === 'Saved notebook' &&
+                    nb.querySelector('.bt-fv-nb-source')?.textContent.includes("print('saved')") &&
+                    output?.textContent.includes('saved stdout\\nsecond line') &&
+                    output.textContent.includes('42') &&
+                    output.textContent.includes('ValueError: saved failure') &&
+                    img?.complete && img.naturalWidth === 1;
+            })()"""; timeout = 40) == true
+            TK.screenshot(server, joinpath(tempdir(), "bonitoagents-saved-notebook.png"))
         end
 
         @testset "a csv opens as a sortable table" begin

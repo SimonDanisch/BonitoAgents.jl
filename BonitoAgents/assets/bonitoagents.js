@@ -552,7 +552,9 @@ function showLoading(body, shape) {
 }
 
 class BonitoChat {
-    constructor(container, comm, init = {}) {
+    // `RowBlock`: the endless-list engine (BonitoWidgets' row_block.js), handed
+    // in by the page so both packages run the same copy.
+    constructor(container, comm, init = {}, RowBlock) {
         this.container = container;
         this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
         this.workspacePanel = container.closest('.bw-ws-panel');
@@ -569,99 +571,62 @@ class BonitoChat {
         this.destroyed = false;
 
         // ── The loaded block ─────────────────────────────────────────────
-        // The transcript holds ONE contiguous block of messages: positions
-        // [plo, phi] of the current sequence (every store index, or the lens
-        // matches under a lens, `seq`), all of them in the DOM in order
-        // between the two marker divs. Nothing outside the block is in the
-        // page, and nothing is estimated: the scroll container is exactly as
-        // tall as what it shows. Scrolling near an end of the block loads the
-        // next CHUNK on that side (`ensureWindow`), a block grown past
-        // MAX_WINDOW drops rows on the side away from the viewport, and the
-        // rail (`setupRail`) shows where the block sits in the conversation.
-        this.cache    = new Map();  // idx (0-based) → DOMNode, the block's rows only
+        // The transcript is a `RowBlock` (BonitoWidgets, row_block.js): ONE
+        // contiguous block of messages, positions [plo, phi] of the current
+        // sequence (every store index, or the lens matches under a lens, its
+        // `seq`), all of them in the DOM in order between the two marker
+        // divs. Nothing outside the block is in the page, and nothing is
+        // estimated: the scroll container is exactly as tall as what it shows.
+        // Scrolling near an end of the block loads the next chunk on that side
+        // (`ensureWindow`), a block grown past its window drops rows on the
+        // side away from the viewport, and the rail (`setupRail`) shows where
+        // the block sits in the conversation. What is chat here plugs in as
+        // hooks: rows built from message dicts, lazy tool bodies, live apps,
+        // follow mode and the rail.
         // Tool id → expanded, as the reader last left it. A row the block
         // drops is built again from its data when the reader comes back, and
         // comes back the way they left it.
         this.expandState = new Map();
-        this.order    = [];         // the block's store indices, ascending (= DOM order)
         this.nodeById = new Map();  // msg_id → DOMNode  (for streaming updates)
-        this.totalCount = 0;
-        this.seq      = null;       // lens matches (store indices, ascending); null = all
-        this.plo      = 0;          // block = sequence positions [plo, phi]
-        this.phi      = -1;
-        this.CHUNK      = 40;       // rows per load at an end of the block
-        this.MAX_WINDOW = 160;      // rows kept before the far side is dropped
-        this.reqSeq   = 0;
-        this.pending  = {};         // kind ('older' | 'newer' | 'block') → in-flight request
-        // Bumped whenever the block is replaced or the server SPLICED history
-        // (msgs.reload: every index shifted). Every msgs.request carries it
-        // and the server echoes it on msgs.range, so a reply for a block that
-        // is gone is dropped instead of placed among the wrong rows.
-        this.epoch        = 0;
         this.STREAM_APPLY_MS = 100; // min interval between streaming innerHTML applies
-
-        // ONE ResizeObserver over the block's rows, for two jobs. A row ABOVE
-        // the viewport that changes height (an image or editor reaching its
-        // real size, a body mounting) would move everything the reader sees
-        // by the difference: the scroll position absorbs it here, before the
-        // frame paints. And in follow mode any growth chases the bottom: an
-        // image reaching its height after the last message has no chunk
-        // coming to chase it. Heights are the fractional BORDER BOX,
-        // recorded at adoption (`adoptRows`).
-        this.rowObserver = new ResizeObserver((entries) => {
-            if (this.destroyed) return;
-            // A hidden pane (display:none on a chat switch) reports every row
-            // at 0. That is no change of the content: skip it, keeping the
-            // heights the rows really have, so showing the pane again (which
-            // reports those same heights) reads as no change either.
-            // `onShown` restores the reading position.
-            const c = this.container;
-            if (!this.paneVisible || c.clientHeight === 0) return;
-            const st = c.scrollTop;
-            const sb = st + c.clientHeight;
-            const last = this.cache.get(this.order[this.order.length - 1]);
-            // In page order, so each row's place BEFORE this batch is its place
-            // now minus what the changed rows above it grew by (`shift`).
-            const rows = entries.map(e => [e.target, (e.borderBoxSize && e.borderBoxSize.length)
-                    ? e.borderBoxSize[0].blockSize : e.target.offsetHeight])
-                .sort(([a], [b]) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
-            let above = 0;
-            let shift = 0;
-            let grew = false;
-            for (const [node, h] of rows) {
-                const prev = node.__btH;
-                node.__btH = h;
-                if (prev === undefined || prev === h) continue;
-                grew = true;
+        this.rowsEnd = container.querySelector('.bt-rows-end');   // rows go before it
+        this.block = new RowBlock(container, {
+            before: this.rowsEnd, chunk: 40, window: 160, start: 'bottom', count: 0,
+        }, {
+            // Every msgs.request carries the block's epoch and the server
+            // echoes it on msgs.range: a reply for a block that is gone (or
+            // for history the server SPLICED since, msgs.reload) is dropped.
+            request: (msg) => this.comm.notify({ type: 'msgs.request', ...msg }),
+            makeRow: (idx, data) => this.makeRow(idx, data),
+            adopt: (nodes) => this.adoptRows(nodes),
+            remove: (idx, node) => this.forgetRow(idx, node),
+            // A row held fullscreen stays.
+            mayDrop: (node) => !this.holdsFullscreen(node),
+            placed: (req) => this.onPlaced(req),
+            appended: () => { if (this.followMode) this.queueScrollToBottom(); },
+            wrote: () => { this.prevScrollTop = this.container.scrollTop; },
+            visible: () => this.paneVisible && !this.destroyed,
+            frozen: () => !!this.railDrag,
+            // In follow mode any growth chases the bottom: an image reaching
+            // its height after the last message has no chunk coming to chase it.
+            following: () => this.followMode,
+            resized: (node) => {
                 if (node.collapsable && node.classList.contains('bt-tool-msg')) {
                     this.scheduleBodyReport(node);
                     this.onBodyMounted(node);        // a body built far away
                 }
-                const top = node.offsetTop - shift;
-                shift += h - prev;
-                if (node.offsetParent === null) continue;   // no box, no place
-                // The reader keeps the first row that STARTS in the viewport
-                // where it is, so every row starting above it absorbs its
-                // change: one entirely above, and one reaching in from above
-                // (the sliver of a video row over the message being read).
-                // A row covering the whole viewport, or the last one, is
-                // what is read, and keeps its own top instead.
-                if (top < st - 1 && (top + prev <= st + 1 || (top + prev < sb && node !== last))) {
-                    above += h - prev;
-                }
-            }
-            if (above !== 0 && !this.followMode && !this.railDrag) {
-                c.scrollTop = st + above;
-                this.prevScrollTop = c.scrollTop;
-            }
-            if (grew && this.followMode) this.queueScrollToBottom();
-            // The thumb follows what is painted. This frame's scroll handler
-            // placed it with the new heights laid out but not yet corrected for
-            // (a row above the reader), or with the read row's old height, and
-            // the next scroll event comes a frame late: placed only then, the
-            // thumb jumped back and forth for a frame at every row that changed.
-            // Observers run before paint, so placing it here shows it right.
-            if (grew) this.updateRail();
+            },
+            afterResize: (grew) => {
+                if (grew && this.followMode) this.queueScrollToBottom();
+                // The thumb follows what is painted. A scroll handler places it
+                // with the new heights laid out but not yet corrected for, and
+                // the next scroll event comes a frame late: placed only then,
+                // the thumb jumped back and forth for a frame at every row that
+                // changed. Observers run before paint, so placing it here shows
+                // it right.
+                if (grew) this.updateRail();
+            },
+            changed: () => this.updateRail(),
         });
 
         // ── Live-app keep-alive ──────────────────────────────────────────
@@ -756,7 +721,6 @@ class BonitoChat {
         // onShown's restore, the lens reset, and the pan/momentum writes.
         this.prevScrollTop = container.scrollTop;
 
-        this.rowsEnd = container.querySelector('.bt-rows-end');   // rows go before it
         // ── Filter / lens state ────────────────────────────────────────
         // The per-tool filter toolbar is GONE — the header lens bar
         // (`setupLens`) replaces it. `keyByIdx` drives the type filter; the
@@ -1276,7 +1240,7 @@ class BonitoChat {
         if (this.viewportObserver) {
             this.viewportObserver.disconnect();
         }
-        if (this.rowObserver) this.rowObserver.disconnect();
+        this.block.destroy();
         if (this.appObserver) this.appObserver.disconnect();
         if (this.freeObserver) this.freeObserver.disconnect();
         if (this.mountObserver) this.mountObserver.disconnect();
@@ -1354,8 +1318,8 @@ class BonitoChat {
         // Track incrementally-arriving counts: every message-creation event
         // includes `n`, the new total. We avoid a separate `msgs.count`
         // broadcast for the steady-state stream.
-        if (typeof msg.n === 'number' && msg.n > this.totalCount) {
-            this.totalCount = msg.n;
+        if (typeof msg.n === 'number' && msg.n > this.block.count) {
+            this.block.count = msg.n;
         }
         // The model's output, or the turn's end, ends a thinking estimate
         // (`onThinkingTokens`).
@@ -1427,44 +1391,42 @@ class BonitoChat {
     // ── The loaded block ──────────────────────────────────────────────────
     // (The model is described in the constructor.)
 
-    // Positions run over every store index, or over the lens matches while a
-    // lens is on (`seq`).
-    seqLength() { return this.seq ? this.seq.length : this.totalCount; }
-    seqIndex(p) { return this.seq ? this.seq[p] : p; }
-    // Position of store index `idx` in the sequence, or -1.
-    seqPos(idx) {
-        if (!this.seq) return (idx >= 0 && idx < this.totalCount) ? idx : -1;
-        let lo = 0, hi = this.seq.length - 1;
-        while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            const v = this.seq[mid];
-            if (v === idx) return mid;
-            if (v < idx) lo = mid + 1; else hi = mid - 1;
-        }
-        return -1;
-    }
-    blockEmpty() { return this.phi < this.plo; }
+    // The sequence and the block live in `this.block` (RowBlock); these are
+    // the names the chat reads them by. Positions run over every store index,
+    // or over the lens matches while a lens is on.
+    seqLength() { return this.block.seqLength(); }
+    seqPos(idx) { return this.block.seqPos(idx); }
     // Does the block end at the last message of the sequence?
-    atTail() { return this.phi === this.seqLength() - 1; }
+    atTail() { return this.block.atTail(); }
+    ensureWindow() { if (!this.destroyed) this.block.ensureWindow(); }
+    // The bottom of the conversation, as a fresh block.
+    loadTail() { this.block.loadStart(); }
+    // The reading position (`RowBlock.captureAnchor`), skipping rows of
+    // `excludeKey`: a type about to be hidden.
+    captureAnchor(excludeKey = null) {
+        return this.block.captureAnchor(excludeKey ? (n => n.dataset.filterKey === excludeKey) : null);
+    }
+    restoreAnchor(a) { this.block.restoreAnchor(a); }
+    syncRowHeights() { this.block.syncRowHeights(); }
 
     // The tail the pane was rendered with ({n, start, msgs}, see the
     // server's `transcript_tail`).
     applyTail(tail) {
-        this.totalCount = Math.max(this.totalCount, tail.n);
+        this.block.count = Math.max(this.block.count, tail.n);
         if (tail.n === 0) { this.markReady(); this.updateRail(); return; }
         const items = (tail.msgs || []).map((m, i) => [tail.start + i, m]);
-        this.replaceBlock(items, { kind: 'tail' });
+        this.block.replaceBlock(items, { kind: 'tail' });
     }
 
     // The count, as `init` and the server's resyncs report it. Growth means
     // more at the end: fetched when the block reaches the end. A count that
     // SHRANK means the indices moved: start over.
     applyCount(n) {
-        if (n < this.totalCount) { this.onMsgsReload(n); return; }
-        this.totalCount = n;
+        if (n < this.block.count) { this.onMsgsReload(n); return; }
+        this.block.count = n;
         if (n === 0) { this.markReady(); this.updateRail(); return; }
-        if (this.blockEmpty()) {
-            if (!this.pending.block) this.loadTail();
+        if (this.block.blockEmpty()) {
+            if (!this.block.pending.block) this.loadTail();
             return;
         }
         this.ensureWindow();
@@ -1476,67 +1438,27 @@ class BonitoChat {
     // the newest messages are what a sync is for. A lens's matches are
     // indices too, so its query runs again.
     onMsgsReload(n) {
-        this.totalCount = n;
-        this.seq = null;
+        this.block.count = n;
+        this.block.seq = null;
         if (this.lensActive) this.runLens(this.lensQuery);
-        this.clearBlock();
+        this.block.clearBlock();
         this.setFollowMode(true);
         this.unreadCount = 0;
         this.loadTail();
     }
 
-    loadTail() {
-        const len = this.seqLength();
-        if (len === 0) {
-            this.clearBlock();
-            this.markReady();
-            this.updateRail();
-            return;
-        }
-        this.requestBlock(Math.max(0, len - this.CHUNK), len - 1, { kind: 'tail' });
-    }
-
-    // Ask for a whole new block, positions [pa, pb]. `opts.kind` says where
-    // the view goes when it lands: 'tail' the bottom; 'jump' position
-    // `opts.target` near the top; 'lens' the top; 'restore' store index
-    // `opts.idx` back at viewport offset `opts.off`.
-    requestBlock(pa, pb, opts) {
-        this.epoch++;            // replies for the old block are dead
-        this.pending = {};
-        this.request('block', pa, pb, opts);
-    }
-
-    request(slot, pa, pb, opts = {}) {
-        if (pa > pb) return;
-        const id = ++this.reqSeq;
-        this.pending[slot] = { ...opts, id, slot, pa, pb };
-        const msg = { type: 'msgs.request', epoch: this.epoch, req: id };
-        if (this.seq) msg.indices = this.seq.slice(pa, pb + 1);
-        else msg.range = [pa, pb];
-        this.comm.notify(msg);
-    }
-
+    // The server's `msgs.range` reply, for the block.
     onRange(msg) {
-        if (msg.epoch !== undefined && msg.epoch !== null && msg.epoch !== this.epoch) return;
-        const req = Object.values(this.pending).find(r => r.id === msg.req);
-        if (!req) return;                     // superseded
-        delete this.pending[req.slot];
-        const msgs = msg.msgs ?? [];
-        const items = Array.isArray(msg.indices)
-            ? msg.indices.map((idx, i) => [idx, msgs[i]])
-            : msgs.map((m, i) => [msg.start + i, m]);
-        if (req.slot === 'older') this.prependItems(items);
-        else if (req.slot === 'newer') this.appendItems(items);
-        else this.replaceBlock(items, req);
-        this.ensureWindow();
+        this.block.onRange({ epoch: msg.epoch, req: msg.req, start: msg.start,
+                             indices: msg.indices, items: msg.msgs });
     }
 
-    // A row for store index `idx` from its wire dict. Not yet in the page.
+    // The block's `makeRow`: a row for store index `idx` from its wire dict.
+    // Not yet in the page.
     makeRow(idx, data) {
         const node = this.createNode(data);
         node.__btIdx = idx;
         node.__btId = data.id;
-        this.cache.set(idx, node);
         this.keyByIdx.set(idx, filterKey(data));
         if (data.id) this.nodeById.set(data.id, node);
         this.applyVisibility(idx, node);
@@ -1546,12 +1468,9 @@ class BonitoChat {
         return node;
     }
 
-    // New rows are in the page: mount what waited for a document, then
-    // record the height each row has now and watch it. Recording here, not
-    // on the observer's first report, matters: a body arriving before the
-    // next frame (a bt_show video expanding) would otherwise be that first
-    // report, recorded as the start and never compensated. A row without a
-    // box (hidden pane, filtered type) records on its first report instead.
+    // The block's `adopt`: new rows are in the page. Mount what waited for a
+    // document (before the block measures them: what mounting expands is part
+    // of the row), and watch tool bodies and live apps.
     adoptRows(nodes) {
         for (const node of nodes) {
             this.mountDeferred(node);
@@ -1560,8 +1479,6 @@ class BonitoChat {
             }
         }
         for (const node of nodes) {
-            if (node.offsetParent !== null) node.__btH = node.getBoundingClientRect().height;
-            this.rowObserver.observe(node);
             if (node.classList.contains('bt-tool-msg')) {
                 this.freeObserver.observe(node);
                 this.mountObserver.observe(node);
@@ -1573,10 +1490,8 @@ class BonitoChat {
         }
     }
 
-    removeRow(idx) {
-        const node = this.cache.get(idx);
-        if (!node) return;
-        this.rowObserver.unobserve(node);
+    // The block's `remove`: a row is about to leave the page.
+    forgetRow(idx, node) {
         this.freeObserver.unobserve(node);
         this.mountObserver.unobserve(node);
         clearTimeout(node.__btBodyTimer);
@@ -1587,178 +1502,20 @@ class BonitoChat {
             if (li !== -1) this.appLru.splice(li, 1);
         }
         if (node.__btId && this.nodeById.get(node.__btId) === node) this.nodeById.delete(node.__btId);
-        this.cache.delete(idx);
         this.keyByIdx.delete(idx);
         this.clearPendingStream(node);
-        node.remove();
     }
 
-    clearBlock() {
-        for (const idx of this.order) this.removeRow(idx);
-        this.order = [];
-        this.plo = 0;
-        this.phi = -1;
-    }
-
-    // Insert `items` ([[idx, dict], ...], ascending) as rows before `before`.
-    insertRows(items, before) {
-        const frag = document.createDocumentFragment();
-        const nodes = [];
-        for (const [idx, data] of items) {
-            const node = this.makeRow(idx, data);
-            frag.appendChild(node);
-            nodes.push(node);
+    // The block's `placed`: a new block is in and the view placed. At the tail
+    // the chat follows the bottom; anywhere else the reader is reading.
+    onPlaced(req) {
+        if (req.kind !== 'empty') {
+            this.setFollowMode(req.kind === 'tail');
+            if (req.kind === 'jump' && req.flashId) this.flash(req.flashId);
+            this.prevScrollTop = this.container.scrollTop;
+            this.updateScrollAffordance(this.atBottom());
         }
-        this.container.insertBefore(frag, before);
-        return nodes;
-    }
-
-    replaceBlock(items, req) {
-        this.clearBlock();
-        const rows = items.filter(([, d]) => d != null);
-        const nodes = this.insertRows(rows, this.rowsEnd);
-        this.order = rows.map(([idx]) => idx);
-        if (this.order.length) {
-            this.plo = this.seqPos(this.order[0]);
-            this.phi = this.seqPos(this.order[this.order.length - 1]);
-        }
-        this.adoptRows(nodes);
-        this.placeView(req);
         this.markReady();
-    }
-
-    // Older rows, above the block. Everything new is above the reader, so
-    // the scroll position grows by exactly what was inserted.
-    prependItems(items) {
-        const rows = items.filter(([idx, d]) => d != null && !this.cache.has(idx));
-        if (rows.length === 0) return;
-        if (this.seqPos(rows[rows.length - 1][0]) !== this.plo - 1) return;   // block moved on
-        const c = this.container;
-        const before = c.scrollHeight;
-        const top = c.scrollTop;
-        const first = this.cache.get(this.order[0]) || this.rowsEnd;
-        const nodes = this.insertRows(rows, first);
-        this.order = rows.map(([idx]) => idx).concat(this.order);
-        this.plo = this.seqPos(rows[0][0]);
-        // Adopted first: what mounting expands is part of what was inserted.
-        this.adoptRows(nodes);
-        const grown = c.scrollHeight - before;
-        if (grown !== 0 && !this.railDrag) {
-            c.scrollTop = top + grown;
-            this.prevScrollTop = c.scrollTop;
-        }
-    }
-
-    // Newer rows, below the block. Rows that streamed in meanwhile are
-    // already there and skipped.
-    appendItems(items) {
-        const rows = items.filter(([idx, d]) => d != null && !this.cache.has(idx));
-        if (rows.length === 0) return;
-        if (this.seqPos(rows[0][0]) !== this.phi + 1) return;   // block moved on
-        const nodes = this.insertRows(rows, this.rowsEnd);
-        this.order = this.order.concat(rows.map(([idx]) => idx));
-        this.phi = this.seqPos(rows[rows.length - 1][0]);
-        this.adoptRows(nodes);
-        if (this.followMode) this.queueScrollToBottom();
-    }
-
-    // Where the view goes once a new block is in (see `requestBlock`).
-    placeView(req) {
-        const c = this.container;
-        const kind = req.kind || 'tail';
-        if (kind === 'tail') {
-            this.setFollowMode(true);
-            c.scrollTop = c.scrollHeight;
-        } else if (kind === 'lens') {
-            this.setFollowMode(false);
-            c.scrollTop = 0;
-        } else if (kind === 'restore') {
-            this.setFollowMode(false);
-            this.restoreAnchor({ idx: req.idx, off: req.off });
-        } else if (kind === 'jump') {
-            this.setFollowMode(false);
-            const node = this.cache.get(this.seqIndex(req.target));
-            if (node && node.offsetParent !== null) {
-                c.scrollTop = Math.max(0, node.offsetTop - (req.offset ?? 8));
-            }
-            if (req.flashId) this.flash(req.flashId);
-        }
-        this.prevScrollTop = c.scrollTop;
-        this.updateScrollAffordance(this.atBottom());
-    }
-
-    // Load more at whichever end of the block the viewport is near, and
-    // keep the block bounded. Runs on every scroll and after every insert,
-    // so it stops by itself once the viewport is a margin away from both ends.
-    ensureWindow() {
-        if (this.destroyed) return;
-        const c = this.container;
-        if (!this.paneVisible || this.railDrag || c.clientHeight === 0) { this.updateRail(); return; }
-        const len = this.seqLength();
-        if (this.pending.block || len === 0) { this.updateRail(); return; }
-        if (this.blockEmpty()) { this.loadTail(); return; }
-        const margin = Math.max(800, 2 * c.clientHeight);
-        if (this.plo > 0 && !this.pending.older && c.scrollTop < margin) {
-            this.request('older', Math.max(0, this.plo - this.CHUNK), this.plo - 1);
-        }
-        if (this.phi < len - 1 && !this.pending.newer &&
-            c.scrollHeight - c.scrollTop - c.clientHeight < margin) {
-            this.request('newer', this.phi + 1, Math.min(len - 1, this.phi + this.CHUNK));
-        }
-        this.trimBlock();
-        this.updateRail();
-    }
-
-    // Rows of the block whose box meets the viewport, as positions in
-    // `order`: [first, last], or [-1, -1]. Hidden rows have no box.
-    visibleSpan() {
-        const st = this.container.scrollTop;
-        const sb = st + this.container.clientHeight;
-        let first = -1, last = -1;
-        for (let i = 0; i < this.order.length; i++) {
-            const node = this.cache.get(this.order[i]);
-            if (!node || node.offsetParent === null) continue;
-            const top = node.offsetTop;
-            if (top + node.offsetHeight <= st + 1) continue;
-            if (top >= sb) break;
-            if (first < 0) first = i;
-            last = i;
-        }
-        return [first, last];
-    }
-
-    // Keep the block at MAX_WINDOW rows: past that, drop rows on the side
-    // farther from the viewport, down to MAX_WINDOW - CHUNK, leaving half a
-    // chunk beyond the viewport on that side. Rows dropped above the reader
-    // take the scroll position down with them. A row held fullscreen stays.
-    trimBlock() {
-        const n = this.order.length;
-        if (n <= this.MAX_WINDOW) return;
-        const [first, last] = this.visibleSpan();
-        if (first < 0) return;
-        const c = this.container;
-        const excess = n - (this.MAX_WINDOW - this.CHUNK);
-        const keepBeyond = Math.floor(this.CHUNK / 2);
-        const above = first, below = n - 1 - last;
-        const holds = (ids) => ids.some(idx => this.holdsFullscreen(this.cache.get(idx)));
-        if (above >= below) {
-            const d = Math.min(excess, above - keepBeyond);
-            if (d <= 0 || holds(this.order.slice(0, d))) return;
-            const before = c.scrollHeight;
-            const top = c.scrollTop;
-            for (const idx of this.order.splice(0, d)) this.removeRow(idx);
-            this.plo = this.seqPos(this.order[0]);
-            const shrunk = before - c.scrollHeight;
-            if (shrunk !== 0) {
-                c.scrollTop = top - shrunk;
-                this.prevScrollTop = c.scrollTop;
-            }
-        } else {
-            const d = Math.min(excess, below - keepBeyond);
-            if (d <= 0 || holds(this.order.slice(n - d))) return;
-            for (const idx of this.order.splice(n - d)) this.removeRow(idx);
-            this.phi = this.seqPos(this.order[this.order.length - 1]);
-        }
     }
 
     // Go to sequence position `p`: scrolled into view when the block has
@@ -1775,17 +1532,17 @@ class BonitoChat {
             return;
         }
         this.setFollowMode(false);
-        const node = this.cache.get(this.seqIndex(p));
-        if (node && p >= this.plo && p <= this.phi && node.offsetParent !== null) {
+        const node = this.block.nodeAt(p);
+        if (node && node.offsetParent !== null) {
             this.container.scrollTop = Math.max(0, node.offsetTop - offset);
             this.prevScrollTop = this.container.scrollTop;
             if (flashId) this.flash(flashId);
             this.ensureWindow();
             return;
         }
-        const back = Math.floor(this.CHUNK / 2);
-        this.requestBlock(Math.max(0, p - back), Math.min(len - 1, p + this.CHUNK),
-                          { kind: 'jump', target: p, offset, flashId });
+        const back = Math.floor(this.block.CHUNK / 2);
+        this.block.requestBlock(Math.max(0, p - back), Math.min(len - 1, p + this.block.CHUNK),
+                                { kind: 'jump', target: p, offset, flashId });
     }
 
     flash(id) {
@@ -1812,49 +1569,9 @@ class BonitoChat {
         window.dispatchEvent(new CustomEvent(name, { detail: pid }));
     }
 
-    // THE one owner of a row's `display`: the type filter (hiddenTypes)
-    // hides rows in place. The lens does not hide rows; it chooses which
-    // rows the block holds.
-    applyVisibility(idx, node = this.cache.get(idx)) {
+    applyVisibility(idx, node = this.block.cache.get(idx)) {
         if (!node) return;
         node.style.display = this.hiddenTypes.has(this.keyByIdx.get(idx)) ? 'none' : '';
-    }
-
-    // The reading position: the first visible row (not of `excludeKey`, a
-    // type about to be hidden) at or below the viewport top, and its offset
-    // from it. A row hanging only a few pixels into the viewport is not
-    // what anyone is reading.
-    captureAnchor(excludeKey = null) {
-        const st = this.container.scrollTop;
-        for (const idx of this.order) {
-            const n = this.cache.get(idx);
-            if (!n || n.offsetParent === null) continue;
-            if (excludeKey && n.dataset.filterKey === excludeKey) continue;
-            if (n.offsetTop + n.offsetHeight > st + 4) return { idx, off: n.offsetTop - st };
-        }
-        return null;
-    }
-
-    restoreAnchor(a) {
-        if (!a) return;
-        const n = this.cache.get(a.idx);
-        if (!n || n.offsetParent === null) return;
-        const want = Math.max(0, n.offsetTop - a.off);
-        if (Math.abs(this.container.scrollTop - want) > 1) {
-            this.container.scrollTop = want;
-            this.prevScrollTop = this.container.scrollTop;
-        }
-    }
-
-    // Record the heights rows have now, so the row observer sees a
-    // deliberate reflow (a filter toggle, already anchored) as no change.
-    // The observer's own measure: the fractional border box. `offsetHeight`
-    // rounds, and the rounding read as growth, half a pixel per row.
-    syncRowHeights() {
-        for (const idx of this.order) {
-            const node = this.cache.get(idx);
-            if (node) node.__btH = node.getBoundingClientRect().height;
-        }
     }
 
     // The shape of this row's body placeholder (`showLoading`), or null. The
@@ -1922,7 +1639,7 @@ class BonitoChat {
         map[w] = h;
         node.__btBodyH = map;
         // Of that, what is not its one picture (`bodyReserve`).
-        const pics = body.querySelectorAll('.bt-media-wrap');
+        const pics = body.querySelectorAll('.bt-media');
         const extra = pics.length === 1
             ? Math.min(h, Math.max(0, Math.round(content - pics[0].getBoundingClientRect().height))) : 0;
         node.__btMediaExtra = extra;
@@ -2154,19 +1871,19 @@ class BonitoChat {
         const c = this.container;
         const len = this.seqLength();
         const fits = len === 0 ||
-            (this.plo <= 0 && this.atTail() && c.scrollHeight <= c.clientHeight + 1);
+            (this.block.plo <= 0 && this.atTail() && c.scrollHeight <= c.clientHeight + 1);
         rail.classList.toggle('bt-rail-hidden', fits);
         if (fits) return;
         let f;
         if (this.atTail() && this.atBottom()) {
             f = 1;
-        } else if (this.plo <= 0 && c.scrollTop <= 1) {
+        } else if (this.block.plo <= 0 && c.scrollTop <= 1) {
             f = 0;
         } else {
-            const [first] = this.visibleSpan();
+            const [first] = this.block.visibleSpan();
             if (first < 0) return;
-            const idx = this.order[first];
-            const node = this.cache.get(idx);
+            const idx = this.block.order[first];
+            const node = this.block.cache.get(idx);
             const into = node.offsetHeight > 0
                 ? Math.min(1, Math.max(0, (c.scrollTop - node.offsetTop) / node.offsetHeight)) : 0;
             f = Math.min(1, (this.seqPos(idx) + into) / Math.max(1, len - 1));
@@ -2203,7 +1920,7 @@ class BonitoChat {
     // Mark a live app as most-recently-relevant in the keep-alive LRU (it
     // entered or left the viewport).
     touchApp(idx) {
-        const node = this.cache.get(idx);
+        const node = this.block.cache.get(idx);
         if (!node || node.dataset.btSpilled) return;
         const i = this.appLru.indexOf(idx);
         if (i !== -1) this.appLru.splice(i, 1);
@@ -2222,7 +1939,7 @@ class BonitoChat {
         let extra = offscreen.length - this.APP_KEEPALIVE;
         for (const idx of offscreen) {          // least recent first
             if (extra <= 0) break;
-            const node = this.cache.get(idx);
+            const node = this.block.cache.get(idx);
             if (!node || this.holdsFullscreen(node)) continue;
             this.spillApp(idx, node);
             extra--;
@@ -2373,22 +2090,11 @@ class BonitoChat {
     // ── New messages + streaming ──────────────────────────────────────────
 
     appendNewMessage(msg) {
-        // `n` already pushed totalCount above; the new message lives at idx n-1.
-        const idx = this.totalCount - 1;
-        if (!this.cache.has(idx)) {
-            // A lens's matches are a STATIC set computed when its query ran:
-            // a new message can't be in it. It shows anyway (re-running the
-            // query re-evaluates it), so it joins the sequence at the end.
-            if (this.seq) this.seq.push(idx);
-            // Into the page only when the block reaches the end; otherwise it
-            // loads with the rest when the reader gets there.
-            if (this.seqPos(idx) === this.phi + 1) {
-                const nodes = this.insertRows([[idx, msg]], this.rowsEnd);
-                this.order.push(idx);
-                this.phi += 1;
-                this.adoptRows(nodes);
-            }
-        }
+        // `n` already pushed the count above; the new message lives at idx n-1.
+        // Into the page only when the block reaches the end (a lens's static
+        // matches take it at their end); otherwise it loads with the rest when
+        // the reader gets there.
+        this.block.pushEnd(this.block.count - 1, msg);
         // Strict no-yank semantics: any new message (including the
         // user's own) auto-scrolls ONLY while followMode is on.
         // When the user is reading scrollback we just register unread
@@ -2454,8 +2160,8 @@ class BonitoChat {
 
     appendUserChunk(text) {
         // Streaming user message: append to the most recent user bubble.
-        const idx = this.totalCount - 1;
-        const node = this.cache.get(idx);
+        const idx = this.block.count - 1;
+        const node = this.block.cache.get(idx);
         if (node && node.classList.contains('bt-user-msg')) {
             node.textContent += text;
             if (this.followMode) {
@@ -2809,6 +2515,10 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
+        // An edit can mount before all of its arguments have streamed in.
+        // Refresh an existing preview when its source changes, using the same
+        // near-viewport scheduler and serialized render requests as first mount.
+        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
@@ -3002,7 +2712,7 @@ class BonitoChat {
             // on, as `adoptRows` watches a row that came in as one. Before, the
             // apps made in a session were never counted, so the limit that keeps
             // WebGL contexts below the browser's cap held only after a reload.
-            if (became && node.__btIdx !== undefined && this.cache.get(node.__btIdx) === node) {
+            if (became && node.__btIdx !== undefined && this.block.cache.get(node.__btIdx) === node) {
                 this.appObserver.observe(node);
                 this.touchApp(node.__btIdx);
             }
@@ -3147,7 +2857,9 @@ class BonitoChat {
     }
 
     applyNative(node) {
-        node.classList.add('bt-tool-native');
+        // The body will supply the shared file toolbar. Hide the tool header
+        // before its loading placeholder is laid out, not after that RPC.
+        node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
             node.collapsable?.setExpanded(true);
         } else {
@@ -3158,7 +2870,7 @@ class BonitoChat {
     }
 
     removeNative(node) {
-        node.classList.remove('bt-tool-native');
+        node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
         node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
     }
@@ -3168,7 +2880,7 @@ class BonitoChat {
     setNativeMedia(prefix, on) {
         if (prefix === 'image/') this.nativeImages = on;
         else                     this.nativeVideos = on;
-        for (const node of this.cache.values()) {
+        for (const node of this.block.cache.values()) {
             if (!(node.dataset.showMime || '').startsWith(prefix)) continue;
             on ? this.applyNative(node) : this.removeNative(node);
         }
@@ -3184,7 +2896,7 @@ class BonitoChat {
         // anchor is the top-visible row that SURVIVES the toggle.
         const anchor = this.followMode ? null : this.captureAnchor(key);
         this.hiddenTypes[hidden ? 'add' : 'delete'](key);
-        for (const [idx, node] of this.cache) {
+        for (const [idx, node] of this.block.cache) {
             if (node.dataset.filterKey === key) this.applyVisibility(idx, node);
         }
         // Hiding the agent stream also hides the idle "waiting" line that
@@ -3423,8 +3135,7 @@ class BonitoChat {
                 if (this.wantsNative(div)) {
                     // Native display: chrome off + body auto-mounted on
                     // first insertion.
-                    div.classList.add('bt-tool-native');
-                    div.dataset.btAutoExpand = '1';
+                    this.applyNative(div);
                 } else if (msg.expand || msg.expand_full) {
                     // Auto-expand (bt_show refs, eval eager-mount /
                     // expand_full) — DEFERRED until the node first enters the
@@ -3500,7 +3211,7 @@ class BonitoChat {
     // bug). Falls back to oldest-in-DOM for events without an index.
     unqueueUser(msg) {
         if (Number.isInteger(msg.idx)) {
-            const node = this.cache.get(msg.idx);
+            const node = this.block.cache.get(msg.idx);
             if (node) { node.classList.remove('bt-queued'); return; }
             // No cached node yet: nothing stale to clear — a later render
             // builds it from the (already-promoted) store dict.
@@ -3516,7 +3227,7 @@ class BonitoChat {
     // position in its cached node.
     requeueUser(msg) {
         for (const it of (msg.items || [])) {
-            const node = this.cache.get(it.idx);
+            const node = this.block.cache.get(it.idx);
             // An explicit `label` overrides the position wording — stop uses it
             // to mark a dropped bubble "not sent" while keeping it dimmed, so
             // the text is still there to copy but clearly never went out.
@@ -3700,7 +3411,7 @@ class BonitoChat {
     // by the ↑ chips of cards that wait on an eval. A message a lens filters
     // out is not in the sequence, so the lens goes first.
     jumpToMessage(idx, id) {
-        if (!Number.isInteger(idx) || idx < 0 || idx >= this.totalCount) return;
+        if (!Number.isInteger(idx) || idx < 0 || idx >= this.block.count) return;
         if (this.seqPos(idx) < 0) {
             this.lensClearAll();
             this.pendingJump = { idx, id };     // applied once the lens result lands
@@ -4058,10 +3769,10 @@ class BonitoChat {
         const anchor = (this.lensActive && !msg.active && !this.followMode)
             ? this.captureAnchor() : null;
         if (!msg.active) {
-            this.lensActive = false; this.seq = null; this.lensActions = null;
+            this.lensActive = false; this.block.seq = null; this.lensActions = null;
         } else {
             this.lensActive  = true;
-            this.seq = (msg.visible || []).slice().sort((a, b) => a - b);
+            this.block.seq = (msg.visible || []).slice().sort((a, b) => a - b);
             this.lensActions = new Map(Object.entries(msg.actions || {}).map(([k, v]) => [+k, v]));
         }
         if (this.lensClearBtn) this.lensClearBtn.hidden = !this.lensActive;
@@ -4073,19 +3784,19 @@ class BonitoChat {
         const jump = this.pendingJump;
         this.pendingJump = null;
         if (jump && this.seqPos(jump.idx) >= 0) {
-            this.clearBlock();
+            this.block.clearBlock();
             this.jumpToPosition(this.seqPos(jump.idx), { flashId: jump.id || null, offset: 60 });
         } else if (this.lensActive) {
-            this.clearBlock();
+            this.block.clearBlock();
             if (len === 0) { this.updateRail(); return; }
-            this.requestBlock(0, Math.min(len - 1, this.CHUNK - 1), { kind: 'lens' });
+            this.block.requestBlock(0, Math.min(len - 1, this.block.CHUNK - 1), { kind: 'top' });
         } else if (anchor && this.seqPos(anchor.idx) >= 0) {
             const p = anchor.idx;
-            this.clearBlock();
-            this.requestBlock(Math.max(0, p - this.CHUNK), Math.min(len - 1, p + this.CHUNK),
+            this.block.clearBlock();
+            this.block.requestBlock(Math.max(0, p - this.block.CHUNK), Math.min(len - 1, p + this.block.CHUNK),
                               { kind: 'restore', idx: anchor.idx, off: anchor.off });
         } else {
-            this.clearBlock();
+            this.block.clearBlock();
             this.loadTail();
         }
     }
@@ -4157,8 +3868,8 @@ class BonitoChat {
     // while followMode / unread-clearing keep using atBottom().
     lastMessageFullyOutOfView() {
         if (!this.paneVisible) return true;
-        if (this.totalCount === 0) return false;
-        const node = this.cache.get(this.totalCount - 1);
+        if (this.block.count === 0) return false;
+        const node = this.block.cache.get(this.block.count - 1);
         // Virtual scroll detaches nodes far outside the viewport (cache
         // keeps them), and deep in scrollback the last message may not be
         // fetched at all — a missing/detached/display:none node has no
@@ -4276,8 +3987,8 @@ class BonitoChat {
         if (this.destroyed || !this.paneVisible || this.scrollbarDrag) return;
         // The bottom of the conversation, not just of the block: a block that
         // stops short of the end is replaced by the tail, which lands pinned.
-        if (this.blockEmpty() || !this.atTail()) {
-            if (this.pending.block?.kind !== 'tail') this.loadTail();
+        if (this.block.blockEmpty() || !this.atTail()) {
+            if (this.block.pending.block?.kind !== 'tail') this.loadTail();
             return;
         }
         // Use the scroll container's layout coordinates only. scrollIntoView
@@ -4380,7 +4091,7 @@ class BonitoChat {
                 this.updateScrollAffordance(this.atBottom());
                 return;
             }
-            const n = anchor ? this.cache.get(anchor.idx) : null;
+            const n = anchor ? this.block.cache.get(anchor.idx) : null;
             if (n && n.isConnected && n.offsetParent !== null) {
                 this.container.scrollTop = n.offsetTop - anchor.off;
             } else if (savedTop != null) {
@@ -5032,6 +4743,7 @@ class BonitoChat {
                 item.status === 'held' ? 'Goes out with your next message' :
                 item.status === 'offline' ? 'Agent not reachable · sends once it is back' :
                 item.status === 'sending' ? 'Connecting · not sent yet' :
+                item.status === 'submitted' ? 'Waiting for agent receipt' :
                 item.mode === 'interrupt' ? 'Waiting for interruption to finish' :
                 item.mode === 'next' ? 'Waiting for the next message boundary' :
                 'Waiting until the agent finishes');
@@ -5042,9 +4754,10 @@ class BonitoChat {
             preview.textContent = item.text;
             const badge = document.createElement('span');
             badge.className = 'bt-queue-badge';
-            badge.textContent = item.status === 'paused' ? 'Paused · not sent' :
+            badge.textContent = item.status === 'paused' ? 'Paused' :
                 item.status === 'held' ? 'With your next message' :
                 item.status === 'offline' ? 'Agent offline · queued' :
+                item.status === 'submitted' ? 'Awaiting receipt' :
                 item.status === 'sending' ? 'Sending…' : item.mode === 'interrupt' ? 'Interrupting…' :
                 item.mode === 'next' ? 'Queued · next message' : 'Queued · when done';
             summary.title = status.textContent;
@@ -5063,7 +4776,7 @@ class BonitoChat {
                     item.status === 'waiting' || item.status === 'offline' ? [['remove', 'Remove']] : []) {
                 const button = document.createElement('button');
                 button.type = 'button';
-                button.className = 'bt-btn bt-btn-ghost bt-btn-sm';
+                button.className = 'bw-btn bw-btn-ghost bw-btn-sm';
                 button.dataset.queueAction = action;
                 button.dataset.queueId = item.id;
                 button.textContent = label;
@@ -5680,8 +5393,8 @@ export function flushDrafts() {
     for (const chat of CHAT_INSTANCES) chat.flushDraft?.();
 }
 
-export function connect(node, comm, init = {}) {
-    const chat = new BonitoChat(node, comm, init);
+export function connect(node, comm, init = {}, RowBlock) {
+    const chat = new BonitoChat(node, comm, init, RowBlock);
     // Late-mount snapshot: comm events fired before this tab connected are
     // gone, so the server bakes the current slash-command set into the init
     // call; live changes keep flowing via the 'commands' comm event.

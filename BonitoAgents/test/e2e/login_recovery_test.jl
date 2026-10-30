@@ -17,7 +17,23 @@
     led = "document.querySelector('.bt-conn-led')"
     # The login page, as a tab whose login ended lands on it.
     login_page(s) = TK.wait_for(s, "the login page",
-        "location.pathname.startsWith('/authelia') && !!document.querySelector('#username-textfield')"; timeout = 30)
+        "location.pathname.startsWith('/authelia') && !!document.querySelector('#username-textfield')"; timeout = 30,
+        describe = "JSON.stringify({path:location.pathname,ready:document.readyState,login:!!document.querySelector('#username-textfield'),dashboard:!!document.querySelector('.bt-dash')})")
+    function fresh_dashboard!(s)
+        # Finish the preceding navigation before expiring this browser's login.
+        # A restored chat can still be fetching authenticated page fragments
+        # after its connection LED turns green.
+        TK.to_dashboard(s)
+        @test TK.wait_for(s, "Home selection saved before reload",
+            "document.querySelector('.bt-main-views')?.dataset.activeView === '' && (localStorage.getItem('bt-last-pid') || '').endsWith('|')";
+            timeout = 30)
+        TK.navigate(s, "/")
+        @test TK.wait_for(s, "fresh dashboard ready before logout",
+            "location.search === '' && document.readyState === 'complete' && " *
+            "document.querySelector('.bt-main-views')?.dataset.activeView === '' && " *
+            "document.querySelector('.bt-conn-led')?.dataset.status === 'connected' && !document.querySelector('.bt-chatpane')";
+            timeout = 30)
+    end
     function new_tab(route = "/")
         tab = TK.another_tab(z; route)
         push!(tabs, tab)
@@ -32,8 +48,9 @@
         second_chat = TK.new_chat(z; title = "SecondChat")
         TK.send_message(z, "second chat")
         TK.wait_for(z, "the second reply", "document.body.textContent.includes('reply to: second chat')"; timeout = 60)
-        TK.click(z, ".bt-side-item[data-project-id=\"$first_chat\"]")
-        TK.navigate(z, "/")                       # a page that has shown neither chat
+        # Reload restores the last selected chat. Clear that selection through
+        # Home first, or the new page can start fetching a chat before logout.
+        fresh_dashboard!(z)                       # a page that has shown neither chat
         second_pane = """document.querySelector('.bt-chatpane[data-pane-pid="$second_chat"] .bt-messages')"""
         @test TK.eval_js(z, "!$second_pane") == true
 
@@ -100,6 +117,7 @@
 
         @testset "no login page while the browser is logged in" begin
             # Two stale tabs on the login page; the user logs in in one of them.
+            fresh_dashboard!(z)
             @test logout!(z) == 200
             stale = new_tab()
             login_page(stale)

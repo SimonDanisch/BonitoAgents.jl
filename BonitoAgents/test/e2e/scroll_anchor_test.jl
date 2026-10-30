@@ -114,16 +114,16 @@
         @test before !== nothing
         dropped = TK.eval_js(s, """(() => {
             const ch = $CH;
-            const n0 = ch.order.length;
-            ch.MAX_WINDOW = 20; ch.CHUNK = 10;     // force a trim right here
-            ch.trimBlock();
-            return n0 - ch.order.length;
+            const n0 = ch.block.order.length;
+            ch.block.MAX_WINDOW = 20; ch.block.CHUNK = 10;     // force a trim right here
+            ch.block.trimBlock();
+            return n0 - ch.block.order.length;
         })()""")
         @test Int(dropped) > 0
         after = settled_top()
         @test after["text"] == before["text"]
         @test abs(Int(after["off"]) - Int(before["off"])) <= 3
-        TK.eval_js(s, "(() => { const ch = $CH; ch.MAX_WINDOW = 160; ch.CHUNK = 40; ch.ensureWindow(); return true; })()")
+        TK.eval_js(s, "(() => { const ch = $CH; ch.block.MAX_WINDOW = 160; ch.block.CHUNK = 40; ch.ensureWindow(); return true; })()")
     end
 
     @testset "a reply for a block that is gone is not placed" begin
@@ -133,8 +133,8 @@
         ghost = TK.eval_js(s, """(() => {
             const ch = $CH;
             const ghost = {type: 'user', text: 'STALE-EPOCH-GHOST'};
-            ch.onRange({start: 0, msgs: [ghost], epoch: ch.epoch - 1, req: ch.reqSeq});
-            ch.onRange({start: 0, msgs: [ghost], epoch: ch.epoch, req: 987654});
+            ch.onRange({start: 0, msgs: [ghost], epoch: ch.block.epoch - 1, req: ch.block.reqSeq});
+            ch.onRange({start: 0, msgs: [ghost], epoch: ch.block.epoch, req: 987654});
             return ch.container.innerText.includes('STALE-EPOCH-GHOST');
         })()""")
         @test ghost == false

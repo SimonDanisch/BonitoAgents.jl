@@ -15,12 +15,12 @@ Base.flush(io::CountIO) = (io.flushes += 1; flush(io.io))
 Base.close(io::CountIO) = close(io.io)
 
 function protocol_copy(src, dst; sender_streaming = true, receiver_streaming = true,
-                       relay = false, quick_check = true)
+                       relay = false, quick_check = true, paths = nothing, on_progress = nothing)
     sender, middle_src = pipe_pair()
     middle_dst, receiver = relay ? pipe_pair() : (nothing, middle_src)
     counted = CountIO(receiver)
     t_send = @async try
-        RS.send_directory(src, sender; streaming = sender_streaming)
+        RS.send_directory(src, sender; paths, streaming = sender_streaming)
     finally
         close(sender)
     end
@@ -30,7 +30,7 @@ function protocol_copy(src, dst; sender_streaming = true, receiver_streaming = t
         close(counted)
     end
     t_relay = relay ? (@async try
-        RS.relay_directory(middle_src, middle_dst)
+        RS.relay_directory(middle_src, middle_dst; on_progress)
     finally
         close(middle_src); close(middle_dst)
     end) : nothing
@@ -38,6 +38,41 @@ function protocol_copy(src, dst; sender_streaming = true, receiver_streaming = t
     result = fetch(t_receive)
     wait(t_send)
     return (; result, replies = counted.flushes, forwarded)
+end
+
+@testset "selected file and folder batches" begin
+    mktempdir() do root
+        src = mkpath(joinpath(root, "src"))
+        mkpath(joinpath(src, "nested", "deeper"))
+        write(joinpath(src, "one.txt"), "one")
+        write(joinpath(src, "nested", "two.txt"), "two")
+        write(joinpath(src, "nested", "deeper", "three.txt"), "three")
+        write(joinpath(src, "excluded.txt"), "excluded")
+        selection = ["one.txt", "nested", "nested/two.txt"]
+        @test getproperty.(RS.walk_directory(src; paths = selection), :rel) ==
+            ["nested/deeper/three.txt", "nested/two.txt", "one.txt"]
+        @test length(RS.walk_directory(src; paths = [".", "one.txt", "nested"])) == 4
+        for streaming in (false, true)
+            dst = mkpath(joinpath(root, "dst-$streaming"))
+            write(joinpath(dst, "keep.txt"), "destination only")
+            events = Tuple{Symbol,Any}[]
+            r = protocol_copy(src, dst; paths = selection, relay = true,
+                sender_streaming = streaming, on_progress = (s, i) -> push!(events, (s, i)))
+            @test r.result.written == 3
+            @test read(joinpath(dst, "nested", "deeper", "three.txt"), String) == "three"
+            @test read(joinpath(dst, "keep.txt"), String) == "destination only"
+            @test !isfile(joinpath(dst, "excluded.txt"))
+            @test [i.idx for (s,i) in events if s == :file_done] == [1,2,3]
+            @test count(e -> first(e) == :file_start, events) == 3
+            @test sum(i.bytes for (s,i) in events if s == :file_chunk) > 0
+            @test last(events)[1] == :transfer_done
+            r = protocol_copy(src, dst; paths = selection, relay = true, sender_streaming = streaming)
+            @test r.result.skipped == (Sys.iswindows() ? 0 : 3)
+        end
+        for paths in (String[], "one.txt", [1], ["../escape"], ["/absolute"], ["missing"], [""])
+            @test_throws ArgumentError RS.walk_directory(src; paths)
+        end
+    end
 end
 
 @testset "streaming negotiation, relaying and incremental sync" begin

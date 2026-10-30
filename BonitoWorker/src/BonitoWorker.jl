@@ -16,6 +16,7 @@ import FileWatching
 include("mcp_relay.jl")
 include("harnesses.jl")
 include("adapter_patches.jl")
+include("managed_processes.jl")
 include("worker.jl")
 include("processes.jl")
 include("file_watch.jl")

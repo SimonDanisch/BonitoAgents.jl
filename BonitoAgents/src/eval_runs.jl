@@ -167,7 +167,7 @@ Apply a `run_update` frame from a chat's MCP (`host_worker == ""`) or from its
 eval host on another worker.
 """
 function run_update!(state::ServerState, project_id::AbstractString,
-                     host_worker::AbstractString, d::AbstractDict)
+                     host_worker::AbstractString, d::AbstractDict; control=nothing)
     chat = lock(() -> get(state.chat_models, String(project_id), nothing), state.lock)
     chat === nothing && return nothing
     chat = shared(chat)
@@ -178,6 +178,7 @@ function run_update!(state::ServerState, project_id::AbstractString,
     started isa Real || (started = nothing)
     r = lock(() -> run_record!(book, id, String(host_worker), started, haskey(d, "status")), book.lock)
     r === nothing && return nothing
+    control === nothing || (r.control = WeakRef(control))
     r.seen = time()
     tuid = String(get(d, "tool_use_id", ""))
     isempty(tuid) || (r.tool_use_id = tuid)
@@ -473,7 +474,7 @@ comes back within a second and knows none of the old runs, which then stayed
 "running" in the bar for good.
 """
 function runs_channel_closed!(state::ServerState, project_id::AbstractString,
-                              host_worker::AbstractString; grace::Real = RUN_LOST_GRACE_S)
+                              host_worker::AbstractString; grace::Real = RUN_LOST_GRACE_S, control=nothing)
     closed_at = time()
     Base.errormonitor(@async begin
         sleep(grace)
@@ -481,7 +482,8 @@ function runs_channel_closed!(state::ServerState, project_id::AbstractString,
         chat === nothing && return nothing
         chat = shared(chat)
         lost = [r for r in all_runs(chat.runs)
-                if r.status == "running" && r.worker_id == host_worker && r.seen < closed_at]
+                if r.status == "running" && r.worker_id == host_worker && r.seen < closed_at &&
+                    (control === nothing || (r.control !== nothing && r.control.value === control))]
         foreach(r -> lose_run!(chat, r, "the process running it went away"), lost)
         isempty(lost) || @info "runs lost with their process" project_id host_worker runs = [r.id for r in lost]
         isempty(lost) || note_finished_runs!(chat)

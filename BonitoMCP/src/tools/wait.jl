@@ -80,6 +80,7 @@ function wait_handler(args::AbstractDict)
     lock(SERVER.waits.lock) do
         push!(SERVER.waits.active, wake)
     end
+    note_wait_request!(args,wake)
     try
         if relay_grant() !== nothing && call_server("wait_input";
                 tool_id = String(get(args, "_tool_use_id", ""))) === true
@@ -92,6 +93,12 @@ function wait_handler(args::AbstractDict)
         end
         isopen(wake) && close(wake)
     end
+end
+
+function note_wait_request!(args,wake)
+    id = get(args,"_mcp_request_id",nothing)
+    id === nothing || note_inflight_request!(id,"\0bonito-wait:" * string(objectid(wake)))
+    return nothing
 end
 
 # Only currently registered waits are signalled. A message received before a

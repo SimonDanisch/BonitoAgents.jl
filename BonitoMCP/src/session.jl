@@ -355,6 +355,20 @@ function start!(s::JuliaSession)
     # `remote_session`, to move values to and from another worker's session
     # (remote_values.jl), through this worker's relay under the eval token.
     Malt.remote_eval_fetch(s.worker, :(using .BonitoMCPHelper; nothing))
+    # A progress-only capability, never the MCP control token. Also inherited
+    # by detached children; the client itself needs only Julia stdlibs.
+    if !isempty(get(ENV,"BONITOAGENTS_PROGRESS_ADDR",""))
+        client = joinpath(pkgdir(@__MODULE__),"src","BonitoProgress.jl")
+        context = BonitoProgress.progress_context()
+        Malt.remote_eval_fetch(s.worker, :(include($client); nothing))
+        Malt.remote_eval_fetch(s.worker, quote
+            for (key,value) in $context; ENV[key]=value; end
+            let logging_module = Base.require(Base.PkgId(Base.UUID("56ddb016-857b-54e1-b83d-db4d58db5568"),"Logging"))
+                logging_module.global_logger(BonitoProgress.progress_logger(logging_module.global_logger()))
+            end
+            nothing
+        end)
+    end
     grant = relay_grant()
     if grant !== nothing && !isempty(grant.values_addr)
         Malt.remote_eval_fetch(s.worker,

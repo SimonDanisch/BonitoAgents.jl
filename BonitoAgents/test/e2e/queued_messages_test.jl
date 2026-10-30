@@ -116,7 +116,9 @@
     @test waitfor("steering turn streaming", "!!$(q(".bt-stream-text"))")
     mode("next")
     TK.send_message(s, "steering instruction")
-    @test waitfor("waiting for boundary", "$queue.length === 1 && $queue[0].dataset.mode === 'next'")
+    @test waitfor("correction is queued or already received",
+        "($queue.length === 1 && $queue[0].dataset.mode === 'next') || " *
+        "$(q(".bt-messages")).textContent.includes('Received: steering instruction')")
     @test waitfor("steering reaches agent", "$(q(".bt-messages")).textContent.includes('Received: steering instruction')")
     # The original turn still reaches its end: steering did not cancel it.
     @test waitfor("original turn continues", "!$(q(".bt-busy")).classList.contains('bt-busy-active')")

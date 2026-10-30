@@ -43,7 +43,7 @@
     P = ".bt-chatpane[data-pane-pid=\"$(pid)\"] "
     C = "document.querySelector($(TK.json(P * ".bt-messages")))"
     CH = "$C.__bt_chat"
-    @test TK.wait_for(s, "the newest rows", "!!$CH && $CH.order.length > 0"; timeout = 20) == true
+    @test TK.wait_for(s, "the newest rows", "!!$CH && $CH.block.order.length > 0"; timeout = 20) == true
     TK.eval_js(s, "(() => { const ch = $CH; ch.setFollowMode(false); ch.cancelPendingScroll(); return true; })()")
     @test TK.eval_js(s, "!$C.querySelector('[data-msg-id*=\"vid-anchor\"]')") == true
 
@@ -65,10 +65,10 @@
             # one synchronous step (the offscreen renderer fires no scroll
             # event for a programmatic write, hence the dispatch).
             before, plo = TK.eval_js(s, """(() => { const c = $C; c.scrollTop = 0;
-                const top = $TOP_PROBE, plo = $CH.plo;
+                const top = $TOP_PROBE, plo = $CH.block.plo;
                 c.dispatchEvent(new Event('scroll'));
                 return [top, plo]; })()""")
-            TK.wait_for(s, "older rows", "$CH.plo < $(plo)"; timeout = 10)
+            TK.wait_for(s, "older rows", "$CH.block.plo < $(plo)"; timeout = 10)
         end
         @test TK.eval_js(s, "!!$VIDEO") == true
         # The video's row is above the reader; its body mounts and grows.

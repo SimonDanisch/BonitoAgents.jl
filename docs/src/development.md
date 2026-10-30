@@ -111,6 +111,20 @@ the whole server; the ⋯ trigger turns red while it is on). A chat that got it
 that way is told the source is not in front of it. Pointing an ordinary chat at
 the checkout grants nothing.
 
+ACP adapters can advertise `agentCapabilities._meta.promptReceipts = true`.
+The client then sends a fresh `_meta.bonitoPromptId` with each `session/prompt`;
+after consuming that prompt, the adapter sends `_bonito/prompt_received` with
+`sessionId` and `messageId` equal to that token. The shared outbox persists the
+message until that receipt, and pauses an unconfirmed attempt after cancellation
+or connection loss. The logs distinguish `message awaiting agent receipt` from
+`message sent to agent`. Claude's temporary worker shim exposes its existing
+insertion event; adapters without receipts cannot use overlapping prompts.
+Its capability shim also advertises the existing steering
+`idleBehavior: "promptRequired"` option. The shared client uses this or
+`activeOnly: true` to steer into live work while retaining ownership of the
+fallback prompt if the running turn ends. An ordinary queued prompt does not
+have that delivery priority.
+
 ## The walkthrough videos
 
 Three recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)

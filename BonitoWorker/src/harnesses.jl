@@ -225,6 +225,8 @@ function sync_harnesses!(spec::HarnessSpec; root::AbstractString = harness_root(
     end
     # What a release cannot do yet (adapter_patches.jl), on whatever is installed.
     if haskey(spec.packages, "@agentclientprotocol/claude-agent-acp")
+        patch_prompt_receipts!(root) == :unchanged &&
+            @warn "BonitoWorker: this claude-agent-acp cannot report prompt receipts; mid-turn messages wait until completion" version = installed_version(root, "@agentclientprotocol/claude-agent-acp")
         patch_thinking_tokens!(root) == :unchanged &&
             @warn "BonitoWorker: this claude-agent-acp has no spot for the thinking-progress patch; its chats show no thinking estimate" version = installed_version(root, "@agentclientprotocol/claude-agent-acp")
     end

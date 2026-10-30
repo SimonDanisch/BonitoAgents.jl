@@ -54,6 +54,21 @@ wait_frames(ws, n; timeout = 60.0) = timedwait(() -> length(ws.frames) >= n, tim
     @testset "bt_sync_folder needs both a source and a worker" begin
         @test occursin("`src`", txt(M.sync_folder_handler(Dict{String,Any}("worker" => "x"))))
         @test occursin("`worker`", txt(M.sync_folder_handler(Dict{String,Any}("src" => "/tmp/x"))))
+        for direction in ("push", "pull")
+            r = M.sync_folder_handler(Dict{String,Any}("src" => "/tmp/x", "worker" => "MacBook", "direction" => direction))
+            @test r["isError"] === true
+            @test occursin("no control channel", txt(r))
+        end
+        for direction in ("sideways", "", nothing)
+            r = M.sync_folder_handler(Dict{String,Any}("src" => "/tmp/x", "worker" => "MacBook", "direction" => direction))
+            @test r["isError"] === true
+            @test occursin("`direction` must be `push` or `pull`", txt(r))
+        end
+        for paths in (String[], "one-file", [1])
+            r = M.sync_folder_handler(Dict{String,Any}("src" => "/tmp/x", "worker" => "MacBook", "paths" => paths))
+            @test r["isError"] === true
+            @test occursin("`paths` must be a nonempty list", txt(r))
+        end
     end
 
     @testset "the eval host answers relayed calls on the control socket" begin
