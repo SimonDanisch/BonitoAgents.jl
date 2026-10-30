@@ -357,7 +357,7 @@ function render_part(session::Bonito.Session, c::WorkerCard)   # timed: diagnost
     # just a thin "▸ projects (N)" toggle row — no separate pill chrome. Fed
     # from state.discovered (no scan needed on first paint); the per-card Rescan
     # button refreshes it.
-    card = DOM.div(card_row, update_notice, adapters_note,
+    card = AppCard(card_row, update_notice, adapters_note,
                    worker_sharing_row(state.auth, session, state, wid),
                    manage ? render_discover_panel(session, c, wid) : DOM.div();
                    class = "bt-card bt-worker-card", dataWorkerId = wid,

@@ -602,7 +602,7 @@ function app_tile(session::Bonito.Session, state::ServerState, app::AgentApp,
         setting_up[] = false
         launch_app!(state, app, current_view, busy; worker_id = chosen[])
     end
-    dialog = Modal(setting_up; title = "Set up $title") do
+    dialog = AppModal(setting_up; title = "Set up $title") do
         app_setup(session, state, app, chosen, start, setting_up)
     end
 
@@ -669,9 +669,9 @@ function app_setup(session::Bonito.Session, state::ServerState, app::AgentApp,
         DOM.div("Its chat runs an agent, on the worker you pick:"; class = "bt-app-setup-label"),
         choices,
         DOM.div("It stays there. From then on a click on its tile opens it."; class = "bt-app-setup-note"),
-        DOM.div(DOM.button("Cancel"; type = "button", class = "bw-btn bw-btn-secondary",
+        DOM.div(AppButton("Cancel"; variant = :secondary,
                            onclick = js"event => $(setting_up).notify(false)"),
-                DOM.button("Set up and open"; type = "button", class = "bw-btn bt-app-start",
+                AppButton("Set up and open"; class = "bt-app-start",
                            disabled = none_online, onclick = js"event => $(start).notify(true)");
                 class = "bt-form-actions");
         class = "bt-app-setup")

@@ -1,5 +1,38 @@
 # Apps
 
+## Shared controls for plugin panes
+
+Use the public `AppButton`, `AppCard`, `AppModal`, and `AppUIStyles` components
+to inherit the server's appearance. They use the same BonitoWidgets controls
+and `--bw-*` theme variables as the built-in pages, and carry the required
+styles when rendered independently.
+
+```julia
+using BonitoAgents: AppButton, AppCard, AppModal
+using Bonito
+
+opened = Observable(false)
+DOM.div(
+    AppCard(DOM.h3("Release"), AppButton("Review";
+        onclick = js"event => $(opened).notify(true)")),
+    AppModal(opened; title = "Review release") do
+        DOM.div("Approve each platform before publishing.")
+    end)
+```
+
+Buttons accept `variant=:primary`, `:secondary`, `:ghost`, or `:danger`, and
+`size=:normal` or `:small`. DOM attributes, including observable `disabled`
+values and plugin data attributes, pass through unchanged. Cards provide the
+shared surface; their content layout and padding belong to the plugin.
+
+The modal builds fresh content on each open and removes it on close. Its close
+button, backdrop, and Escape update the supplied `Observable{Bool}`. Plugins
+can listen to this observable to cancel pending actions. For credential forms,
+keep input values in the browser until the user explicitly submits them.
+
+Include `AppUIStyles` for additional plugin layout using the public `--bw-*`
+variables. Do not duplicate the server palette or shared button/modal CSS.
+
 An app is a permanent part of the server with a chat of its own. Its state lives
 in the server, so it is there whether or not its chat is open; its chat's pane is
 laid out by the app; and it can give every chat's agent tools of its own.
