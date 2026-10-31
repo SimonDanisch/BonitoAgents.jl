@@ -184,14 +184,14 @@
             @test !occursin("public", HTTP.header(js, "Cache-Control"))
 
             # Who the request is from is Authelia's word, whatever the client sent.
-            gate = BT.TunnelGate(auth)
+            gate = BT.TunnelAuthentication(auth)
             req = HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, "Accept" => "text/html",
                                                    "Remote-User" => "carol", "Remote-Groups" => "nobody"])
-            @test Bonito.HTTPServer.gate_request(gate, req) === nothing
+            @test BT.authenticate!(gate, req) === nothing
             user = BT.request_user(auth, req)
             @test user.name == "bob" && user.groups == ["admins"] && user.display_name == "Bob B"
             forged = HTTP.Request("GET", "/acp-log", ["Remote-User" => "bob", "Remote-Groups" => "admins"])
-            @test Bonito.HTTPServer.gate_request(gate, forged) isa HTTP.Response
+            @test BT.authenticate!(gate, forged) isa HTTP.Response
             @test BT.request_user(auth, forged) === nothing
 
             # A browser let through and later turned away gets ONE log line saying
@@ -199,21 +199,21 @@
             # login) or another one (something replaced it). Logins that ended
             # every few minutes left no other trace.
             who = ["Cf-Connecting-Ip" => "203.0.113.7", "User-Agent" => "a test browser"]
-            @test Bonito.HTTPServer.gate_request(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...])) === nothing
+            @test BT.authenticate!(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...])) === nothing
 
             # A page's live connection is recorded when it reaches the gate: whose
             # tab it is and whether it was let through. A phone waited seconds for
             # its socket and nothing said whether they passed before the server.
             upgrade(target, headers...) = HTTP.Request("GET", target, ["Connection" => "Upgrade", "Upgrade" => "websocket",
                 "Sec-WebSocket-Key" => "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version" => "13", headers...])
-            @test Bonito.HTTPServer.gate_request(gate, upgrade("/abcdef12-3456-7890?x=1", "Cookie" => cookie, who...)) === nothing
+            @test BT.authenticate!(gate, upgrade("/abcdef12-3456-7890?x=1", "Cookie" => cookie, who...)) === nothing
             up = last(gate.timings.kinds[:ws_upgrade])
             @test (up.detail["tab"], up.detail["status"]) == ("abcdef12", 101) && up.seconds < 5
-            @test Bonito.HTTPServer.gate_request(gate, upgrade("/abcdef12-3456-7890")) isa HTTP.Response
+            @test BT.authenticate!(gate, upgrade("/abcdef12-3456-7890")) isa HTTP.Response
             @test last(gate.timings.kinds[:ws_upgrade]).detail["status"] == 401   # no page: no redirect
             # A plain request is not a live connection.
             n = length(gate.timings.kinds[:ws_upgrade])
-            Bonito.HTTPServer.gate_request(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
+            BT.authenticate!(gate, HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
             @test length(gate.timings.kinds[:ws_upgrade]) == n
 
             # Logged out, it is the login first again. The logout passes the gate,
@@ -222,14 +222,14 @@
             # nothing to say what ended them.
             out = HTTP.Request("POST", "/authelia/api/logout",
                                ["Cookie" => cookie, "Content-Type" => "application/json", who...], "{}")
-            logs, answer = Test.collect_test_logs(() -> Bonito.HTTPServer.gate_request(gate, out))
+            logs, answer = Test.collect_test_logs(() -> BT.authenticate!(gate, out))
             @test answer.status == 200
             kw = Dict(only(l for l in logs if l.message == "login: Authelia").kwargs)
             @test kw[:path] == "/authelia/api/logout" && kw[:status] == 200
             @test kw[:cookie] == BT.cookie_digest(cookie) && !occursin(cookie, string(kw))
             @test login_first(get_("/", ["Cookie" => cookie]))
 
-            refused(req) = Test.collect_test_logs(() -> Bonito.HTTPServer.gate_request(gate, req))
+            refused(req) = Test.collect_test_logs(() -> BT.authenticate!(gate, req))
             logs, answer = refused(HTTP.Request("GET", "/acp-log", ["Cookie" => cookie, who...]))
             @test answer isa HTTP.Response
             line = only(l for l in logs if occursin("turned away a device that was logged in", l.message))
@@ -321,9 +321,9 @@
     # would carry one Authelia no longer knows.
     renewed = HTTP.Request("GET", "/")
     renewed.context[:login_cookies] = ["authelia_session=new; Path=/; HttpOnly"]
-    response = Bonito.HTTPServer.gate_response(BT.TunnelGate(auth), renewed, HTTP.Response(200))
+    response = BT.authenticated_response!(BT.TunnelAuthentication(auth), renewed, HTTP.Response(200))
     @test HTTP.header(response, "Set-Cookie") == "authelia_session=new; Path=/; HttpOnly"
-    @test !HTTP.hasheader(Bonito.HTTPServer.gate_response(BT.TunnelGate(auth), HTTP.Request("GET", "/"),
+    @test !HTTP.hasheader(BT.authenticated_response!(BT.TunnelAuthentication(auth), HTTP.Request("GET", "/"),
                                                          HTTP.Response(200)), "Set-Cookie")
 
     # What a shared cache may keep: nothing, whatever a route said.

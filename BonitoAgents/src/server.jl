@@ -140,10 +140,10 @@ function serve(; host::String        = "127.0.0.1",
     Bonito.set_cleanup_time!(1.0)   # hours
 
     # Single-page app: sidebar + dashboard/chat swap. No per-project routes.
-    # Behind a tunnel every request passes the login gate first (tunnel.jl).
+    # Behind a tunnel every request passes the authentication handler first (tunnel.jl).
     app = unified_app(state)
     srv = Bonito.Server(context -> timed_page(state, app, context), host, port;
-                        proxy_url = ".", gate = server_gate(auth, state.shares, state.timings))
+                        proxy_url = ".", handler = authenticated_handler(auth, state.shares, state.timings))
     state.srv = srv
 
     # online_url uses the post-start srv.port — handles port=0 → ephemeral
