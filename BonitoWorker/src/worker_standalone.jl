@@ -15,6 +15,7 @@
 #                                  so two installs don't collide on the dashboard)
 #   BONITOAGENTS_PROJECTS_ROOT     default: ~/bonitoagents-projects
 #   CLAUDE_AGENT_ACP               path to claude-agent-acp, over the managed one
+#   BONITOAGENTS_MCP_CONFIG        optional JSON file with worker-local mcp_servers
 #
 # The BonitoMCP launch command is derived automatically (`julia` + args against
 # the active project) — no env var or wrapper script needed.

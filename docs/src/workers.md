@@ -25,9 +25,11 @@ is missing. Then it:
 1. installs the worker packages into a shared `@bonito-agents` Julia
    environment, pinned to the same code revision the server runs so server
    and workers can't drift apart,
-2. records the worker config (server URL, credential and a stable `worker_id`)
+2. includes the CPU-only RomeoDB core and registers its MCP tools automatically
+   (`btromeodb`), with the GPU embedding model kept optional,
+3. records the worker config (server URL, credential and a stable `worker_id`)
    in a Julia scratchspace,
-3. starts the worker and, on Linux, installs a systemd user service
+4. starts the worker and, on Linux, installs a systemd user service
    (`bonito-worker`) so it survives reboots.
 
 The worker then installs a private Node and the agent adapters

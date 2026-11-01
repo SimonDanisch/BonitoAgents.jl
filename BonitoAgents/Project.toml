@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]
+RomeoDB = "b0bc34ab-3faa-4d3f-891a-2fccc1f41d4b"
 AgentClientProtocol = "a1b2c3d4-1234-5678-abcd-a1b2c3d4e5f6"
 AgentProviders = "c3d4e5f6-7a8b-49c0-b1d2-e3f4a5b6c7d8"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
@@ -30,6 +31,7 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 WorkerLink = "03840273-e5e6-4e74-9050-e95881fcd827"
 
 [sources]
+RomeoDB = {path = "../RomeoDB"}
 AgentClientProtocol = {path = "../AgentClientProtocol"}
 AgentProviders = {path = "../AgentProviders"}
 Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}

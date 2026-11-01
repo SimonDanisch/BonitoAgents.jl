@@ -9,6 +9,94 @@ end
 BonitoWorker.WebSockets.isclosed(ws::MCPEnvFrames) = isempty(ws.frames)
 BonitoWorker.WebSockets.receive(ws::MCPEnvFrames) = popfirst!(ws.frames)
 
+@testset "RomeoDB is enabled without worker configuration" begin
+    options = (; command = "/worker/julia", project = "/worker/env", index = "/worker/index")
+    server = only(BonitoWorker.worker_mcp_servers(Dict(); options...))
+    @test server.name == "btromeodb"
+    @test server.command == "/worker/julia"
+    @test server.args == ["--project=/worker/env", "--startup-file=no", "--threads=2", "-e",
+                          "using RomeoDB; RomeoDB.serve(ARGS[1])", "/worker/index"]
+    @test isempty(server.env)
+    @test isempty(BonitoWorker.worker_mcp_servers(
+        Dict("mcp_servers" => Dict("btromeodb" => Dict("enabled" => false))); options...))
+    override = Dict("command" => "custom", "args" => ["--project=/embedding-env"])
+    customized = BonitoWorker.worker_mcp_servers(Dict("mcp_servers" => Dict("btromeodb" => override)); options...)
+    @test only(customized).command == "custom"
+    @test only(customized).args == ["--project=/embedding-env"]
+    defaults = BonitoWorker.worker_mcp_servers(Dict("mcp_servers" => Dict("extra" => Dict("command" => "extra"))); options...)
+    @test sort([s.name for s in defaults]) == ["btromeodb", "extra"]
+    mktempdir() do dir
+        withenv("BONITOAGENTS_CONFIG_DIR" => dir, "BONITOAGENTS_MCP_CONFIG" => nothing) do
+            # The desktop/precompile entry point constructs WorkerConfig directly.
+            c = BonitoWorker.WorkerConfig(; server_url = "http://test", worker_id = "test", name = "test",
+                mcp_command = "/worker/julia", mcp_arguments = String[], projects_root = dir)
+            @test only(c.mcp_servers).name == "btromeodb"
+            @test only(c.mcp_servers).command == "/worker/julia"
+        end
+    end
+    target = Dict("repo" => "https://example.test/BonitoAgents.jl", "rev" => "main", "source_id" => "exact-sha",
+                  "bonito_url" => "https://example.test/Bonito.jl", "bonito_rev" => "main")
+    @test isempty(BonitoWorker.missing_worker_packages(Dict(), ["RomeoDB"]))
+    install = only(BonitoWorker.missing_worker_packages(Dict("update_spec" => target), String[]))
+    @test install.name == "RomeoDB"
+    @test install.rev == "exact-sha"
+    @test install.subdir == "RomeoDB"
+    @test_throws ErrorException BonitoWorker.missing_worker_packages(Dict(), String[])
+end
+
+@testset "worker-local MCP servers reach every ACP session entry point" begin
+    config = Dict("mcp_servers" => Dict(
+        "btromeodb" => Dict("command" => "/worker/julia", "args" => ["--project=/worker/RomeoDB"],
+                          "env" => Dict("JULIA_GLFW_PLATFORM" => "null")),
+        "disabled" => Dict("enabled" => false)))
+    configured = BonitoWorker.configured_mcp_servers(config)
+    @test length(configured) == 1
+    @test isempty(BonitoWorker.configured_mcp_servers(Dict()))
+    @test_throws ArgumentError BonitoWorker.configured_mcp_servers(
+        Dict("mcp_servers" => Dict("btworker" => Dict("command" => "julia"))))
+    @test_throws ArgumentError BonitoWorker.configured_mcp_servers(
+        Dict("mcp_servers" => Dict("bad" => Dict("command" => " "))))
+    mktempdir() do dir
+        withenv("BONITOAGENTS_CONFIG_DIR" => dir) do
+            path = BonitoWorker.write_config!(; server_url = "http://test", name = "test",
+                mcp_servers = config["mcp_servers"])
+            BonitoWorker.write_config!(; server_url = "http://test", name = "test")
+            @test JSON.parsefile(path)["mcp_servers"] == config["mcp_servers"]
+        end
+    end
+    link = BonitoWorker.WorkerLink.Link(:client)
+    relay = BonitoWorker.start_mcp_relay(link)
+    try
+        for method in ("session/new", "session/load", "session/fork", "session/resume")
+            msg = Dict("id" => 8, "method" => method, "params" => Dict("cwd" => "/project"))
+            mktemp() do path, io
+                BonitoWorker.relay_ws_to_proc(MCPEnvFrames([JSON.json(msg)]), (; in = io), relay, "owner", configured)
+                out = JSON.parse(read(path, String))
+                server = only(out["params"]["mcpServers"])
+                @test server["name"] == "btromeodb"
+                @test server["command"] == "/worker/julia"
+                @test server["args"] == ["--project=/worker/RomeoDB"]
+                @test server["env"] == [Dict("name" => "JULIA_GLFW_PLATFORM", "value" => "null")]
+                @test out["params"]["cwd"] == "/project"
+            end
+        end
+        duplicate = JSON.json(Dict("method" => "session/new", "params" =>
+            Dict("mcpServers" => [Dict("name" => "btromeodb")])) )
+        @test_throws ErrorException BonitoWorker.inject_mcp_grant(duplicate, relay, "owner", configured)
+        prompt = JSON.json(Dict("method" => "session/prompt", "params" => Dict()))
+        @test BonitoWorker.inject_mcp_grant(prompt, relay, "owner", configured) == prompt
+        mktemp() do path, io
+            write(io, JSON.json(config)); flush(io)
+            withenv("BONITOAGENTS_MCP_CONFIG" => path) do
+                @test only(BonitoWorker.configured_mcp_servers()).name == "btromeodb"
+            end
+        end
+    finally
+        close(relay)
+        BonitoWorker.WorkerLink.kill!(link, "done")
+    end
+end
+
 @testset "the MCP's relay grant survives filtered agent environments" begin
     link = BonitoWorker.WorkerLink.Link(:client)    # never connected: the grant is all this needs
     relay = BonitoWorker.start_mcp_relay(link)

@@ -63,10 +63,10 @@ jobs:
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-${{ github.run_id }}
           restore-keys: |
-            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-
-            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-${{ github.run_id }}-
+            ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
       - name: Resolve + refresh the git-pinned forks
@@ -84,7 +84,7 @@ jobs:
             using Pkg
             Pkg.instantiate()
             Pkg.update(["ElectronCall", "Bonito", "BonitoWidgets", "BonitoBook"])'
-          for env in evalenv altenv; do
+          for env in evalenv altenv romeodbenv; do
             julia --project=BonitoAgents/test/$env -e 'using Pkg; Pkg.instantiate()'
           done
 
@@ -106,7 +106,7 @@ jobs:
         # process that just resolved builds images against the versions that
         # process had loaded, which every later process rejects and rebuilds.
         run: |
-          for env in BonitoAgents BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv; do
+          for env in BonitoAgents BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv BonitoAgents/test/romeodbenv; do
             julia --project=$env .github/scripts/warmup.jl
           done
 
@@ -119,6 +119,7 @@ jobs:
             BonitoAgents/test/Manifest.toml
             BonitoAgents/test/evalenv/Manifest.toml
             BonitoAgents/test/altenv/Manifest.toml
+            BonitoAgents/test/romeodbenv/Manifest.toml
           if-no-files-found: error
           retention-days: 1
 
@@ -131,7 +132,7 @@ jobs:
       - uses: actions/cache/save@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml', 'BonitoAgents/test/romeodbenv/Manifest.toml') }}
 
   # ── Unit tests (headless) ─────────────────────────────────────────────────
   unit:
@@ -148,7 +149,7 @@ jobs:
         with:
           name: manifests
           path: manifests-dl
-      # The artifact is rooted at BonitoAgents/ (the common ancestor of the four
+      # The artifact is rooted at BonitoAgents/ (the common ancestor of the five
       # uploaded paths), so this one copy restores all of them.
       - name: Restore the shared Manifests
         # …and fail here if they didn't land where they're expected, rather than
@@ -157,10 +158,11 @@ jobs:
           cp -r manifests-dl/. BonitoAgents/
           test -f BonitoAgents/Manifest.toml
           test -f BonitoAgents/test/Manifest.toml
+          test -f BonitoAgents/test/romeodbenv/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml', 'BonitoAgents/test/romeodbenv/Manifest.toml') }}
           fail-on-cache-miss: true
       - name: Warm the envs this job loads
         run: |
@@ -173,6 +175,9 @@ jobs:
         # main package. `unit` matches the `unit:*` item names; the e2e shards
         # take the browser items.
         run: julia --project=BonitoAgents/test BonitoAgents/test/runtests.jl unit
+
+      - name: RomeoDB search and MCP tests
+        run: julia --threads=2 --project=BonitoAgents/test/romeodbenv RomeoDB/test/runtests.jl
 
       - name: Chat JS unit tests
         # The chat's pure-JS pieces (word diffs, body size reservations) under
@@ -223,17 +228,18 @@ jobs:
           cp -r manifests-dl/. BonitoAgents/
           test -f BonitoAgents/Manifest.toml
           test -f BonitoAgents/test/Manifest.toml
+          test -f BonitoAgents/test/romeodbenv/Manifest.toml
       - uses: actions/cache/restore@v4
         with:
           path: ~/.julia
-          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml') }}
+          key: ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-${{ hashFiles('BonitoAgents/Project.toml', 'BonitoAgents/test/Project.toml', 'RomeoDB/Project.toml', 'BonitoAgents/test/romeodbenv/Project.toml') }}-${{ github.run_id }}-${{ hashFiles('BonitoAgents/Manifest.toml', 'BonitoAgents/test/Manifest.toml', 'BonitoAgents/test/evalenv/Manifest.toml', 'BonitoAgents/test/altenv/Manifest.toml', 'BonitoAgents/test/romeodbenv/Manifest.toml') }}
           fail-on-cache-miss: true
       - name: Warm the test + eval envs
         # The eval envs matter as much as the test env: an eval item's Malt worker
         # mounts a render inside a 30 s DOM wait, and a worker that compiles
         # WGLMakie on first touch never makes it.
         run: |
-          for env in BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv; do
+          for env in BonitoAgents/test BonitoAgents/test/evalenv BonitoAgents/test/altenv BonitoAgents/test/romeodbenv; do
             julia --project=$env .github/scripts/warmup.jl
           done
 

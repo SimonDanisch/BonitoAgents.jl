@@ -17,6 +17,7 @@ include("mcp_relay.jl")
 include("harnesses.jl")
 include("adapter_patches.jl")
 include("managed_processes.jl")
+include("configured_mcp.jl")
 include("worker.jl")
 include("processes.jl")
 include("file_watch.jl")
@@ -695,15 +696,16 @@ function write_config!(; server_url::AbstractString,
                           # this is what lets the worker notice a later server upgrade
                           # without polling a third-party service.
                           update_spec::Union{AbstractDict,Nothing} = nothing,
+                          mcp_servers::Union{AbstractDict,Nothing} = nothing,
                           # Direct callers are dev/test rigs. The public
                           # installer opts in below after recording a real spec.
                           auto_update::Bool = false)
     cfg = config_path()
+    previous = isfile(cfg) ? JSON.parsefile(cfg) : Dict{String,Any}()
     # Installed again without a credential (to update, or from another folder):
     # the machine keeps the one it has for this server. Writing "" would lock it
     # out, and a new credential per reinstall leaves the old ones lying around.
-    if isempty(credential) && isfile(cfg)
-        previous = JSON.parsefile(cfg)
+    if isempty(credential)
         if get(previous, "server_url", "") == server_url && !isempty(get(previous, "credential", ""))
             credential = previous["credential"]
             @info "BonitoWorker: keeping this machine's worker credential" credential = first(split(credential, ':'))
@@ -716,6 +718,10 @@ function write_config!(; server_url::AbstractString,
         "projects_root" => abspath(projects_root),
         "auto_update"   => auto_update,
     )
+    # Reinstallation updates the worker but keeps its machine-local services.
+    servers = mcp_servers === nothing ? get(previous, "mcp_servers", Dict()) : mcp_servers
+    configured_mcp_servers(Dict("mcp_servers" => servers))
+    isempty(servers) || (config["mcp_servers"] = servers)
     update_spec === nothing || (config["update_spec"] = Dict{String,Any}(
         String(k) => String(v) for (k, v) in update_spec))
     write(cfg, JSON.json(config))
@@ -955,6 +961,7 @@ function start(; force::Bool = false)
     # worker's agents.
     reap_stray_agents!()
     config = JSON.parse(read(cfg, String))
+    ensure_worker_packages!(config)
     worker_id = load_or_generate_worker_id()
     connect_and_serve(;
         server_url    = String(config["server_url"]),
@@ -981,6 +988,7 @@ function connect_and_serve(; server_url::String,
                             name::String          = default_worker_name(worker_id),
                             mcp_command::String   = "julia",
                             mcp_arguments::Vector{String} = mcp_args(),
+                            mcp_servers::Vector{ConfiguredMCPServer} = configured_mcp_servers(; command = mcp_command),
                             projects_root::String = joinpath(homedir(), "bonitoagents-projects"),
                             # `nothing` is the standalone/dev default. Only a real
                             # installer writes an auto-update-enabled config.
@@ -1000,7 +1008,7 @@ function connect_and_serve(; server_url::String,
     # Stamped once, for the debug chat's uptime readout (`worker_state`). Not a
     # `const` computed at load: that bakes the precompiling machine's clock.
     WORKER_STARTED[] == 0.0 && (WORKER_STARTED[] = time())
-    w = Worker(WorkerConfig(; server_url, credential, worker_id, name, mcp_command, mcp_arguments,
+    w = Worker(WorkerConfig(; server_url, credential, worker_id, name, mcp_command, mcp_arguments, mcp_servers,
                             projects_root, update_config, instance, crashed_instance))
     serve(w; retry_delay)
     return nothing
@@ -1028,6 +1036,25 @@ end
 
 function configured_update_spec(config::AbstractDict)
     update_spec_from_wire(get(config, "update_spec", nothing))
+end
+
+# An older worker's fixed updater package list does not know RomeoDB yet. Keep
+# it out of BonitoWorker's hard dependencies so that update can resolve, then
+# complete the installation on the upgraded worker's first start. Fresh
+# installers, current updaters and desktop bundles already include it.
+function missing_worker_packages(config::AbstractDict, installed)
+    "RomeoDB" in installed && return Pkg.PackageSpec[]
+    target = configured_update_spec(config)
+    target === nothing && error("RomeoDB is missing from this worker environment; rerun the server's worker installer")
+    return [Pkg.PackageSpec(name = "RomeoDB", url = target["repo"], subdir = "RomeoDB", rev = target["source_id"])]
+end
+
+function ensure_worker_packages!(config::AbstractDict)
+    specs = missing_worker_packages(config, Base.find_package("RomeoDB") === nothing ? String[] : ["RomeoDB"])
+    isempty(specs) && return nothing
+    @info "BonitoWorker: completing the default RomeoDB installation"
+    Pkg.add(specs)
+    return nothing
 end
 
 auto_update_enabled(config::AbstractDict) = get(config, "auto_update", false) === true
@@ -1061,6 +1088,7 @@ function update_packages!(target::Dict{String,String})
         Pkg.PackageSpec(name = "BonitoWorker", url = target["repo"], subdir = "BonitoWorker", rev = target["source_id"]),
         Pkg.PackageSpec(name = "BonitoMCP", url = target["repo"], subdir = "BonitoMCP", rev = target["source_id"]),
         Pkg.PackageSpec(name = "AgentProviders", url = target["repo"], subdir = "AgentProviders", rev = target["source_id"]),
+        Pkg.PackageSpec(name = "RomeoDB", url = target["repo"], subdir = "RomeoDB", rev = target["source_id"]),
         Pkg.PackageSpec(name = "Bonito", url = target["bonito_url"], rev = target["bonito_rev"]),
     ]
     Pkg.add(specs)
@@ -2383,17 +2411,25 @@ end
 # Hand our MCP server (the injected `btworker` entry) a grant to this worker's
 # relay, for the chat the server named in it. It goes into the launch
 # configuration explicitly: Codex, for one, does not pass arbitrary parent
-# environment on to MCP servers. Other MCP servers and all other ACP traffic
-# pass unchanged; applied to new and resumed sessions alike.
-function inject_mcp_grant(line::String, relay::MCPRelay, owner::AbstractString)
+# environment on to MCP servers. Append configured worker-local servers at the
+# same boundary for new, loaded, forked and resumed sessions; other traffic
+# passes unchanged.
+function inject_mcp_grant(line::String, relay::MCPRelay, owner::AbstractString,
+                          configured::Vector{ConfiguredMCPServer} = ConfiguredMCPServer[])
     msg = JSON.parse(line)
     msg isa AbstractDict || return line
     get(msg, "method", nothing) in ("session/new", "session/load", "session/fork", "session/resume") || return line
     params = get(msg, "params", nothing)
     params isa AbstractDict || return line
-    servers = get(params, "mcpServers", nothing)
+    servers = isempty(configured) ? get(params, "mcpServers", nothing) : get!(params, "mcpServers", Any[])
     servers isa AbstractVector || return line
     changed = false
+    for server in configured
+        any(s -> get(s, "name", "") == server.name, servers) &&
+            error("MCP server $(server.name) is configured twice in this chat; use a distinct worker-local name")
+        push!(servers, mcp_payload(server))
+        changed = true
+    end
     for mcp in servers
         mcp isa AbstractDict || continue
         get(mcp, "name", nothing) == "btworker" || continue
@@ -2411,11 +2447,12 @@ end
 
 # Line shuttle from the session's channel to the agent's stdin, granting our
 # MCP server its relay access on the way (`inject_mcp_grant`).
-function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString)
+function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString,
+                          configured::Vector{ConfiguredMCPServer} = ConfiguredMCPServer[])
     try
         while !WebSockets.isclosed(ws)
             frame = WebSockets.receive(ws)
-            line  = inject_mcp_grant(String(frame), relay, owner)
+            line  = inject_mcp_grant(String(frame), relay, owner, configured)
             endswith(line, '\n') || (line *= "\n")
             write(proc.in, line)
             flush(proc.in)

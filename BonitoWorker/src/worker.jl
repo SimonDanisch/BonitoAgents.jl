@@ -26,6 +26,8 @@ Base.@kwdef struct WorkerConfig
     name::String
     mcp_command::String
     mcp_arguments::Vector{String}
+    mcp_servers::Vector{ConfiguredMCPServer} = isempty(mcp_command) ? ConfiguredMCPServer[] :
+                                              configured_mcp_servers(; command = mcp_command)
     projects_root::String
     # Environment for every agent, over the inherited one.
     agent_env::Dict{String,String} = Dict{String,String}()
@@ -563,7 +565,7 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         @info "BonitoWorker: ACP session started" project_id cwd provider = provider_str pid = getpid(proc)
         try
             channel_ready(ch)
-            to_agent   = @async relay_ws_to_proc(ch, proc, relay, owner)
+            to_agent   = @async relay_ws_to_proc(ch, proc, relay, owner, c.mcp_servers)
             from_agent = @async relay_proc_to_ws(proc, ch)
             try
                 wait(to_agent)
