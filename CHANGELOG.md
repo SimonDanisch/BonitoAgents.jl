@@ -194,6 +194,8 @@ live.
   the command from **Add worker** again, without the credential.
 - **Codex:** log in on each worker that should run it (`codex login`, or set
   `CODEX_API_KEY` / `OPENAI_API_KEY` for the worker).
+- **From source:** BonitoAgents now uses the registered Bonito 5.3 instead of a
+  git branch.
 
 ## v0.1.0
 

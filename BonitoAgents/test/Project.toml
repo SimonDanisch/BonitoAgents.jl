@@ -1,10 +1,10 @@
 # Dedicated test environment. `Pkg.test` / `ReTestItems.runtests` activate THIS
 # project, so its `[sources]` decide where deps resolve from. The packages UNDER
 # TEST (BonitoAgents + its sibling sub-packages) resolve from the local dev
-# checkouts so tests run against the source we're editing; everything else
-# (Bonito/BonitoBook/BonitoWidgets/ElectronCall) pins to the SAME git url+rev CI
-# uses, NOT a local folder — the local layout isn't reproducible on CI. Keep
-# these revs in sync with BonitoAgents's own `[sources]`. Scoped to BonitoAgents's
+# checkouts so tests run against the source we're editing; Bonito is the registered
+# release; everything else (BonitoBook/BonitoWidgets/ElectronCall) pins to the SAME
+# git url+rev CI uses, NOT a local folder — the local layout isn't reproducible on
+# CI. Keep these in sync with BonitoAgents's own `[sources]`. Scoped to BonitoAgents's
 # real deps + the test tools, so it never drags in the umbrella's Makie/Sunny stack.
 [deps]
 BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"
@@ -37,7 +37,6 @@ MockACP = {path = "MockACP"}
 BonitoMCP = {path = "../../BonitoMCP"}
 BonitoWorker = {path = "../../BonitoWorker"}
 RemoteSync = {path = "../../RemoteSync"}
-Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
 ElectronCall = {url = "https://github.com/IanButterworth/ElectronCall.jl.git", rev = "sd/testsuite"}
 BonitoBook = {url = "https://github.com/SimonDanisch/BonitoBook.jl.git", rev = "sd/llm-improvements"}
 BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
@@ -45,4 +44,5 @@ BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", r
 WorkerLink = {path = "../../WorkerLink"}
 
 [compat]
+Bonito = "5.3"
 BonitoWidgets = "0.1.3"

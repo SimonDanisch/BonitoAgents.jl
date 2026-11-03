@@ -291,12 +291,9 @@ end
 # The upgrade-card marker the chat decodes (`bonito_upgrade_descriptor` in
 # BonitoAgents remote_app.jl): a value wanted a live display but the project env's
 # Bonito is too old. Carries current/needed versions + the `Pkg.add` the [Update
-# env] button runs. Bonito's live-render fixes aren't released, so the add pins
-# the git branch (works without a release).
-const BONITO_UPGRADE_URL = "https://github.com/SimonDanisch/Bonito.jl"
-const BONITO_UPGRADE_REV = "sd/media-proxy"
+# env] button runs. It installs 5.3, the first release with the live-render fixes.
 function bonito_upgrade_block(current::AbstractString, env_path)
-    add = "Pkg.add(url=\"$(BONITO_UPGRADE_URL)\", rev=\"$(BONITO_UPGRADE_REV)\")"
+    add = "Pkg.add(name=\"Bonito\", version=\"5.3\")"
     e(x) = json_escape_string(string(x))
     j = string("{\"bonito_upgrade\":{",
                "\"current\":\"", e(current), "\",",

@@ -14,7 +14,7 @@ const TK = TestKit
 
 const UPGRADE_MARKER = JSON.json(Dict("bonito_upgrade" => Dict(
     "current" => "4.5.0", "need" => "5.0.0", "env" => "/tmp/proj",
-    "add" => "Pkg.add(url=\"https://github.com/SimonDanisch/Bonito.jl\", rev=\"sd/media-proxy\")")))
+    "add" => "Pkg.add(name=\"Bonito\", version=\"5.3\")")))
 
 const APPCODE = "using WGLMakie\nApp() do\n    lines(1:10)\nend"
 
@@ -54,10 +54,10 @@ function run_suite(server)
             "!(document.querySelector('$CARD').innerText||'').includes('bonito_upgrade')") == true
 
         # Click [Update env] → the fix is submitted as a user message (carries the
-        # Pkg.add pinning the git branch).
+        # Pkg.add of the release).
         TK.eval_js(server, "document.querySelector('$CARD .bt-worker-upgrade-btn').click(); true")
         @test TK.wait_for(server, "fix prompt submitted",
-            "document.body.innerText.includes('sd/media-proxy')"; timeout = 20) == true
+            "document.body.innerText.includes('Pkg.add(name=')"; timeout = 20) == true
 
         @test isempty(TK.js_errors(server))
     end

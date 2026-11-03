@@ -5,7 +5,7 @@
 # failure if one path were a prefix of the other, which is why this is `altenv`
 # and not `evalenv2`.
 #
-# Deps are deliberately minimal: only Bonito, pinned to the SAME rev as
+# Deps are deliberately minimal: only Bonito, at the SAME version as
 # test/evalenv (and test/Project.toml), so both sides of the eval proxy agree.
 # Bonito is not optional here — the eval worker's live-render bridge is gated on
 # Bonito ≥ 5 (`MIN_BRIDGE_BONITO` in BonitoMCP/src/session.jl), and a project
@@ -26,5 +26,5 @@ version = "0.0.1"
 [deps]
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 
-[sources]
-Bonito = {rev = "sd/media-proxy", url = "https://github.com/SimonDanisch/Bonito.jl.git"}
+[compat]
+Bonito = "5.3"

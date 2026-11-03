@@ -70,9 +70,9 @@ jobs:
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
       - name: Resolve + refresh the git-pinned forks
-        # The UI forks (Bonito, BonitoBook, BonitoWidgets) are [sources] of the
-        # main env; ElectronCall is TEST-only, and the eval envs carry their own
-        # Bonito/Makie pins — update each fork in the env it actually lives in
+        # BonitoBook and BonitoWidgets are [sources] of the main env and Bonito is
+        # the registered release; ElectronCall is TEST-only, and the eval envs carry
+        # their own Makie pins — update each package in the env it actually lives in
         # (`Pkg.update(["ElectronCall"])` on the main env errors with "not found
         # in project or manifest").
         run: |
