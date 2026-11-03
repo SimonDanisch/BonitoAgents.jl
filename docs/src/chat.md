@@ -38,6 +38,9 @@ go. Home and End jump to the first and the last message.
   group runs, even between agent turns. Expand a row for worker, PID, command
   and output. Stop requests interruption; its menu offers Terminate and Force
   kill. The row remains until the worker confirms exit.
+  Each `bt_process` call also has a card in the chat, titled with what it did
+  and the job it did it to. A failed job shows a red pill. Open the card for the
+  command, folder, worker and output.
 - **Plans and todo lists** the agent maintains are pinned to the taskbar while
   the turn runs.
 - **Subagents** (for example Claude Code's Task tool) get their own activity

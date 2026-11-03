@@ -1214,6 +1214,54 @@ mutable struct JuliaWaitToolMsg <: MCPToolMsg         # bt_julia_wait
 end
 JuliaWaitToolMsg(message::Message, server) = JuliaWaitToolMsg(message, server, String[], "all")
 
+# One job as a `bt_process` result reports it (BonitoAgents' `public_process_result`).
+# `process_reply` is the one place that format is decoded (managed_processes.jl).
+struct ProcessJob
+    id::String
+    label::String
+    status::String
+    argv::Vector{String}
+    cwd::String
+    worker::String
+    pid::Int
+    exitcode::Union{Int,Nothing}
+    signal::Union{Int,Nothing}
+    started::Float64
+    finished::Union{Float64,Nothing}
+    error::String
+    control_error::String         # a stop request the worker could not carry out
+    output::String                # the tail or byte range the call asked for
+    output_bytes::Int             # everything the job has written so far
+    wait_reason::String           # "exited" | "timeout" | "message"; "" unless a wait
+end
+
+struct ProcessJobList             # `action = "list"`, newest first
+    jobs::Vector{ProcessJob}
+end
+
+mutable struct ProcessToolMsg <: MCPToolMsg           # bt_process
+    message::Message
+    server::String
+    action::String                # "" until the arguments stream in
+    job_id::String
+    label::String                 # the call's own, then the job's from the result
+    argv::Vector{String}
+    seconds::Union{Float64,Nothing}                   # how long a wait may block
+    reply::Union{ProcessJob,ProcessJobList,Nothing}   # nothing until decoded
+end
+ProcessToolMsg(message::Message, server) =
+    ProcessToolMsg(message, server, "", "", "", String[], nothing, nothing)
+
+mutable struct JsonToolMsg <: MCPToolMsg              # answers with one JSON blob
+    message::Message
+    server::String
+    tool_name::String             # several tools share this card; see MCP_MSG_TYPES
+end
+
+# Text that becomes a tool's title: one line without backticks, because chat.md
+# keeps a title on one line between backticks.
+one_line_title(t::AbstractString) = String(strip(replace(replace(t, '`' => ""), r"\s+" => " ")))
+
 # Streamed-argument parsing for the typed MCP variants (see `apply_input!` above).
 function apply_input!(m::GenericMCPToolMsg, raw::AbstractDict)
     merge!(m.raw_input, raw)
@@ -1222,13 +1270,24 @@ end
 function apply_input!(m::ShowToolMsg, raw::AbstractDict)
     p = get(raw, "path", nothing)
     p isa AbstractString && !isempty(p) && (m.path = String(p))
-    # One line without backticks: it becomes the tool's title, which chat.md
-    # keeps on one line between backticks.
     t = get(raw, "title", nothing)
     if t isa AbstractString
-        caption = strip(replace(replace(t, '`' => ""), r"\s+" => " "))
-        isempty(caption) || (m.caption = String(caption))
+        caption = one_line_title(t)
+        isempty(caption) || (m.caption = caption)
     end
+    return nothing
+end
+function apply_input!(m::ProcessToolMsg, raw::AbstractDict)
+    a = get(raw, "action", nothing)
+    a isa AbstractString && !isempty(a) && (m.action = String(a))
+    id = get(raw, "id", nothing)
+    id isa AbstractString && !isempty(id) && (m.job_id = String(id))
+    l = get(raw, "label", nothing)
+    l isa AbstractString && !isempty(l) && (m.label = String(l))
+    argv = get(raw, "argv", nothing)
+    argv isa AbstractVector && (m.argv = [String(x) for x in argv if x isa AbstractString])
+    s = get(raw, "seconds", nothing)
+    s isa Real && (m.seconds = Float64(s))
     return nothing
 end
 apply_input!(m::JuliaEvalCall, raw::AbstractDict) = apply_eval_input!(m, raw)
@@ -1279,6 +1338,15 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
     "bt_julia_list_sessions" => JuliaListSessionsToolMsg,
     "bt_julia_wait"          => JuliaWaitToolMsg,
     "bt_show"                => ShowToolMsg,
+    "bt_process"             => ProcessToolMsg,
+    # Every dev tool and `bt_progress` answer through BonitoMCP's `dev_result`.
+    "bt_progress"            => JsonToolMsg,
+    "bt_dev_inspect"         => JsonToolMsg,
+    "bt_dev_logs"            => JsonToolMsg,
+    "bt_dev_memory"          => JsonToolMsg,
+    "bt_dev_control"         => JsonToolMsg,
+    "bt_dev_timings"         => JsonToolMsg,
+    "bt_dev_console"         => JsonToolMsg,
 )
 mcp_msg_type(tool_name::AbstractString) = get(MCP_MSG_TYPES, tool_name, GenericMCPToolMsg)
 
@@ -1340,9 +1408,24 @@ function build_mcp_msg(T::Type{<:MCPToolMsg}, message::Message, server, tool_nam
     message.title = String(tool_name)
     return T(message, String(server))
 end
-function build_mcp_msg(::Type{GenericMCPToolMsg}, message::Message, server, tool_name)
+function build_mcp_msg(T::Type{<:Union{GenericMCPToolMsg,JsonToolMsg}}, message::Message, server, tool_name)
     message.title = String(tool_name)
-    return GenericMCPToolMsg(message, String(server), String(tool_name))
+    return T(message, String(server), String(tool_name))
+end
+
+# What a reopened chat rebuilds from chat.md (`load_history`). An MCP card with
+# nothing live behind it comes back typed, so its body looks as it did; every
+# other MCP call stays generic. The persisted title is kept, not reset to the
+# tool's name.
+restored_tool_msg(kind::AbstractString, name::AbstractString, message::Message) =
+    restored_tool_msg(mcp_msg_type(name), kind, name, message)
+restored_tool_msg(::Type{<:MCPToolMsg}, kind, name, message) =
+    builtin_msg_type(kind, name)(message)
+function restored_tool_msg(T::Type{<:Union{ProcessToolMsg,JsonToolMsg}}, kind, name, message)
+    title = message.title
+    m = build_mcp_msg(T, message, "", name)
+    m.message.title = title
+    return m
 end
 
 """
@@ -2105,7 +2188,8 @@ tool_key(::BashToolMsg)     = "Bash"
 tool_key(::TaskToolMsg)     = "Task"
 # Known MCP tools: the TYPE is the name — no string field needed. Only the
 # unknown-tool fallback carries the wire name as data.
-tool_key(m::GenericMCPToolMsg)       = m.tool_name
+tool_key(m::Union{GenericMCPToolMsg,JsonToolMsg}) = m.tool_name
+tool_key(::ProcessToolMsg)           = "bt_process"
 tool_key(::ShowToolMsg)              = "bt_show"
 tool_key(::JuliaEvalToolMsg)         = "bt_julia_eval"
 tool_key(::JuliaContinueToolMsg)     = "bt_julia_continue"
@@ -2114,7 +2198,12 @@ tool_key(::JuliaRestartToolMsg)      = "bt_julia_restart"
 tool_key(::JuliaListSessionsToolMsg) = "bt_julia_list_sessions"
 tool_key(::JuliaWaitToolMsg)         = "bt_julia_wait"
 
+# A card whose header depends on its call or result gets them back from the files
+# beside the chat when it was rebuilt from chat.md. Default: nothing to restore.
+restore_call!(::ToolMsg, ::AbstractString) = nothing
+
 function tool_header_dict(m::ToolMsg, chat_dir::AbstractString="")
+    restore_call!(m, chat_dir)
     pretty_title, server = pretty_tool_title(tool_title(m))
     d = Dict{String,Any}(
         "type" => "tool",
@@ -2674,7 +2763,7 @@ function Bonito.jsrender(session::Session, c::Collapsable)
         dataPinEnd=c.pin_end ? "1" : nothing,
         style=Styles("--bt-summary-lines" => string(c.summary_lines),
                      "--bt-full-lines" => string(c.full_lines)),
-        open=c.state === :collapsed ? nothing : true))
+        open=c.state !== :collapsed))
 end
 
 tool_subsection(label::AbstractString, body; kwargs...) = Collapsable(label, body; kwargs...)
@@ -3926,6 +4015,21 @@ function render_tool_content(state::ServerState, m::BashToolMsg, content, projec
     text = join((c.text for c in content if c isa TextContent), "\n")
     isempty(text) && return render_tool_parts(state, m, content, project_id)
     return CodeView(text; language = "shell")
+end
+# JSON stays literal. As markdown its lines ran together and `_` and `--` became
+# formatting. A failed call answers with an error message, not JSON.
+function render_tool_content(state::ServerState, m::JsonToolMsg, content, project_id::AbstractString)
+    text = reply_text(content)
+    isempty(text) && return render_tool_parts(state, m, content, project_id)
+    return CodeView(text; language = tool_status(m) == "failed" ? "plaintext" : "json")
+end
+
+# A tool's text, whatever an adapter wrapped it in: claude-agent-acp puts an
+# error's text in a code fence.
+function reply_text(content)
+    text = join((c.text for c in content if c isa TextContent), "\n")
+    fenced = fenced_code(text)
+    return fenced === nothing ? text : last(fenced)
 end
 
 # ── The message is the streaming target ─────────────────────────────────────

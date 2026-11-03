@@ -567,12 +567,12 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # a reopened refactor showed "The file … has been updated
             # successfully" where the diff belongs.
             #
-            # Deliberately NOT the MCP types: a restored `bt_julia_eval` would
-            # try to mount a live result embed against a RemoteRef that died
-            # with its worker. `builtin_msg_type` never returns one (MCP routing
-            # is a separate door), so this restores exactly the display-only
-            # variants — edit, read, search, move, fetch.
-            push!(msgs, builtin_msg_type(string(kind), string(name))(
+            # Deliberately NOT the live MCP types: a restored `bt_julia_eval`
+            # would try to mount a live result embed against a RemoteRef that
+            # died with its worker. `restored_tool_msg` restores exactly the
+            # display-only variants: edit, read, search, move, fetch, and the MCP
+            # cards that only draw their result (bt_process, the JSON tools).
+            push!(msgs, restored_tool_msg(string(kind), string(name),
                 Message(string(id), string(kind), string(name), tool_title,
                         string(status), summary, time(), time(), nothing)))
         elseif category == "plan"

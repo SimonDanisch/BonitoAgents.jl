@@ -150,6 +150,9 @@ live.
   readable `.md`, every tool call with its full output and diffs. It is also a
   BonitoBook notebook: each Julia eval is a cell you can run again (thanks
   @sbordt).
+- A `bt_process` card now says what the call did and how it went, such as
+  "Wait for Build docs · failed · exit 3", with a red pill when the job failed.
+  Opening it shows the command, folder, worker and output.
 
 ### Developer tools
 
@@ -175,6 +178,8 @@ live.
 - An error page with a long stack trace no longer stalls the server while it
   compiles a renderer for that length.
 - Logging a rendering error no longer prints a whole live chat.
+- JSON results from `bt_progress` and the dev tools show as JSON. As Markdown their
+  lines ran together, and `--` and `_` turned into formatting.
 - Many fixes to scrolling, streaming, reconnects, worker links and tests that
   were flaky on CI.
 

@@ -295,3 +295,198 @@ function taskbar_slot(session,bar,item,head,t::ManagedProcessTask)
     }""")
     return node
 end
+
+# ── The `bt_process` card ────────────────────────────────────────────────────
+# The card says what a call did in its title and summary; opening it shows the
+# job's details and output. The title comes from the call's arguments and the
+# summary from its result, so they stay right whatever the agent labels the tool.
+
+ProcessJob(d::AbstractDict) = ProcessJob(String(d["id"]), String(d["label"]), String(d["status"]),
+    String[String(a) for a in d["argv"]], String(d["cwd"]), String(d["worker"]), Int(d["pid"]),
+    d["exitcode"], d["signal"], Float64(d["started"]), d["finished"], String(d["error"]),
+    String(get(d, "control_error", "")), String(d["output"]), Int(d["output_bytes"]),
+    String(get(d, "wait_reason", "")))
+
+# Exact decode of a result. The text can legitimately be something else: an error
+# message, or JSON an agent cut short because it was too long. Those are not jobs,
+# so they return nothing and the card shows the text as it is.
+function process_reply(content)
+    text = reply_text(content)
+    JSON.isvalidjson(text) || return nothing
+    d = JSON.parse(text)
+    d isa AbstractDict || return nothing
+    if haskey(d, "jobs")
+        jobs = ProcessJob[ProcessJob(j) for j in d["jobs"]]
+        return ProcessJobList(sort!(jobs; by = j -> j.started, rev = true))
+    end
+    fields = ("id", "label", "status", "argv", "cwd", "worker", "pid", "exitcode", "signal",
+              "started", "finished", "error", "output", "output_bytes")
+    return all(k -> haskey(d, k), fields) ? ProcessJob(d) : nothing
+end
+
+reply_failed(job::ProcessJob) = job.status in ("failed", "lost")
+reply_failed(::ProcessJobList) = false
+
+command_line(argv) = join(Base.shell_escape.(argv), ' ')
+
+function process_duration(seconds::Real)
+    seconds < 60 && return string(round(seconds; digits = 1), " s")
+    minutes = floor(Int, seconds / 60)
+    minutes < 60 && return string(minutes, " min ", round(Int, seconds - 60 * minutes), " s")
+    return string(minutes ÷ 60, " h ", minutes % 60, " min")
+end
+
+# "succeeded", "failed · exit 3", "killed · signal 9". A clean exit needs no number.
+function job_state(job::ProcessJob)
+    parts = [job.status]
+    something(job.exitcode, 0) == 0 || push!(parts, "exit $(job.exitcode)")
+    something(job.signal, 0) == 0 || push!(parts, "signal $(job.signal)")
+    return join(parts, " · ")
+end
+
+reply_summary(list::ProcessJobList) = string(length(list.jobs), length(list.jobs) == 1 ? " command" : " commands",
+    " · ", count(j -> j.status in BonitoWorker.PROCESS_ACTIVE, list.jobs), " running")
+function reply_summary(job::ProcessJob)
+    parts = [job_state(job)]
+    job.wait_reason == "timeout" && push!(parts, "wait timed out")
+    job.wait_reason == "message" && push!(parts, "woken by a message")
+    job.finished === nothing || push!(parts, process_duration(job.finished - job.started))
+    return join(parts, " · ")
+end
+
+function process_summary(m::ProcessToolMsg, content)
+    m.reply === nothing || return reply_summary(m.reply)
+    if isempty(content)
+        return m.seconds === nothing ? "" : "up to " * process_duration(m.seconds)
+    end
+    tool_status(m) == "failed" && return String(first(split(reply_text(content), '\n')))
+    return content_summary_default(content)
+end
+
+# A call that names only an id has no label until its result: a wait can block for
+# minutes. The chat's book already knows the job.
+function known_job_label(m::ProcessToolMsg)
+    chat = tool_chat(m)
+    (chat === nothing || isempty(m.job_id)) && return ""
+    state = root_state(chat.state)
+    project = get(state.projects[], chat.project_id, nothing)
+    book = lock(() -> get(state.process_jobs, chat.project_id, nothing), state.lock)
+    (project === nothing || book === nothing) && return ""
+    key = managed_task_id(project.worker_id, m.job_id)
+    return lock(book.lock) do
+        record = get(book.jobs, key, nothing)
+        record === nothing ? "" : String(record["label"])
+    end
+end
+
+# A job's name for a person: its label; else its command (without a label the
+# worker labels a job with its id, which says less).
+function job_name(label::AbstractString, id::AbstractString, argv)
+    !isempty(label) && label != id && return String(label)
+    return isempty(argv) ? String(id) : command_line(argv)
+end
+job_name(job::ProcessJob) = job_name(job.label, job.id, job.argv)
+job_name(m::ProcessToolMsg) =
+    job_name(isempty(m.label) ? known_job_label(m) : m.label, m.job_id, m.argv)
+
+function process_title(m::ProcessToolMsg; max_length::Int = 120)
+    m.action == "list" && return "List background commands"
+    verbs = (start = "Start", wait = "Wait for", status = "Check", output = "Read output of",
+             interrupt = "Interrupt", terminate = "Terminate", kill = "Force kill")
+    title = one_line_title(string(get(verbs, Symbol(m.action), m.action), " ", job_name(m)))
+    # A command can be a whole script. The body shows all of it.
+    return length(title) <= max_length ? title : first(title, max_length - 1) * "…"
+end
+
+# The result fills in what the call did not name, and a job that failed fails the
+# card: the call worked, but the green pill is read as "the command worked".
+function adopt_reply!(m::ProcessToolMsg, content)
+    m.reply = process_reply(content)
+    if m.reply isa ProcessJob
+        m.label = m.reply.label
+        m.argv = m.reply.argv
+        m.job_id = m.reply.id
+    end
+    m.reply !== nothing && reply_failed(m.reply) && (m.message.status = "failed")
+    return nothing
+end
+
+snap_title(b::ProcessToolMsg, ::AbstractString) = isempty(b.action) ? tool_title(b) : process_title(b)
+snap_summary(b::ProcessToolMsg, snap) = process_summary(b, snap.content)
+
+function update_from_snap!(b::ProcessToolMsg, snap)
+    apply_input!(b, snap.raw_input)
+    tool_status(b) in ("completed", "failed") && adopt_reply!(b, snap.content)
+    return nothing
+end
+
+# Rebuilt from chat.md, the card has its persisted title and summary; a chat written
+# before this card has only "bt_process" and a byte count there. Both are redone
+# from the call and the result stored beside the chat.
+function restore_call!(m::ProcessToolMsg, chat_dir::AbstractString)
+    (isempty(chat_dir) || m.reply !== nothing || !(tool_status(m) in ("completed", "failed"))) &&
+        return nothing
+    raw = stored_raw_input(chat_dir, tool_id(m))
+    raw === nothing || apply_input!(m, raw)
+    content = tool_content_for_render(m, chat_dir)
+    isempty(content) && return nothing
+    adopt_reply!(m, content)
+    isempty(m.action) || (m.message.title = process_title(m))
+    m.message.summary = process_summary(m, content)
+    return nothing
+end
+
+const PROCESS_CARD_STYLES = Styles(
+    CSS(".bt-process-card", "display"=>"flex", "flex-direction"=>"column", "min-width"=>"0",
+        "gap"=>"var(--bw-space-2)", "padding-top"=>"var(--bw-space-2)"),
+    CSS(".bt-process-facts", "display"=>"grid", "grid-template-columns"=>"max-content minmax(0, 1fr)",
+        "gap"=>"var(--bw-space-1) var(--bw-space-3)", "margin"=>"0", "font-size"=>"var(--bw-font-size-sm)"),
+    CSS(".bt-process-job-name", "font-size"=>"var(--bw-font-size-sm)", "overflow-wrap"=>"anywhere"),
+    CSS(".bt-process-fact", "display"=>"contents"),
+    CSS(".bt-process-facts dt", "color"=>"var(--bw-text-muted)"),
+    CSS(".bt-process-facts dd", "margin"=>"0", "min-width"=>"0", "overflow-wrap"=>"anywhere"),
+    CSS(".bt-process-facts code", "font-family"=>"ui-monospace, monospace", "white-space"=>"pre-wrap"))
+
+function process_facts(job::ProcessJob)
+    facts = Pair{String,Any}["Status" => job_state(job)]
+    isempty(job.wait_reason) || push!(facts, "Wait ended" => job.wait_reason)
+    isempty(job.error) || push!(facts, "Error" => job.error)
+    isempty(job.control_error) || push!(facts, "Stop failed" => job.control_error)
+    push!(facts, "Command" => DOM.code(command_line(job.argv)), "Folder" => DOM.code(job.cwd),
+        "Worker" => job.worker, "Job id" => DOM.code(job.id), "Process id" => string(job.pid),
+        "Started" => Dates.format(Dates.unix2datetime(job.started), "yyyy-mm-dd HH:MM:SS") * " UTC")
+    job.finished === nothing || push!(facts, "Ran for" => process_duration(job.finished - job.started))
+    return facts
+end
+
+function Bonito.jsrender(session::Session, job::ProcessJob)
+    facts = DOM.dl(Any[DOM.div(DOM.dt(name), DOM.dd(value); class = "bt-process-fact")
+                       for (name, value) in process_facts(job)]; class = "bt-process-facts")
+    parts = Any[PROCESS_CARD_STYLES, facts]
+    if !isempty(job.output)
+        kept = sizeof(job.output)
+        push!(parts, Collapsable("Output", console_block(job.output);
+            preview = kept < job.output_bytes ? "last $(kept) of $(job.output_bytes) bytes" : "",
+            summary_lines = 10, pin_end = true, console = true))
+    end
+    return Bonito.jsrender(session, DOM.div(parts; class = "bt-process-card"))
+end
+
+function Bonito.jsrender(session::Session, list::ProcessJobList)
+    isempty(list.jobs) && return Bonito.jsrender(session,
+        DOM.div("No background commands in this chat."; class = "bt-tool-empty"))
+    # A node, because a section's text label is set in capitals: a command's case matters.
+    rows = Any[Collapsable(DOM.span(job_name(job); class = "bt-process-job-name"), job;
+                           preview = job_state(job), state = :collapsed,
+                           summary_lines = 16, full_lines = 40) for job in list.jobs]
+    return Bonito.jsrender(session, DOM.div(PROCESS_CARD_STYLES, rows; class = "bt-process-card"))
+end
+
+# Anything that is not a job goes out as it came: never through markdown.
+function render_tool_content(state::ServerState, m::ProcessToolMsg, content, project_id::AbstractString)
+    reply = process_reply(content)
+    reply === nothing || return reply
+    text = reply_text(content)
+    isempty(text) && return render_tool_parts(state, m, content, project_id)
+    return CodeView(text; language = "plaintext")
+end

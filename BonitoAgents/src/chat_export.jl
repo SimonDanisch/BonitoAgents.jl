@@ -120,6 +120,7 @@ export_tool_name(m::ToolMsg) =
     first(pretty_tool_title(isempty(m.message.name) ? tool_kind(m) : m.message.name))
 export_tool_name(::JuliaEvalToolMsg) = "bt_julia_eval"
 export_tool_name(::JuliaContinueToolMsg) = "bt_julia_continue"
+export_tool_name(m::Union{ProcessToolMsg,JsonToolMsg}) = tool_key(m)
 
 # ── A tool's input ────────────────────────────────────────────────────────────
 
@@ -193,6 +194,10 @@ function export_body!(ex::ChatExport, m::EditToolMsg, content)
     end
     foreach(d -> export_content!(ex, d), diffs)
 end
+
+# Their results are JSON: a fence keeps it literal, as on the card.
+export_body!(ex::ChatExport, ::Union{ProcessToolMsg,JsonToolMsg}, content) =
+    foreach(c -> c isa TextContent ? fence(ex, "json", c.text) : export_content!(ex, c), content)
 
 # The input line already names the shown file.
 export_body!(ex::ChatExport, ::ShowToolMsg, content) =
