@@ -178,6 +178,8 @@ live.
 - An error page with a long stack trace no longer stalls the server while it
   compiles a renderer for that length.
 - Logging a rendering error no longer prints a whole live chat.
+- A worker that loses its ID file restores its identity from its config. If both
+  are gone it reports an error and doesn't register as a different worker.
 - Shared pages show the BonitoAgents icon in the browser tab.
 - JSON results from `bt_progress` and the dev tools show as JSON. As Markdown their
   lines ran together, and `--` and `_` turned into formatting.

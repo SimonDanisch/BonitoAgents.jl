@@ -135,6 +135,12 @@ fail with an error instead of hanging, and a reconnect re-establishes the path.
 
 ## Managing workers
 
+The worker keeps its identity in `worker_id` and backs it up in `config.json`.
+If the ID file is missing or empty, it restores the saved ID automatically.
+Keep these files when reinstalling: existing chats refer to this identity.
+If both copies are missing from an existing installation, startup reports an
+error instead of silently registering a different worker.
+
 Each worker card on the dashboard shows its status dot, lets you rename it,
 and offers *Rescan* to refresh the discovered-sessions list. The `worker.log`
 lives next to the worker config (a Julia scratchspace by default; the exact

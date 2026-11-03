@@ -24,6 +24,7 @@ BonitoWorker.WebSockets.send(::NullWS, ::Any) = nothing
 @testset "BonitoWorker" begin
 
 include("test_mcp_env.jl")
+include("test_worker_identity.jl")
 
 # ── which_executable ──────────────────────────────────────────────────────────
 # Tests the contract directly via a planted file on a temp PATH dir — avoids

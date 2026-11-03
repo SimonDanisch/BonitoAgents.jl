@@ -295,17 +295,48 @@ function generate_worker_id()
                   bytes[21:32])
 end
 
+function write_private_file(path::AbstractString, data::AbstractString)
+    tmp, io = mktemp(dirname(path))
+    try
+        write(io, data)
+        close(io)
+        chmod(tmp, 0o600)
+        Base.Filesystem.rename(tmp, path)
+    finally
+        isopen(io) && close(io)
+        isfile(tmp) && rm(tmp)
+    end
+    return path
+end
+
 function load_or_generate_worker_id()
     path = worker_id_path()
-    if isfile(path)
-        id = strip(read(path, String))
-        !isempty(id) && return String(id)
-    end
-    id = generate_worker_id()
     mkpath(dirname(path))
-    write(path, id)
-    @info "BonitoWorker: generated stable worker_id" path id
-    return id
+    # The installer and an updating worker may start at the same time.
+    return FileWatching.Pidfile.mkpidlock(path * ".lock"; stale_age = 60, mode = 0o600) do
+        cfg = config_path()
+        config = isfile(cfg) ? JSON.parsefile(cfg) : Dict{String, Any}()
+        saved = String(get(config, "worker_id", ""))
+        id = isfile(path) ? String(strip(read(path, String))) : ""
+        if isempty(id)
+            if isempty(saved) && isfile(cfg)
+                error(
+                    "BonitoWorker: worker identity is missing from $path and $cfg. " *
+                        "Restore this installation's original worker_id; refusing to register as a different worker."
+                )
+            end
+            id = isempty(saved) ? generate_worker_id() : saved
+            write_private_file(path, id)
+            @info "BonitoWorker: persisted worker identity" path worker_id=id restored=!isempty(saved)
+        elseif !isempty(saved) && saved != id
+            error("BonitoWorker: conflicting worker identities in $path and $cfg; restore the original identity in both files.")
+        end
+        if isfile(cfg) && saved != id
+            config["worker_id"] = id
+            write_private_file(cfg, JSON.json(config))
+        end
+        return id
+    end
 end
 
 # OS-friendly display name. Prefers the user-configured "pretty" name when
@@ -710,6 +741,7 @@ function write_config!(; server_url::AbstractString,
         end
     end
     config = Dict(
+        "worker_id" => load_or_generate_worker_id(),
         "server_url"    => String(server_url),
         "credential"    => String(credential),
         "name"          => String(name),
@@ -718,9 +750,7 @@ function write_config!(; server_url::AbstractString,
     )
     update_spec === nothing || (config["update_spec"] = Dict{String,Any}(
         String(k) => String(v) for (k, v) in update_spec))
-    write(cfg, JSON.json(config))
-    # It holds the credential: this user's only.
-    chmod(cfg, 0o600)
+    write_private_file(cfg, JSON.json(config))
     @info "BonitoWorker: wrote config" path=cfg server_url projects_root=config["projects_root"]
     return cfg
 end
@@ -954,8 +984,8 @@ function start(; force::Bool = false)
     # id safe. Before the claim, a duplicate start would reap the RUNNING
     # worker's agents.
     reap_stray_agents!()
-    config = JSON.parse(read(cfg, String))
     worker_id = load_or_generate_worker_id()
+    config = JSON.parse(read(cfg, String))
     connect_and_serve(;
         server_url    = String(config["server_url"]),
         credential    = String(get(config, "credential", "")),
@@ -1043,7 +1073,8 @@ end
 
 function write_update_spec!(config::Dict{String,Any}, target::Dict{String,String})
     config["update_spec"] = target
-    write(config_path(), JSON.json(config))
+    config["worker_id"] = load_or_generate_worker_id()
+    write_private_file(config_path(), JSON.json(config))
     return nothing
 end
 
