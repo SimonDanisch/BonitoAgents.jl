@@ -34,11 +34,11 @@
 
     @testset "a request the server was slow to answer" begin
         req = HTTP.Request("GET", "/assets/x.js", ["User-Agent" => "Mozilla/5.0 (Linux; Android 10; K)"])
-        req.context[:gate_t0] = time() - 3
+        req.context[:authentication_started] = time() - 3
         req.context[:login_s] = 2.5
         @test_logs (:warn, r"slow request") BT.log_slow_request(req, HTTP.Response(200))
         quick = HTTP.Request("GET", "/assets/x.js")
-        quick.context[:gate_t0] = time()
+        quick.context[:authentication_started] = time()
         @test_logs BT.log_slow_request(quick, HTTP.Response(200))
     end
 
@@ -54,7 +54,7 @@
         @test occursin(r"^dashboard=0\.2\d*s sidebar=0\.1\d*s$", summary)
         @test !occursin("apps", summary)
         req = HTTP.Request("GET", "/")
-        req.context[:gate_t0] = time() - 3
+        req.context[:authentication_started] = time() - 3
         req.context[:page_phases] = phases
         @test_logs (:warn, r"slow request") BT.log_slow_request(req, HTTP.Response(200))
         delete!(task_local_storage(), :bt_page_phases)
