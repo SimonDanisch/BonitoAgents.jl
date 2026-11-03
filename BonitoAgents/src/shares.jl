@@ -553,7 +553,7 @@ function share_page(::ViewShare, state::ServerState, l::ShareLink, context)
     kind = file_kind(l.path)
     # Read here, on the request's task: a parsed kind is a worker round-trip.
     viewer = viewer_or_error(() -> file_viewer(kind, share_input(kind, state, l, url), l.path, PanelView()), l.path)
-    app = App(; title = l.title) do session
+    app = App(; title = l.title, favicon = favicon_svg()) do session
         open_share_page!(state, Bonito.root_session(session))
         # Bonito.MarkdownCSS: a notebook's markdown cells.
         return DOM.div(Bonito.MarkdownCSS, ShareStyles, share_bar(l, url),
@@ -615,7 +615,7 @@ css_text(styles::Bonito.Styles) =
     sprint(io -> foreach(css -> Bonito.render_style(io, nothing, "", css), values(styles.styles)))
 
 function share_page(::AppShare, state::ServerState, l::ShareLink, context)
-    app = App(; title = l.title) do session
+    app = App(; title = l.title, favicon = favicon_svg()) do session
         root = open_share_page!(state, Bonito.root_session(session))
         content = Observable{Any}(DOM.div("Starting the app…"; class = "bt-share-note"))
         Base.errormonitor(@async content[] = share_app_content(state, l, root))

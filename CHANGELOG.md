@@ -178,6 +178,7 @@ live.
 - An error page with a long stack trace no longer stalls the server while it
   compiles a renderer for that length.
 - Logging a rendering error no longer prints a whole live chat.
+- Shared pages show the BonitoAgents icon in the browser tab.
 - JSON results from `bt_progress` and the dev tools show as JSON. As Markdown their
   lines ran together, and `--` and `_` turned into formatting.
 - Many fixes to scrolling, streaming, reconnects, worker links and tests that

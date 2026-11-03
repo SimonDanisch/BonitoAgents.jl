@@ -1595,17 +1595,13 @@ end
 
 # BonitoAgents logo family (see bonito-logos/README.md for the design notes).
 # The SVG doubles as the favicon — every evergreen browser accepts
-# `<link rel="icon" type="image/svg+xml">`; the 32px PNG is the fallback.
+# `<link rel="icon" type="image/svg+xml">`; the 32px PNG is for iOS home screens.
 logo_svg()    = bonito_asset("logo", "bonitoagents-light.svg")
 favicon_svg() = logo_svg()
 favicon_png() = bonito_asset("logo", "bonitoagents-light-32.png")
 
-# Bonito has no first-class favicon hook on App, so inject the <link> tags
-# into <head> on document load. The assets are served by the same hashed
-# asset machinery as everything else — resolved to URL STRINGS here because
-# a raw `Asset` has no msgpack mapping inside interpolated JS.
-function favicon_onload(session::Bonito.Session, node)
-    svg_url = Bonito.url(session, favicon_svg())
+# The iOS home-screen icon is separate from App's browser tab icon.
+function touch_icon_onload(session::Bonito.Session, node)
     png_url = Bonito.url(session, favicon_png())
     Bonito.onload(session, node, js"""(el) => {
         const ensure = (rel, type, href) => {
@@ -1618,7 +1614,6 @@ function favicon_onload(session::Bonito.Session, node)
             if (type) link.type = type;
             link.href = href;
         };
-        ensure('icon', 'image/svg+xml', $(svg_url));
         ensure('apple-touch-icon', '', $(png_url));
     }""")
     return node
@@ -1691,7 +1686,7 @@ Single-page app: sidebar on the left, dashboard or chat in the main area
 depending on `current_view`. Replaces the old per-project `/p/<id>` routes.
 """
 function unified_app(state::ServerState)
-    App(; title = "BonitoAgents") do session, request
+    App(; title = "BonitoAgents", favicon = favicon_svg()) do session, request
         page_phase(() -> unified_page(state, session, request), :handler)
     end
 end
@@ -1776,7 +1771,7 @@ function unified_page(state::ServerState, session::Bonito.Session, request)
     # the per-tool #bt-slot-<id> / #bt-embed-<id> pairs it moves are all
     # descendants of the shell, guaranteed present by onload.
     Bonito.onload(session, shell, glue_js)
-    # Favicon (SVG + PNG fallback) — injected into <head> on load.
-    favicon_onload(session, shell)
+    # iOS home-screen icon.
+    touch_icon_onload(session, shell)
     shell
 end
