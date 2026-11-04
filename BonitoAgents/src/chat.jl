@@ -2675,16 +2675,13 @@ function render_text_block(text::AbstractString)
     return DOM.div(Markdown.parse(text), class="bt-tool-md")
 end
 
-# A reusable collapsible section — the server-side (eager) counterpart of the
-# JS `Collapsable` in bonitoagents.js. Renders a native <details>: the `body` is
-# present from the start (no lazy fetch), used for eval Code/Output sub-sections
-# inside an already-expanded tool card. `label` is the always-visible heading;
+# A section inside an already-expanded tool card, such as an eval's Code or
+# Output: a `BonitoWidgets.Collapsible`. `label` is the always-visible heading;
 # `preview` (optional) is dim text next to it.
 #
-# THE default three-state collapsible: clicking the header cycles
-# [summary → full → collapsed → summary]. `summary_lines` is the height of the
+# Clicking the header cycles [summary → full → collapsed → summary]. `summary_lines` is the height of the
 # SUMMARY state (the restricted preview) in text lines — the body is capped
-# to that height and SCROLLS (the scrollbar belongs to the Collapsable, not
+# to that height and SCROLLS (the scrollbar belongs to the section, not
 # to its content), so nothing is ever clipped away: the summary is a window
 # onto the full content, not a truncation. `pin_end` keeps that window
 # pinned to the END (console panes — the newest output is what matters,
@@ -2692,63 +2689,22 @@ end
 # every section (and the result embed below them) stays reachable. `full_lines`
 # caps the FULL state the same way. `label` is a heading string, or a node (an
 # edit's file link).
-struct Collapsable
-    label::Any
-    body::Any
-    preview::String
-    summary_lines::Int
-    full_lines::Int
-    state::Symbol           # initial state: :full | :summary | :collapsed
-    pin_end::Bool
-    console::Bool           # the body is a terminal (`console_block`): its surface
-end
-function Collapsable(label, body; preview::AbstractString = "",
-                     summary_lines::Integer = 4, full_lines::Integer = 26,
-                     state::Symbol = :summary, pin_end::Bool = false, console::Bool = false)
+function tool_subsection(label, body; preview::AbstractString = "",
+                         summary_lines::Integer = 4, full_lines::Integer = 26,
+                         state::Symbol = :summary, pin_end::Bool = false, console::Bool = false)
     state in (:full, :summary, :collapsed) ||
-        throw(ArgumentError("Collapsable state must be :full, :summary or :collapsed, got $(state)"))
-    return Collapsable(label, body, String(preview), Int(summary_lines), Int(full_lines),
-                       state, pin_end, console)
-end
-
-subsection_label(label::AbstractString) = DOM.span(label; class="bt-subsection-label")
-subsection_label(label) = label
-
-function Bonito.jsrender(session::Session, c::Collapsable)
-    summary_kids = Any[subsection_label(c.label)]
-    isempty(c.preview) || push!(summary_kids,
-        DOM.span(c.preview; class="bt-subsection-preview"))
-    body = DOM.div(c.body; class = c.console ? "bt-subsection-body bt-subsection-console" : "bt-subsection-body")
-    # Header click cycles the three states summary → full → collapsed → summary.
-    # preventDefault keeps the click from ALSO firing the native <details> toggle
-    # — `open` is driven here (open ⇔ not collapsed; `data-state` carries full vs
-    # summary while open). Entering summary/full re-pins a `pin_end` body to its
-    # end. A click on a file link in the header opens the file (the chat's
-    # delegated listener) and leaves the section as it is.
-    cycle = js"""e => {
-        e.preventDefault();
-        if (e.target.closest('.bt-path-link')) return;
-        e.stopPropagation();
-        const d = e.target.closest('.bt-subsection');
-        if (!d.open) { d.open = true; d.dataset.state = 'summary'; }
-        else if (d.dataset.state === 'summary') { d.dataset.state = 'full'; }
-        else { d.open = false; return; }
-        if (d.dataset.pinEnd === '1') {
-            const b = d.querySelector('.bt-subsection-body');
-            if (b) b.scrollTop = b.scrollHeight;
-        }
-    }"""
-    kids = Any[DOM.summary(summary_kids; class="bt-subsection-summary", onclick=cycle), body]
-    # Initial end-pin, once the subtree is parsed (inline JSCode children run
-    # right after their surrounding DOM — the Bonito idiom for init steps).
+        throw(ArgumentError("a section's state must be :full, :summary or :collapsed, got $(state)"))
+    header = Any[subsection_label(label)]
+    isempty(preview) || push!(header, DOM.span(preview; class="bt-subsection-preview"))
+    content = DOM.div(body; class = console ? "bt-subsection-body bt-subsection-console" : "bt-subsection-body")
     # Pin to the end once the subtree is parsed (inline JSCode children run right
-    # after their surrounding DOM — the Bonito idiom for init steps), and KEEP it
+    # after their surrounding DOM, the Bonito idiom for init steps), and KEEP it
     # pinned as the content grows: a running eval's stdout streams into this body
     # in place, and nothing else re-pins it (the JS `stream_tail` poke that used
     # to is gone). Only while the user is at the bottom, so scrolling up to read
-    # stays put.
-    c.pin_end && push!(kids, js"""(() => {
-        const b = $(body);
+    # stays put. Entering summary/full re-pins too.
+    pin = pin_end ? js"""(() => {
+        const b = $(content);
         if (!b) return;
         b.scrollTop = b.scrollHeight;
         let pinned = true;
@@ -2756,17 +2712,19 @@ function Bonito.jsrender(session::Session, c::Collapsable)
         b.addEventListener('scroll', () => { pinned = atEnd(); }, { passive: true });
         new MutationObserver(() => { if (pinned) b.scrollTop = b.scrollHeight; })
             .observe(b, { childList: true, subtree: true, characterData: true });
-    })()""")
-    Bonito.jsrender(session, DOM.details(kids;
-        class="bt-subsection",
-        dataState=c.state === :collapsed ? "summary" : String(c.state),
-        dataPinEnd=c.pin_end ? "1" : nothing,
-        style=Styles("--bt-summary-lines" => string(c.summary_lines),
-                     "--bt-full-lines" => string(c.full_lines)),
-        open=c.state !== :collapsed))
+        b.parentElement.addEventListener('bw-collapsible-state', () => { b.scrollTop = b.scrollHeight; });
+    })()""" : nothing
+    return BonitoWidgets.Collapsible(header, isnothing(pin) ? content : Any[content, pin];
+        expanded = state !== :collapsed,
+        states = ["summary", "full"], state = state === :full ? "full" : "summary",
+        class = "bt-subsection", header_class = "bt-subsection-summary",
+        dataPinEnd = pin_end ? "1" : nothing,
+        style = Styles("--bt-summary-lines" => string(summary_lines),
+                       "--bt-full-lines" => string(full_lines)))
 end
 
-tool_subsection(label::AbstractString, body; kwargs...) = Collapsable(label, body; kwargs...)
+subsection_label(label::AbstractString) = DOM.span(label; class="bt-subsection-label")
+subsection_label(label) = label
 
 # Generic tool-body bridge: every tool type renders through `jsrender` so the
 # `ToolRenderCommand` handler can hand the MESSAGE (not a pre-rendered Node) to
@@ -3111,7 +3069,7 @@ end
 function diff_section(d::DiffContent)
     view = DiffView(d)
     removed, added = diff_counts(view)
-    return Collapsable(DOM.span(d.path; class = "bt-subsection-path bt-path-link", dataPath = d.path),
+    return tool_subsection(DOM.span(d.path; class = "bt-subsection-path bt-path-link", dataPath = d.path, dataBwControl = "1"),
         view; preview = "+$(added) −$(removed)",
         summary_lines = EDIT_SUMMARY_LINES, full_lines = EDIT_FULL_LINES)
 end
@@ -9877,10 +9835,11 @@ function chat_transcript(session::Session, model::ChatModel)
     # microtask: by then the whole pane is in the document, wherever the layout
     # put them.
     # The transcript scrolls on BonitoWidgets' endless-list engine (`RowBlock`),
-    # handed to the chat so both packages run the one copy.
+    # and its rows collapse with `Collapsible`, both handed to the chat so both
+    # packages run the one copy.
     init_script = js"""
-        Promise.all([$(ChatLib), $(BonitoWidgets.ROW_BLOCK_LIB)]).then(([lib, rows]) =>
-            lib.connect($(messages_container), $(model.comm), $(init_snapshot), rows.RowBlock))
+        Promise.all([$(ChatLib), $(BonitoWidgets.ROW_BLOCK_LIB), $(BonitoWidgets.COLLAPSIBLE_LIB)]).then(([lib, rows, collapsible]) =>
+            lib.connect($(messages_container), $(model.comm), $(init_snapshot), rows.RowBlock, collapsible.Collapsible))
     """
     # The messages area + the taskbar share a positioning context so the
     # taskbar floats over the MESSAGES, anchored below the (variable-height)

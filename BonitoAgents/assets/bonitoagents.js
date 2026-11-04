@@ -28,22 +28,6 @@ if (typeof document !== 'undefined') {
         vp.content += ', interactive-widget=resizes-content';
 }
 
-// One reusable collapsible-section behaviour, shared by tool rows and thought
-// bubbles (and any future lazy section). It owns the expand/collapse plus the
-// lazy-body lifecycle that used to be duplicated across wireToolToggle /
-// setToolExpanded / wireThoughtToggle:
-//   • a header click (or, in `native` mode, a <details> `toggle`) flips expanded
-//   • the first expand of a lazy section shows a "loading…" placeholder and
-//     fires `onExpand` once; the owner fills the body (via dom_in_js or a comm
-//     reply) and `fill()` marks it loaded so a re-expand doesn't refetch
-//   • `fetchEachExpand` (most tools) refetches on every expand and
-//     `discardOnCollapse` empties the body on collapse (frees the mounted
-//     Monaco editors)
-//   • `editMode` (edit tools): the body stays mounted ALWAYS — collapse just
-//     shrinks Monaco's `max_height` via its own `setMaxHeight` API; expand
-//     grows it. No re-fetch, no display:none. The eager body mount itself is
-//     triggered from `createNode` so the user sees the compact diff under the
-//     header immediately. Implies !fetchEachExpand && !discardOnCollapse.
 // A token count the way a reader takes it in: 950, 1.2k, 48k, 1.3M.
 // localStorage for what the page only keeps for convenience (drafts, the todo
 // card's state). Storage can be off (SecurityError) or full
@@ -75,113 +59,6 @@ function queueLabel(pos) {
     if (!Number.isInteger(pos) || pos < 1) return 'queued';
     if (pos === 1) return 'next up';
     return `queued \u00b7 #${pos}`;
-}
-
-export class Collapsable {
-    constructor(headerEl, bodyEl, opts = {}) {
-        this.header  = headerEl;
-        this.body    = bodyEl;
-        this.toggle  = opts.toggleEl || null;
-        this.native  = opts.native || false;          // hosted in <details>/<summary>
-        this.editMode = opts.editMode || false;
-        // Eval cards: the body stays MOUNTED across collapse (live embeds /
-        // Monaco survive) but collapse hides it via display — the height
-        // clamping happens per SUB-SECTION inside the body (see styles.jl
-        // .bt-clamped), never on the card body as a whole.
-        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.fetchEachExpand   = this.editMode ? false : (opts.fetchEachExpand || false);
-        this.discardOnCollapse = this.editMode ? false : (opts.discardOnCollapse || false);
-        this.onExpand = opts.onExpand || null;
-        // The height the body last rendered at (px, 0 when unknown); the
-        // loading placeholder holds it until the body replaces it.
-        this.reserve  = opts.reserve || null;
-        this.onToggle = opts.onToggle || null;      // the reader's own clicks
-        this.lazy     = !!this.onExpand;
-        this.loaded   = !this.lazy;                    // eager bodies start loaded
-
-        // Everything starts collapsed: edit diffs at their summary height,
-        // compact eval bodies capped by the CSS clamp (styles.jl).
-        this.expanded = false;
-
-        if (this.native) {
-            this.details = headerEl.closest('details') || bodyEl.closest('details');
-            this.details && this.details.addEventListener(
-                'toggle', () => this.applyExpanded(this.details.open));
-        } else {
-            headerEl.style.cursor = 'pointer';
-            headerEl.addEventListener('click', (e) => {
-                // Collapsed → the WHOLE header is the expand target (big,
-                // forgiving). Expanded → only the ▼ arrow collapses:
-                // the header is dense with small buttons (⊗ ⤢ »), and a
-                // near-miss on any of them used to slam the body shut.
-                if (this.expanded && this.toggle && e.target !== this.toggle &&
-                    !this.toggle.contains(e.target)) return;
-                this.applyExpanded(!this.expanded);
-                this.onToggle && this.onToggle(this.expanded);
-            });
-        }
-    }
-
-    setExpanded(expanded) {
-        if (this.native) { if (this.details) this.details.open = expanded; return; }
-        this.applyExpanded(expanded);
-    }
-
-    applyExpanded(expanded) {
-        if (expanded === this.expanded) return;        // idempotent
-        this.expanded = expanded;
-        if (!this.native) {
-            this.header.dataset.expanded = expanded ? 'true' : 'false';
-            if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode && !this.hideBodyOnCollapse) {
-                // Edit tools: the body stays visible; its diffs take their
-                // full or summary height from the header's `data-expanded`
-                // (styles.jl), whenever they were mounted.
-                this.body.style.display = '';
-            } else {
-                // Plain lazy bodies AND eval compact bodies hide on collapse;
-                // for the latter the node stays mounted (editMode skips the
-                // discard below), so re-expanding is instant and live embeds
-                // keep their sessions.
-                this.body.style.display = expanded ? '' : 'none';
-            }
-        }
-        // Lazy body fetch. editMode pills normally keep their streamed-in
-        // body across toggles and only resize their diffs — but a
-        // HISTORY-REPLAYED edit pill starts with an EMPTY body (its diff lives
-        // server-side until a tool.render round trip), so gating the fetch on
-        // `!editMode` alone made replayed Edit pills permanently
-        // unexpandable: the arrow flipped and nothing ever appeared. Fetch
-        // whenever the body has nothing to show.
-        const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
-        if (expanded && (!this.editMode || editBodyEmpty)) {
-            if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
-                // Reserve this mount before notifying. Deferred auto-mount
-                // and completion updates can arrive before the body does;
-                // a second render would replace an initializing editor.
-                this.loaded = true;
-                this.showPlaceholder();
-                this.onExpand && this.onExpand();
-            }
-        } else if (!expanded && this.discardOnCollapse) {
-            this.body.innerHTML = '';
-            this.loaded = false;
-        }
-    }
-
-    // "loading…" until the body arrives, in the shape the body will have
-    // (`reserve`): the row is its final size from the start, and nothing
-    // below it moves when the body replaces the placeholder.
-    showPlaceholder() {
-        showLoading(this.body, this.reserve ? this.reserve() : null);
-    }
-
-    // Owner finished loading the lazy body: set its html + mark loaded so a
-    // subsequent expand shows it without another round-trip.
-    fill(html) {
-        if (html != null) this.body.innerHTML = html;
-        this.loaded = true;
-    }
 }
 
 // ── Static code views (code_view.jl) ───────────────────────────────────────
@@ -552,10 +429,12 @@ function showLoading(body, shape) {
 }
 
 class BonitoChat {
-    // `RowBlock`: the endless-list engine (BonitoWidgets' row_block.js), handed
-    // in by the page so both packages run the same copy.
-    constructor(container, comm, init = {}, RowBlock) {
+    // `RowBlock`: the endless-list engine (BonitoWidgets' row_block.js), and
+    // `Collapsible` (collapsible.js), handed in by the page so both packages run
+    // the same copy.
+    constructor(container, comm, init = {}, RowBlock, Collapsible) {
         this.container = container;
+        this.Collapsible = Collapsible;
         this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
         this.workspacePanel = container.closest('.bw-ws-panel');
         this.workspaceVisible = this.workspacePanel?.dataset.bwVisible !== 'false';
@@ -611,7 +490,7 @@ class BonitoChat {
             // its height after the last message has no chunk coming to chase it.
             following: () => this.followMode,
             resized: (node) => {
-                if (node.collapsable && node.classList.contains('bt-tool-msg')) {
+                if (node.collapsible && node.classList.contains('bt-tool-msg')) {
                     this.scheduleBodyReport(node);
                     this.onBodyMounted(node);        // a body built far away
                 }
@@ -847,7 +726,7 @@ class BonitoChat {
         // in the chat (tool titles, diff headers, search hits, linkified
         // paths in agent messages) → open the file in the plotpane editor.
         // Capture phase, so a click on a linked TOOL TITLE opens the editor
-        // instead of toggling the pill's expand state (the Collapsable
+        // instead of toggling the pill's expand state (the Collapsible
         // listener sits on the header, below us on the capture path).
         // ↑ chips on a card that waits on an eval (bt_julia_continue /
         // bt_julia_wait): bring that eval's card into view. Capture phase for
@@ -1475,7 +1354,7 @@ class BonitoChat {
         for (const node of nodes) {
             this.mountDeferred(node);
             if (this.lensActions?.get(node.__btIdx) === 'collapse') {
-                node.collapsable?.setExpanded(false);
+                node.collapsible?.setExpanded(false);
             }
         }
         for (const node of nodes) {
@@ -1592,7 +1471,7 @@ class BonitoChat {
     // `overflow: hidden` drops the automatic minimum height, so "loading…"
     // can't stretch a small picture's placeholder.
     bodyReserve(node) {
-        if (!node.collapsable) return null;
+        if (!node.collapsible) return null;
         const map = node.__btBodyH;
         // Most new rows have no saved size. Reading clientWidth while those
         // rows are being built would lay out the pane for no reservation.
@@ -1622,7 +1501,7 @@ class BonitoChat {
     reportBody(node) {
         node.__btBodyTimer = null;
         if (this.destroyed || !this.paneVisible || !node.isConnected || this.container.clientHeight === 0) return;
-        const body = node.collapsable?.body;
+        const body = node.collapsible?.body;
         const id = node.dataset.msgId;
         if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
@@ -1664,7 +1543,7 @@ class BonitoChat {
         if (!this.paneVisible) return;
         if (!node.isConnected || node.dataset.btFreed || node.dataset.btApp) return;
         if (node.classList.contains('bt-tool-live') || this.holdsFullscreen(node)) return;
-        const c = node.collapsable;
+        const c = node.collapsible;
         const body = c?.body;
         if (!body || !c.loaded || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
@@ -2057,7 +1936,7 @@ class BonitoChat {
         // Auto-expand (bt_show / native images, a completed eval).
         if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
-            const c = node.collapsable;
+            const c = node.collapsible;
             c?.setExpanded(true);
             // Already expanded, with no body yet (`setExpanded` only fetches
             // on the way in): fetch it.
@@ -2068,14 +1947,14 @@ class BonitoChat {
             }
         }
         // Eager mount for edit tools (Monaco body without flipping the
-        // Collapsable to expanded).
+        // Collapsible to expanded).
         if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
-            if (node.collapsable && !node.collapsable.loaded) {
-                node.collapsable.loaded = true;
-                const body = node.collapsable.body;
+            if (node.collapsible && !node.collapsible.loaded) {
+                node.collapsible.loaded = true;
+                const body = node.collapsible.body;
                 if (body.childElementCount === 0 && this.bodyReserve(node))
-                    node.collapsable.showPlaceholder();
+                    node.collapsible.showPlaceholder();
                 this.requestBody(node);
             }
         }
@@ -2248,13 +2127,13 @@ class BonitoChat {
     // there (and marked loaded) before the user even expands.
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        node && node.collapsable && node.collapsable.fill(msg.html || '');
+        node && node.collapsible && node.collapsible.fill(msg.html || '');
     }
 
     // Reply to a `thought.render` request (reloaded thought, lazy body).
     onThoughtBody(msg) {
         const node = this.nodeById.get(msg.id);
-        node && node.collapsable && node.collapsable.fill(msg.html);
+        node && node.collapsible && node.collapsible.fill(msg.html);
     }
 
     // Transient "reasoning…" indicator toggled by Julia for the lifetime of an
@@ -2518,7 +2397,7 @@ class BonitoChat {
         // An edit can mount before all of its arguments have streamed in.
         // Refresh an existing preview when its source changes, using the same
         // near-viewport scheduler and serialized render requests as first mount.
-        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
+        if (msg.refresh_body && node.collapsible?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) { s.textContent = msg.status; s.className = `bt-tool-status bt-status-${msg.status}`; }
@@ -2540,7 +2419,7 @@ class BonitoChat {
         // by itself: a long call — bt_julia_wait, bt_wait — expanded while it
         // ran stayed "(loading…)" after it finished. Ask again on each update
         // until the real body is in.
-        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading'))
+        if (node.collapsible?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading'))
             this.requestBody(node);
         // A Julia run outlived the call that ended this card: it is live again,
         // and its elapsed clock runs on from the start instead of the call's end.
@@ -2584,15 +2463,11 @@ class BonitoChat {
             if (s) s.textContent = msg.summary;
         }
         // Eval compact-body mode can arrive LATE (claude streams tool input;
-        // the typed extras ride a later update). Flip the Collapsable into
-        // editMode BEFORE the expand handling below so the eager-mount takes
+        // the typed extras ride a later update). Flip the Collapsible into
+        // its keep mode BEFORE the expand handling below so the eager-mount takes
         // the compact path.
-        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
-            const c = node.collapsable;
-            c.editMode = true;
-            c.hideBodyOnCollapse = true;
-            c.fetchEachExpand = false;
-            c.discardOnCollapse = false;
+        if (msg.compact_body === true && node.collapsible && !node.collapsible.keepsBody) {
+            node.collapsible.mode = 'keep';
             node.dataset.compactBody = '1';
         }
         // bt_show: the completion update is when we learn it's a "show me
@@ -2603,15 +2478,15 @@ class BonitoChat {
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this.wantsNative(node)) {
             this.applyNative(node);
-        } else if (msg.expand && node.collapsable) {
-            if (node.collapsable.editMode) {
+        } else if (msg.expand && node.collapsible) {
+            if (node.collapsible.keepsBody) {
                 // Edit tools: msg.expand from the server means "the first
                 // DiffContent landed — eager-mount the compact Monaco
-                // preview, but DON'T flip Collapsable.expanded (we stay in
+                // preview, but DON'T flip Collapsible.expanded (we stay in
                 // compact size). A click on the header is what expands
                 // Monaco; this auto-mount just makes the diff visible
                 // without requiring a click.
-                // Eval compact bodies (hideBodyOnCollapse) DO flip expanded:
+                // Eval compact bodies (keep mode) DO flip expanded:
                 // their visible-body state IS the expanded state (sections
                 // self-clamp), so the arrow must read ▼ while the body shows.
                 // The body is fetched once the row is near the view
@@ -2619,19 +2494,19 @@ class BonitoChat {
                 // reader scrolls, and each diff built far away was only freed
                 // again.
                 if (node.isConnected) {
-                    if (!node.collapsable.loaded) {
-                        node.collapsable.loaded = true;
+                    if (!node.collapsible.loaded) {
+                        node.collapsible.loaded = true;
                         this.requestBody(node);
                     }
-                    if (node.collapsable.hideBodyOnCollapse)
-                        node.collapsable.setExpanded(true);
+                    if (node.collapsible.mode === 'keep')
+                        node.collapsible.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
-                    if (node.collapsable.hideBodyOnCollapse)
+                    if (node.collapsible.mode === 'keep')
                         node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
-                node.collapsable.setExpanded(true);
+                node.collapsible.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
             }
@@ -2640,13 +2515,13 @@ class BonitoChat {
         // non-empty): mount if needed, then actually flip expanded — unlike
         // `expand`, which in compact-body mode only eager-mounts at compact
         // height.
-        if (msg.expand_full && node.collapsable) {
+        if (msg.expand_full && node.collapsible) {
             if (node.isConnected) {
-                if (!node.collapsable.loaded) {
-                    node.collapsable.loaded = true;
+                if (!node.collapsible.loaded) {
+                    node.collapsible.loaded = true;
                     this.requestBody(node);
                 }
-                node.collapsable.setExpanded(true);
+                node.collapsible.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
             }
@@ -2752,7 +2627,7 @@ class BonitoChat {
     // owns it; the server keeps that subagent's WHOLE history and mirrors each
     // step here as a `task_activity` event. The bubble renders them
     // most-recent-last, auto-scrolled, in its own collapsible section between
-    // the header and the lazy body (same Collapsable behaviour the tool body /
+    // the header and the lazy body (same Collapsible behaviour the tool body /
     // thought sections use). Remounts rebuild from the header's `task_feed`
     // snapshot (createNode), which carries the tail plus the true total.
     //
@@ -2781,14 +2656,14 @@ class BonitoChat {
         node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) ||
             node.appendChild(feed);
         const list = feed.querySelector('.bt-task-feed-list');
-        feed._collapsable = new Collapsable(
+        feed._collapsible = new this.Collapsible(
             feed.querySelector('.bt-task-feed-head'), list,
-            { toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle') });
+            { closer: feed.querySelector('.bt-task-feed-head .bt-tool-toggle') });
         // Live task: open by default so the activity is visible as it
         // streams; finished/replayed bubbles start collapsed (a click on
         // the section head re-opens — the list is filled either way).
         if (node.classList.contains('bt-tool-live')) {
-            feed._collapsable.setExpanded(true);
+            feed._collapsible.setExpanded(true);
         } else {
             list.style.display = 'none';
         }
@@ -2820,7 +2695,7 @@ class BonitoChat {
             count.textContent = feed.dataset.total;
         }
         // Most-recent-last + auto-scroll while the section is open.
-        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+        if (feed._collapsible?.expanded) list.scrollTop = list.scrollHeight;
     }
 
     // ── Message filter (toolbar below the composer) ──────────────────────
@@ -2843,7 +2718,7 @@ class BonitoChat {
     // When "Native Images" / "Native Videos" is on, a bt_show whose mime is
     // image/* / video/* renders bare in the chat flow: the pill's chrome is
     // hidden via the bt-tool-native class and the body is auto-expanded
-    // through the normal Collapsable → tool.render path (the server fills
+    // through the normal Collapsible → tool.render path (the server fills
     // the slot with the <img>/<video>). Display-only, per-tab — like the
     // filters.
 
@@ -2861,7 +2736,7 @@ class BonitoChat {
         // before its loading placeholder is laid out, not after that RPC.
         node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
-            node.collapsable?.setExpanded(true);
+            node.collapsible?.setExpanded(true);
         } else {
             // Not in the document yet (a row being built): defer the expand
             // to insertion so the tool.render reply has a slot to mount into.
@@ -2872,7 +2747,7 @@ class BonitoChat {
     removeNative(node) {
         node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
-        node.collapsable?.setExpanded(false);   // discardOnCollapse frees the body
+        node.collapsible?.setExpanded(false);   // reload mode frees the body
     }
 
     // Flip one media class ('image/' or 'video/') and re-depict every cached
@@ -3022,13 +2897,13 @@ class BonitoChat {
                 div.className = 'bt-thought-msg';
                 div.innerHTML = this.thoughtHTML(msg);
                 const id = msg.id;
-                // Native <details> host, lazy body loaded once via thought.render.
-                div.collapsable = new Collapsable(
+                // A <details>, its body loaded once via thought.render.
+                div.collapsible = new this.Collapsible(
                     div.querySelector('.bt-thought-summary'),
                     div.querySelector('.bt-thought-body'),
-                    { native: true,
+                    { placeholder: (body) => showLoading(body, null),
                       onExpand: () => this.comm.notify({type: 'thought.render', id}) });
-                if (msg.html) div.collapsable.fill(msg.html);
+                if (msg.html) div.collapsible.fill(msg.html);
                 break;
             }
             case 'tool': {
@@ -3062,10 +2937,10 @@ class BonitoChat {
                 // every expand via tool.render → dom_in_js, and discarded on
                 // collapse so the editors are freed.
                 // Edit tools render their compact Monaco diff under the
-                // header eagerly (no click required). The Collapsable's
-                // editMode keeps the body mounted across collapse — toggle
+                // header eagerly (no click required). The Collapsible's
+                // compact mode keeps the body mounted across collapse — toggle
                 // just calls Monaco.setMaxHeight to swap compact↔full.
-                // Eval tools reuse editMode's KEEP-MOUNTED semantics via
+                // Eval tools keep the body MOUNTED too (keep mode) via
                 // `compact_body` (server-typed) but not its height games:
                 // their body shows all sections (Code / Output each clamped
                 // to ~4 lines SECTION-side, result embed unclamped) and the
@@ -3082,14 +2957,12 @@ class BonitoChat {
                 // what its placeholder reserves until a height is measured.
                 div.__btMedia = msg.media || null;
                 div.__btMediaExtra = msg.media_extra || 0;
-                div.collapsable = new Collapsable(
+                div.collapsible = new this.Collapsible(
                     div.querySelector('.bt-tool-header'),
                     div.querySelector('.bt-tool-body'),
-                    { toggleEl: div.querySelector('.bt-tool-toggle'),
-                      editMode: compactBody,
-                      hideBodyOnCollapse: msg.compact_body === true,
-                      fetchEachExpand: !compactBody, discardOnCollapse: !compactBody,
-                      reserve: () => this.bodyReserve(div),
+                    { closer: div.querySelector('.bt-tool-toggle'),
+                      mode: msg.compact_body === true ? 'keep' : compactBody ? 'compact' : 'reload',
+                      placeholder: (body) => showLoading(body, this.bodyReserve(div)),
                       onToggle: (expanded) => this.expandState.set(id, expanded),
                       onExpand: () => this.requestBody(div) });
                 // Subagent Task: rebuild the live activity feed from the
@@ -3143,13 +3016,13 @@ class BonitoChat {
                     // are inserted; expanding then fired tool.render whose
                     // dom_in_js reply found no slot in the document — the
                     // body stayed on "loading…" forever. Same split as onToolUpdate's
-                    // detached fallback: editMode bodies need the explicit
+                    // detached fallback: bodies kept across a collapse need the explicit
                     // MOUNT flag (their applyExpanded never lazy-fetches),
                     // plus the expanded flip for expand_full / evals whose
                     // visible-body state IS the expanded state.
-                    if (div.collapsable.editMode) {
+                    if (div.collapsible.keepsBody) {
                         div.dataset.btAutoMount = '1';
-                        if (msg.expand_full || div.collapsable.hideBodyOnCollapse)
+                        if (msg.expand_full || div.collapsible.mode === 'keep')
                             div.dataset.btAutoExpand = '1';
                     } else {
                         div.dataset.btAutoExpand = '1';
@@ -3158,7 +3031,7 @@ class BonitoChat {
                 // What the reader did to it last wins over the default.
                 const mine = this.expandState.get(id);
                 if (mine === true) {
-                    if (div.collapsable.editMode) div.dataset.btAutoMount = '1';
+                    if (div.collapsible.keepsBody) div.dataset.btAutoMount = '1';
                     div.dataset.btAutoExpand = '1';
                 } else if (mine === false) {
                     delete div.dataset.btAutoExpand;
@@ -3302,7 +3175,7 @@ class BonitoChat {
                      msg.finished_at == null;
         // (The old <pre> eval code preview is gone: eval cards mount their
         // BODY compactly instead — the real Monaco Code editor capped at ~4
-        // lines via Collapsable compact-body mode, see `msg.compact_body`.)
+        // lines via Collapsible compact-body mode, see `msg.compact_body`.)
         // "What ran", ALWAYS visible (persists past completion — there's no Monaco
         // "Code" section afterwards) and never hidden in a tooltip: the bash command,
         // OR a control MCP tool's action (interrupt/restart/list its target session).
@@ -5393,8 +5266,8 @@ export function flushDrafts() {
     for (const chat of CHAT_INSTANCES) chat.flushDraft?.();
 }
 
-export function connect(node, comm, init = {}, RowBlock) {
-    const chat = new BonitoChat(node, comm, init, RowBlock);
+export function connect(node, comm, init = {}, RowBlock, Collapsible) {
+    const chat = new BonitoChat(node, comm, init, RowBlock, Collapsible);
     // Late-mount snapshot: comm events fired before this tab connected are
     // gone, so the server bakes the current slash-command set into the init
     // call; live changes keep flowing via the 'commands' comm event.

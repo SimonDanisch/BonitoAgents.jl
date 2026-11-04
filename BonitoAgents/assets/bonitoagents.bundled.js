@@ -125,73 +125,6 @@ function queueLabel(pos) {
     if (pos === 1) return 'next up';
     return `queued \u00b7 #${pos}`;
 }
-class Collapsable {
-    constructor(headerEl, bodyEl, opts = {}){
-        this.header = headerEl;
-        this.body = bodyEl;
-        this.toggle = opts.toggleEl || null;
-        this.native = opts.native || false;
-        this.editMode = opts.editMode || false;
-        this.hideBodyOnCollapse = opts.hideBodyOnCollapse || false;
-        this.fetchEachExpand = this.editMode ? false : opts.fetchEachExpand || false;
-        this.discardOnCollapse = this.editMode ? false : opts.discardOnCollapse || false;
-        this.onExpand = opts.onExpand || null;
-        this.reserve = opts.reserve || null;
-        this.onToggle = opts.onToggle || null;
-        this.lazy = !!this.onExpand;
-        this.loaded = !this.lazy;
-        this.expanded = false;
-        if (this.native) {
-            this.details = headerEl.closest('details') || bodyEl.closest('details');
-            this.details && this.details.addEventListener('toggle', ()=>this.applyExpanded(this.details.open));
-        } else {
-            headerEl.style.cursor = 'pointer';
-            headerEl.addEventListener('click', (e)=>{
-                if (this.expanded && this.toggle && e.target !== this.toggle && !this.toggle.contains(e.target)) return;
-                this.applyExpanded(!this.expanded);
-                this.onToggle && this.onToggle(this.expanded);
-            });
-        }
-    }
-    setExpanded(expanded) {
-        if (this.native) {
-            if (this.details) this.details.open = expanded;
-            return;
-        }
-        this.applyExpanded(expanded);
-    }
-    applyExpanded(expanded) {
-        if (expanded === this.expanded) return;
-        this.expanded = expanded;
-        if (!this.native) {
-            this.header.dataset.expanded = expanded ? 'true' : 'false';
-            if (this.toggle) this.toggle.textContent = expanded ? '▼' : '▶';
-            if (this.editMode && !this.hideBodyOnCollapse) {
-                this.body.style.display = '';
-            } else {
-                this.body.style.display = expanded ? '' : 'none';
-            }
-        }
-        const editBodyEmpty = this.editMode && this.body.childElementCount === 0;
-        if (expanded && (!this.editMode || editBodyEmpty)) {
-            if (this.lazy && (!this.loaded || this.fetchEachExpand)) {
-                this.loaded = true;
-                this.showPlaceholder();
-                this.onExpand && this.onExpand();
-            }
-        } else if (!expanded && this.discardOnCollapse) {
-            this.body.innerHTML = '';
-            this.loaded = false;
-        }
-    }
-    showPlaceholder() {
-        showLoading(this.body, this.reserve ? this.reserve() : null);
-    }
-    fill(html) {
-        if (html != null) this.body.innerHTML = html;
-        this.loaded = true;
-    }
-}
 const CODE_STATE = new WeakMap();
 const CODE_OBSERVERS = new WeakMap();
 const CODE_CHUNKS = new WeakMap();
@@ -570,8 +503,9 @@ function showLoading(body, shape) {
     }, shape);
 }
 class BonitoChat {
-    constructor(container, comm, init = {}, RowBlock){
+    constructor(container, comm, init = {}, RowBlock, Collapsible){
         this.container = container;
+        this.Collapsible = Collapsible;
         this.projectVisible = container.closest('.bt-chatpane')?.getAttribute('aria-hidden') !== 'true';
         this.workspacePanel = container.closest('.bw-ws-panel');
         this.workspaceVisible = this.workspacePanel?.dataset.bwVisible !== 'false';
@@ -615,7 +549,7 @@ class BonitoChat {
             frozen: ()=>!!this.railDrag,
             following: ()=>this.followMode,
             resized: (node)=>{
-                if (node.collapsable && node.classList.contains('bt-tool-msg')) {
+                if (node.collapsible && node.classList.contains('bt-tool-msg')) {
                     this.scheduleBodyReport(node);
                     this.onBodyMounted(node);
                 }
@@ -1284,7 +1218,7 @@ class BonitoChat {
         for (const node of nodes){
             this.mountDeferred(node);
             if (this.lensActions?.get(node.__btIdx) === 'collapse') {
-                node.collapsable?.setExpanded(false);
+                node.collapsible?.setExpanded(false);
             }
         }
         for (const node of nodes){
@@ -1374,7 +1308,7 @@ class BonitoChat {
         node.style.display = this.hiddenTypes.has(this.keyByIdx.get(idx)) ? 'none' : '';
     }
     bodyReserve(node) {
-        if (!node.collapsable) return null;
+        if (!node.collapsible) return null;
         const map = node.__btBodyH;
         const sizes = map ? Object.entries(map) : [];
         if (sizes.length) {
@@ -1404,7 +1338,7 @@ class BonitoChat {
     reportBody(node) {
         node.__btBodyTimer = null;
         if (this.destroyed || !this.paneVisible || !node.isConnected || this.container.clientHeight === 0) return;
-        const body = node.collapsable?.body;
+        const body = node.collapsible?.body;
         const id = node.dataset.msgId;
         if (!id || !body || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
@@ -1439,7 +1373,7 @@ class BonitoChat {
         if (!this.paneVisible) return;
         if (!node.isConnected || node.dataset.btFreed || node.dataset.btApp) return;
         if (node.classList.contains('bt-tool-live') || this.holdsFullscreen(node)) return;
-        const c = node.collapsable;
+        const c = node.collapsible;
         const body = c?.body;
         if (!body || !c.loaded || body.offsetParent === null || body.childElementCount === 0) return;
         if (body.querySelector(':scope > .bt-collapsable-loading')) return;
@@ -1748,7 +1682,7 @@ class BonitoChat {
     mountDeferred(node) {
         if (node.dataset.btAutoExpand) {
             delete node.dataset.btAutoExpand;
-            const c = node.collapsable;
+            const c = node.collapsible;
             c?.setExpanded(true);
             if (c && c.lazy && !c.loaded) {
                 c.loaded = true;
@@ -1758,10 +1692,10 @@ class BonitoChat {
         }
         if (node.dataset.btAutoMount) {
             delete node.dataset.btAutoMount;
-            if (node.collapsable && !node.collapsable.loaded) {
-                node.collapsable.loaded = true;
-                const body = node.collapsable.body;
-                if (body.childElementCount === 0 && this.bodyReserve(node)) node.collapsable.showPlaceholder();
+            if (node.collapsible && !node.collapsible.loaded) {
+                node.collapsible.loaded = true;
+                const body = node.collapsible.body;
+                if (body.childElementCount === 0 && this.bodyReserve(node)) node.collapsible.showPlaceholder();
                 this.requestBody(node);
             }
         }
@@ -1851,11 +1785,11 @@ class BonitoChat {
     }
     onThoughtFinal(msg) {
         const node = this.nodeById.get(msg.id);
-        node && node.collapsable && node.collapsable.fill(msg.html || '');
+        node && node.collapsible && node.collapsible.fill(msg.html || '');
     }
     onThoughtBody(msg) {
         const node = this.nodeById.get(msg.id);
-        node && node.collapsable && node.collapsable.fill(msg.html);
+        node && node.collapsible && node.collapsible.fill(msg.html);
     }
     onThinking(msg) {
         const active = msg.active;
@@ -2051,7 +1985,7 @@ class BonitoChat {
     onToolUpdate(msg) {
         const node = this.nodeById.get(msg.id);
         if (!node) return;
-        if (msg.refresh_body && node.collapsable?.loaded) this.requestBody(node);
+        if (msg.refresh_body && node.collapsible?.loaded) this.requestBody(node);
         if (msg.status) {
             const s = node.querySelector('.bt-tool-status');
             if (s) {
@@ -2062,7 +1996,7 @@ class BonitoChat {
             node.classList.toggle('bt-tool-live', live);
             if (live) this.ensureElapsedTicker();
         }
-        if (node.collapsable?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading')) this.requestBody(node);
+        if (node.collapsible?.expanded && node.querySelector('.bt-tool-body .bt-tool-loading')) this.requestBody(node);
         if (msg.reopen) {
             delete node.dataset.toolFinished;
             node.classList.add('bt-tool-live');
@@ -2096,42 +2030,38 @@ class BonitoChat {
             const s = node.querySelector('.bt-tool-summary');
             if (s) s.textContent = msg.summary;
         }
-        if (msg.compact_body === true && node.collapsable && !node.collapsable.editMode) {
-            const c = node.collapsable;
-            c.editMode = true;
-            c.hideBodyOnCollapse = true;
-            c.fetchEachExpand = false;
-            c.discardOnCollapse = false;
+        if (msg.compact_body === true && node.collapsible && !node.collapsible.keepsBody) {
+            node.collapsible.mode = 'keep';
             node.dataset.compactBody = '1';
         }
         if (msg.show_mime) node.dataset.showMime = msg.show_mime;
         if (this.wantsNative(node)) {
             this.applyNative(node);
-        } else if (msg.expand && node.collapsable) {
-            if (node.collapsable.editMode) {
+        } else if (msg.expand && node.collapsible) {
+            if (node.collapsible.keepsBody) {
                 if (node.isConnected) {
-                    if (!node.collapsable.loaded) {
-                        node.collapsable.loaded = true;
+                    if (!node.collapsible.loaded) {
+                        node.collapsible.loaded = true;
                         this.requestBody(node);
                     }
-                    if (node.collapsable.hideBodyOnCollapse) node.collapsable.setExpanded(true);
+                    if (node.collapsible.mode === 'keep') node.collapsible.setExpanded(true);
                 } else {
                     node.dataset.btAutoMount = '1';
-                    if (node.collapsable.hideBodyOnCollapse) node.dataset.btAutoExpand = '1';
+                    if (node.collapsible.mode === 'keep') node.dataset.btAutoExpand = '1';
                 }
             } else if (node.isConnected) {
-                node.collapsable.setExpanded(true);
+                node.collapsible.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
             }
         }
-        if (msg.expand_full && node.collapsable) {
+        if (msg.expand_full && node.collapsible) {
             if (node.isConnected) {
-                if (!node.collapsable.loaded) {
-                    node.collapsable.loaded = true;
+                if (!node.collapsible.loaded) {
+                    node.collapsible.loaded = true;
                     this.requestBody(node);
                 }
-                node.collapsable.setExpanded(true);
+                node.collapsible.setExpanded(true);
             } else {
                 node.dataset.btAutoExpand = '1';
             }
@@ -2229,11 +2159,11 @@ class BonitoChat {
             <div class="bt-task-feed-list"></div>`;
         node.querySelector('.bt-tool-header')?.insertAdjacentElement('afterend', feed) || node.appendChild(feed);
         const list = feed.querySelector('.bt-task-feed-list');
-        feed._collapsable = new Collapsable(feed.querySelector('.bt-task-feed-head'), list, {
-            toggleEl: feed.querySelector('.bt-task-feed-head .bt-tool-toggle')
+        feed._collapsible = new this.Collapsible(feed.querySelector('.bt-task-feed-head'), list, {
+            closer: feed.querySelector('.bt-task-feed-head .bt-tool-toggle')
         });
         if (node.classList.contains('bt-tool-live')) {
-            feed._collapsable.setExpanded(true);
+            feed._collapsible.setExpanded(true);
         } else {
             list.style.display = 'none';
         }
@@ -2257,7 +2187,7 @@ class BonitoChat {
             feed.dataset.total = String(Math.max(n, Number(feed.dataset.total || 0)));
             count.textContent = feed.dataset.total;
         }
-        if (feed._collapsable?.expanded) list.scrollTop = list.scrollHeight;
+        if (feed._collapsible?.expanded) list.scrollTop = list.scrollHeight;
     }
     noteKey(msg) {
         const key = filterKey(msg);
@@ -2274,7 +2204,7 @@ class BonitoChat {
     applyNative(node) {
         node.classList.add('bt-tool-native', 'bt-output-framed');
         if (node.isConnected) {
-            node.collapsable?.setExpanded(true);
+            node.collapsible?.setExpanded(true);
         } else {
             node.dataset.btAutoExpand = '1';
         }
@@ -2282,7 +2212,7 @@ class BonitoChat {
     removeNative(node) {
         node.classList.remove('bt-tool-native', 'bt-output-framed');
         delete node.dataset.btAutoExpand;
-        node.collapsable?.setExpanded(false);
+        node.collapsible?.setExpanded(false);
     }
     setNativeMedia(prefix, on) {
         if (prefix === 'image/') this.nativeImages = on;
@@ -2404,14 +2334,14 @@ class BonitoChat {
                     div.className = 'bt-thought-msg';
                     div.innerHTML = this.thoughtHTML(msg);
                     const id = msg.id;
-                    div.collapsable = new Collapsable(div.querySelector('.bt-thought-summary'), div.querySelector('.bt-thought-body'), {
-                        native: true,
+                    div.collapsible = new this.Collapsible(div.querySelector('.bt-thought-summary'), div.querySelector('.bt-thought-body'), {
+                        placeholder: (body)=>showLoading(body, null),
                         onExpand: ()=>this.comm.notify({
                                 type: 'thought.render',
                                 id
                             })
                     });
-                    if (msg.html) div.collapsable.fill(msg.html);
+                    if (msg.html) div.collapsible.fill(msg.html);
                     break;
                 }
             case 'tool':
@@ -2435,13 +2365,10 @@ class BonitoChat {
                     div.__btBodyH = msg.body_h || null;
                     div.__btMedia = msg.media || null;
                     div.__btMediaExtra = msg.media_extra || 0;
-                    div.collapsable = new Collapsable(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
-                        toggleEl: div.querySelector('.bt-tool-toggle'),
-                        editMode: compactBody,
-                        hideBodyOnCollapse: msg.compact_body === true,
-                        fetchEachExpand: !compactBody,
-                        discardOnCollapse: !compactBody,
-                        reserve: ()=>this.bodyReserve(div),
+                    div.collapsible = new this.Collapsible(div.querySelector('.bt-tool-header'), div.querySelector('.bt-tool-body'), {
+                        closer: div.querySelector('.bt-tool-toggle'),
+                        mode: msg.compact_body === true ? 'keep' : compactBody ? 'compact' : 'reload',
+                        placeholder: (body)=>showLoading(body, this.bodyReserve(div)),
                         onToggle: (expanded)=>this.expandState.set(id, expanded),
                         onExpand: ()=>this.requestBody(div)
                     });
@@ -2476,16 +2403,16 @@ class BonitoChat {
                     if (this.wantsNative(div)) {
                         this.applyNative(div);
                     } else if (msg.expand || msg.expand_full) {
-                        if (div.collapsable.editMode) {
+                        if (div.collapsible.keepsBody) {
                             div.dataset.btAutoMount = '1';
-                            if (msg.expand_full || div.collapsable.hideBodyOnCollapse) div.dataset.btAutoExpand = '1';
+                            if (msg.expand_full || div.collapsible.mode === 'keep') div.dataset.btAutoExpand = '1';
                         } else {
                             div.dataset.btAutoExpand = '1';
                         }
                     }
                     const mine = this.expandState.get(id);
                     if (mine === true) {
-                        if (div.collapsable.editMode) div.dataset.btAutoMount = '1';
+                        if (div.collapsible.keepsBody) div.dataset.btAutoMount = '1';
                         div.dataset.btAutoExpand = '1';
                     } else if (mine === false) {
                         delete div.dataset.btAutoExpand;
@@ -4235,8 +4162,8 @@ function toolSlot(id) {
 function flushDrafts() {
     for (const chat of CHAT_INSTANCES)chat.flushDraft?.();
 }
-function connect(node, comm, init = {}, RowBlock) {
-    const chat = new BonitoChat(node, comm, init, RowBlock);
+function connect(node, comm, init = {}, RowBlock, Collapsible) {
+    const chat = new BonitoChat(node, comm, init, RowBlock, Collapsible);
     if (Array.isArray(init.commands)) chat.slashCommands = init.commands;
     node.__bt_chat = chat;
     CHAT_INSTANCES.add(chat);
@@ -4256,7 +4183,6 @@ function connect(node, comm, init = {}, RowBlock) {
     return chat;
 }
 export { BonitoChat as BonitoChat };
-export { Collapsable as Collapsable };
 export { mountCode as mountCode };
 export { openLightbox as openLightbox };
 export { msearchFilter as msearchFilter };

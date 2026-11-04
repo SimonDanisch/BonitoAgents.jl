@@ -137,6 +137,9 @@ live.
 
 ### Chat and workspace
 
+- **Faster page loads.** A worker's list of past sessions is built when you open
+  it, not with every page. A page with hundreds of past sessions, on a phone
+  especially, no longer waits for rows it isn't showing.
 - The transcript opens at its newest messages and loads older ones as you
   scroll, keeping a bounded number of rows in the page; the reading position
   is anchored to content.

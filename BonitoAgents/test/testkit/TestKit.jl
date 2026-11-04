@@ -98,7 +98,7 @@ export TestServer, dev_server, add_worker!, drop_worker_connection!,
        sub_text, sub_tool,
        diff_block, text_block, image_block, error_reply, crash, end_turn,
        mcp_call, bt_eval, bt_continue,
-       open_browser, navigate, to_dashboard, new_chat, open_chat,
+       open_browser, navigate, to_dashboard, new_chat, open_chat, open_discover!,
        send_message, switch_agent, set_window_size, emulate_phone, tap, swipe,
        click, click_until, click_text, set_input, wheel_into_view,
        exit_success,
@@ -2551,6 +2551,20 @@ function current_chat_id(s::TestServer)
     pid = eval_js(s, """(() => { const a=document.querySelector('.bt-side-item.bt-side-active');
         return a ? (a.getAttribute('data-project-id') || '') : ''; })()""")
     return String(pid === nothing ? "" : pid)
+end
+
+"""
+    open_discover!(s::TestServer; timeout = 15)
+
+Open every worker's "projects" list and every folder in it, and wait for the session
+rows: they're built when they're opened.
+"""
+function open_discover!(s::TestServer; timeout::Real = 15)
+    wait_for(s, "rows in the discover list", """(() => {
+        document.querySelectorAll('details.bt-discover-panel, details.bt-group').forEach(d => d.open = true);
+        return document.querySelector('.bt-session-row') !== null;
+    })()"""; timeout)
+    return nothing
 end
 
 """
