@@ -125,49 +125,34 @@ Its capability shim also advertises the existing steering
 fallback prompt if the running turn ends. An ordinary queued prompt does not
 have that delivery priority.
 
-## The walkthrough videos
+## Recording the homepage demo
 
-Three recorders under [`examples/`](https://github.com/SimonDanisch/BonitoAgents.jl/tree/main/examples)
-drive a real Electron window with ElectronCall's animated cursor and frame-pump
-recorder, using only trusted input (`ECT.real_click`, `ECT.wheel`) so the clip
-shows exactly what a user does. The first two write the videos embedded on the
-home page; copy them into `docs/src/assets/` (as `dashboard.mp4` and
-`walkthrough.mp4`) to publish them:
+The homepage follows one curve-fitting task: explore a live app, check the
+calculation, then dock the app beside the conversation. The conversation is
+scripted with MockACP; Julia execution, streaming output, plots and browser
+interactions are real. It uses no agent credits.
 
-- [`walkthrough_dashboard.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_dashboard.jl)
-  → `walkthrough_dashboard.mp4`: the multi-project dashboard tour (open a project
-  from its card, switch projects from the sidebar, back to Home). Replays the
-  persistent rig (`BT_WALKTHROUGH_RIG`), so it uses no tokens and never prompts
-  the agent.
-- [`walkthrough.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough.jl)
-  → `walkthrough.mp4`: the focused tour on the SAME rig. A streaming
-  `bt_julia_eval`, the three-state section collapse, the other three chats, then
-  the Lorenz app steered by its slider, detached and docked beside its source
-  file. Replaying costs nothing, but the app the agent returned is gone after a
-  cold attach, so `BT_WALKTHROUGH_REVIVE=1` spends ONE small turn rebuilding it.
-- [`walkthrough_mock.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
-  → also `walkthrough.mp4`: the same story with no rig and no agent at all. A
-  `MockACP` scripts the conversation while the REAL `bt_julia_eval` runs the
-  code. Deterministic, which is what you want when the rig is unavailable or you
-  are iterating on the camera work rather than on the content.
-
-`walkthrough.jl` and `walkthrough_mock.jl` write the same filename, so whichever
-you run last is the one you copy into the docs. The rig tour shows four genuine
-agent sessions; the mock one is reproducible anywhere.
+Run [the recorder](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_mock.jl)
+in the development environment, with ElectronCall's testing helpers available:
 
 ```bash
-# run in an env that dev's ElectronCall with the trusted-input helpers:
-julia --project examples/walkthrough_dashboard.jl   # → examples/walkthrough_dashboard.mp4
-BT_WALKTHROUGH_REVIVE=1 julia --project examples/walkthrough.jl   # → examples/walkthrough.mp4
-julia --project examples/walkthrough_mock.jl        # → examples/walkthrough.mp4 (no rig, no tokens)
+julia --project examples/walkthrough_mock.jl
 ```
 
-The rig itself lives OUTSIDE the repo (it holds machine-local absolute paths),
-so a fresh checkout has nothing to replay and the recorders fail on a missing
-chat. [`walkthrough_seed.jl`](https://github.com/SimonDanisch/BonitoAgents.jl/blob/main/examples/walkthrough_seed.jl)
-rebuilds it: four projects, one real agent turn each (this is the only step that
-spends tokens), with a check per chat that it produced what the camera needs.
-Name one chat to reseed just that one.
+Set `BT_WALKTHROUGH_EVAL_ENV` to an existing project with WGLMakie, Bonito,
+Statistics and LinearAlgebra. The recorder writes `examples/workflow-raw.mp4`;
+setup and compilation happen before the camera starts. Use a fresh Julia
+process for a new take so a previous recording's live app cannot be reused.
+
+The published clip is `docs/src/assets/workflow.mp4`. Keep pauses long enough
+to understand the result, and cut waiting or repeated navigation. Publish it
+with a representative `workflow-poster.jpg` and English captions in
+`workflow.vtt`. Update the chapter times in `index.md` to match the edit.
+The page uses native video controls and does not autoplay.
+
+The older `walkthrough.jl` and `walkthrough_dashboard.jl` replay a separate
+persistent rig with real agent sessions. They remain available for longer
+tours, but are not embedded on the homepage.
 
 ## Building these docs
 

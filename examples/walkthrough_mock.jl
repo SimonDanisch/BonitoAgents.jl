@@ -1,27 +1,14 @@
-# Dashboard walkthrough, driven by the DETERMINISTIC MockACP agent.
+# Homepage demo: scripted conversation, real Julia execution and browser input.
+# Build the curve-fitting app before recording, then show its slider, streaming
+# cross-validation, code folding and docking. No agent credits are used.
 #
-# MockACP invokes the REAL bt_julia_eval (real Malt worker, real streaming, a
-# real live/steerable app) but the CONVERSATION is exactly scripted — no
-# fumbling, no failed cards, repeatable. So we pre-build the app off camera and
-# open directly on it.
-#
-# STRICT: every on-camera interaction is a REAL input event — `ECT.wheel`
-# (trusted WheelEvent, app scroll handlers fire), `ECT.real_click` (trusted
-# press/release, sets CSS :hover for hover-gated controls), `ECT.steer_slider`
-# (trusted thumb drag), `ECT.drag`. No `scrollTop`, no synthetic `.click()`.
-# `eval_js` is used ONLY to READ layout (element rects) for aiming, never to act.
-#
-# The demo is a live curve-fitting dashboard: noisy samples + a least-squares
-# polynomial fit, a DEGREE slider that walks underfit → overfit (RMSE live), and
-# a streaming k-fold cross-validation sweep that finds the best degree.
-#
-# Run:  julia --project=BonitoAgents/test examples/walkthrough_mock.jl
-# Out:  examples/walkthrough.mp4
+# Run in the development environment: julia --project examples/walkthrough_mock.jl
+# Output: examples/workflow-raw.mp4. Set BT_WALKTHROUGH_EVAL_ENV to the eval project.
 
 isdefined(@__MODULE__, :tour) || include(joinpath(@__DIR__, "walkthrough.jl"))
 
 const MOCK_EVAL_ENV  = get(ENV, "BT_WALKTHROUGH_EVAL_ENV", "/sim/Programmieren/AgentsDev")
-const MOCK_CHAT_TITLE = "RegressionExplorer"        # NO spaces — new_chat's bind hangs on a spaced title
+const MOCK_CHAT_TITLE = "CurveFitting"
 const SHOTDIR = get(ENV, "BT_WALKTHROUGH_SHOTS", "/tmp/wshots")
 
 # ── the app: an interactive least-squares curve-fitting dashboard ──────────────
@@ -43,8 +30,8 @@ App() do session
         rmse = sqrt(mean((V*coef .- DY) .^ 2))
         (; yg, rmse)
     end
-    fig = Figure(; size = (1120, 520), backgroundcolor = :white)
-    ax = Axis(fig[1, 1]; title = "Least-squares polynomial fit", titlesize = 22,
+    fig = Figure(; size = (960, 440), backgroundcolor = :white)
+    ax = Axis(fig[1, 1]; title = "Polynomial fit", titlesize = 20,
               xlabel = "x", ylabel = "y")
     lines!(ax, xg, truef.(xg); color = (:seagreen, 0.5), linewidth = 2, linestyle = :dash, label = "truth")
     scatter!(ax, DX, DY; color = (:steelblue, 0.55), markersize = 11, label = "samples")
@@ -53,13 +40,24 @@ App() do session
     # the embed's right edge the way a right-anchored legend does.
     axislegend(ax; position = :lt)
     ylims!(ax, -2.2, 1.7)
+    styles = Styles(
+        CSS(".demo-fit", "width" => "100%", "min-width" => "0",
+            "background" => "white", "border-radius" => "8px"),
+        CSS(".demo-fit-header", "display" => "flex", "flex-wrap" => "wrap",
+            "align-items" => "center", "gap" => "12px", "padding" => "12px 18px",
+            "font" => "600 14px sans-serif", "color" => "#333"),
+        CSS(".demo-fit-value", "color" => "#b83732"),
+        CSS(".demo-fit-error", "color" => "#555"),
+        CSS(".demo-fit-plot", "width" => "100%", "height" => "420px", "min-width" => "0"),
+    )
     header = DOM.div(
-        DOM.span("polynomial degree"; style = "color:#333; font:600 15px sans-serif;"),
-        deg,
-        DOM.span(map(d -> "degree $d", deg.value); style = "color:#c0392b; font:700 15px monospace; margin-left:6px;"),
-        DOM.span(map(f -> "RMSE $(round(f.rmse; digits = 3))", fit); style = "color:#555; font:600 15px monospace; margin-left:18px;");
-        style = "display:flex; align-items:center; gap:12px; padding:12px 18px;")
-    DOM.div(header, fig; style = "background:white; padding:6px; border-radius:10px;")
+        DOM.span("polynomial degree"), deg,
+        DOM.span(map(d -> "degree $d", deg.value); class = "demo-fit-value"),
+        DOM.span(map(f -> "RMSE $(round(f.rmse; digits = 3))", fit); class = "demo-fit-error");
+        class = "demo-fit-header")
+    plot = DOM.div(WGLMakie.WithConfig(fig; resize_to = :parent); class = "demo-fit-plot")
+    DOM.div(styles, header, plot; class = "demo-fit")
+
 end"""
 
 # Streaming k-fold cross-validation over the SAME data (reuses DX/DY): the
@@ -93,14 +91,15 @@ mock_completed_js() = """[...document.querySelectorAll('.bt-tool-msg')].filter(c
 
 function make_agent()
     n = Ref(0)
+    take = string(BT.uuid4())
     return function (_prompt)
         n[] += 1
         n[] == 1 ?
             Any[TK.text("Here's an interactive least-squares curve-fitting dashboard — a " *
                         "polynomial fit to noisy samples with a degree slider."),
-                TK.bt_eval(FIT_APP; env_path = MOCK_EVAL_ENV, id = "fit-app")] :
+                TK.bt_eval(FIT_APP; env_path = MOCK_EVAL_ENV, id = "fit-$take", timeout = 0)] :
             Any[TK.text("Which degree actually generalizes? Cross-validating, streaming the held-out error:"),
-                TK.bt_eval(CV_CODE; env_path = MOCK_EVAL_ENV, id = "cv-sweep")]
+                TK.bt_eval(CV_CODE; env_path = MOCK_EVAL_ENV, id = "cv-$take", timeout = 0)]
     end
 end
 
@@ -127,7 +126,11 @@ fit_detach_js() = """(() => {
 # Real wheel scroll: park the cursor in the transcript gutter, then dispatch
 # genuine WheelEvents. `dy>0` scrolls DOWN (content up).
 function wheel!(s, ctx, dy)
-    cursor_to_transcript!(s, ctx)
+    gutter = TK.eval_js(s, """(() => {
+        const r = [...document.querySelectorAll('.bt-messages')].find(e => e.checkVisibility()).getBoundingClientRect();
+        return [r.x + 6, r.y + r.height / 2];
+    })()""")
+    ECT.move_to(ctx, (Float64(gutter[1]), Float64(gutter[2])); duration = 0.2)
     ECT.wheel(ctx, dy; steps = 8, step_sleep = 0.05)
     sleep(0.2)
 end
@@ -156,20 +159,15 @@ shot(s, name) = (mkpath(SHOTDIR); TK.screenshot(s, joinpath(SHOTDIR, name)); @in
 # ── the recorded tour ──────────────────────────────────────────────────────────
 function tour_mock(s, ctx)
     T0 = time(); mark(n) = @info "tour" step = n at = round(time() - T0; digits = 1)
-    # 1 ─ OPEN ON THE DASHBOARD. Wheel it so the DEGREE SLIDER sits just below the
-    #     composer — the slider AND the whole plot are then in frame, so the
-    #     viewer sees the control that drives the fit and the fit itself.
+    # Keep the slider and the whole plot in frame.
     TK.wait_for(s, "live slider", "$(embed_slider()) && $(embed_slider()).checkVisibility()"; timeout = 30)
     wheel_into_view!(s, ctx, embed_slider(); at = 0.16)
-    sleep(1.4); mark("1 framed")
+    sleep(0.8); mark("1 framed")
 
-    # 2 ─ DRAG the degree slider through the bias/variance story, RMSE updating
-    #     live: underfit (deg 1, a straight line) → a clean fit (deg 6) → overfit
-    #     (deg 20, chasing the noise) → back to the clean fit. Trusted thumb drag;
-    #     the fit recomputes in the worker on release.
-    for frac in (0.0, 0.26, 1.0, 0.26)
-        ECT.steer_slider(ctx, ".bt-embed input[type=range]", frac; duration = 1.2)
-        sleep(1.1)
+    # Compare underfitting and overfitting before checking the held-out error.
+    for frac in (0.0, 0.26, 0.85)
+        ECT.steer_slider(ctx, ".bt-embed input[type=range]", frac; duration = 0.8)
+        sleep(0.8)
     end
     sleep(0.6); mark("2 swept")
 
@@ -184,7 +182,7 @@ function tour_mock(s, ctx)
     code = "($(mock_completed_js()))?.querySelector('.bt-subsection')"
     wheel_into_view!(s, ctx, "$code?.querySelector('.bt-subsection-summary')"; at = 0.35)
     sleep(0.6)
-    for st in ["summary:false", "full:true", "summary:true"]
+    for st in ["full:true", "full:false", "summary:true"]
         ECT.real_click(ctx, ECT.JS(el_center_js("$code?.querySelector('.bt-subsection-summary')")))
         TK.wait_for(s, "collapse → $st", """(() => { const d = $code;
             return d && (d.dataset.state + ':' + d.hasAttribute('open')) === $(repr(st)); })()"""; timeout = 8)
@@ -192,10 +190,7 @@ function tour_mock(s, ctx)
     end
     sleep(0.5); mark("3 collapsed")
 
-    # 4 ─ detach the dashboard into the workspace and dock it beside the chat.
-    #     Wheel the app back into view, then a TRUSTED click on its ⤢ button.
-    #     Target the DASHBOARD pill specifically (canvas + slider) so we never
-    #     grab the cross-validation card, whose result is a bare scalar.
+    # Detach the live app, not the cross-validation card (which returns a scalar).
     wheel_into_view!(s, ctx, "$(fit_pill_js())?.querySelector('.bt-tool-detach')"; at = 0.3)
     sleep(0.6); mark("4 detach-framed")
     ECT.real_click(ctx, ECT.JS(fit_detach_js()))
@@ -203,10 +198,7 @@ function tour_mock(s, ctx)
         "[...document.querySelectorAll('.bw-ws-float')].some(f => f.checkVisibility() && f.querySelector('canvas'))";
         timeout = 20)
     sleep(1.0); mark("4 floating")
-    ECT.drag(ctx, ECT.JS(floattitle("App")),
-             [ECT.JS(groupbody("Chat"; rel = (0.7, 0.5))),
-              ECT.JS(groupbody("Chat"; rel = (0.94, 0.5)))];
-             grab = 0.4, move = 1.1)
+    dock_float!(s, ctx) || error("the app did not dock beside the chat")
     sleep(1.4); mark("4 docked")
 
     # 5 ─ docked + live: one more drag in the plotpane.
@@ -214,21 +206,25 @@ function tour_mock(s, ctx)
         "[...document.querySelectorAll('input[type=range]')].some(e => e.checkVisibility())"; timeout = 15)
     ECT.steer_slider(ctx, "input[type=range]", 0.85; duration = 1.2)
     sleep(1.0)
-    ECT.steer_slider(ctx, "input[type=range]", 0.2; duration = 1.2)
+    ECT.steer_slider(ctx, "input[type=range]", 0.53; duration = 1.2)
     sleep(1.2); mark("5 docked-steer done")
 end
 
-function record_mock(; outpath = joinpath(@__DIR__, "walkthrough.mp4"))
-    s = TK.dev_server(agent = make_agent())         # mock = true (default)
+function record_mock(; outpath = joinpath(@__DIR__, "workflow-raw.mp4"))
+    s = TK.dev_server(agent = make_agent(), name = "Studio")         # mock = true (default)
     try
         TK.open_browser(s)
-        TK.set_window_size(s, 1600, 900)
-        chatdir = mktempdir(; prefix = "bt-reg-")
+        TK.set_window_size(s, 1440, 900)
+        chatdir = joinpath(mktempdir(; prefix = "bonito-demo-"), "CurveFitting")
+        mkpath(chatdir)
         TK.new_chat(s; cwd = chatdir, title = MOCK_CHAT_TITLE)
         # SETUP (off camera): build the dashboard, wait for it to render.
         TK.send_message(s, "Build me an interactive least-squares curve-fitting dashboard with a degree slider.")
         TK.wait_for(s, "app mounts live", mock_app_up_js(); timeout = 240)
-        sleep(4)
+        TK.wait_for(s, "app eval completed",
+            "!!($(fit_pill_js())) && $(fit_pill_js()).querySelector('.bt-tool-status')?.textContent === 'completed'";
+            timeout = 90)
+        sleep(1)
         ctx = s.browser[]
         ECT.install_error_sink(ctx)
         ECT.install_cursor(ctx; start = (800, 780))
