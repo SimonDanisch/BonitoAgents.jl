@@ -137,6 +137,7 @@ const OverviewStyles = Bonito.Styles(
         "border-radius" => "var(--bw-radius)",
         "overflow" => "hidden",
         "cursor" => "pointer",
+        "position" => "relative",
         "display" => "flex", "flex-direction" => "column",
         "transition" => "border-color 120ms ease, box-shadow 120ms ease"),
     CSS(".bt-ov-card:hover",
@@ -183,12 +184,25 @@ const OverviewStyles = Bonito.Styles(
         "color" => "var(--bw-text-muted)",
         "white-space" => "nowrap", "overflow" => "hidden",
         "text-overflow" => "ellipsis"),
+    # Shows on hover, and always where there's no hover to reveal it.
+    CSS(".bt-ov-delete",
+        "position" => "absolute", "top" => "6px", "right" => "6px",
+        "padding" => "2px 7px",
+        "font-size" => "var(--bw-font-size-xs)",
+        "color" => "var(--bw-text-muted)",
+        "background" => "var(--bw-bg-panel)",
+        "border" => "1px solid var(--bw-border)",
+        "border-radius" => "var(--bw-radius)",
+        "cursor" => "pointer",
+        "opacity" => "0"),
+    CSS(".bt-ov-card:hover .bt-ov-delete, .bt-ov-delete:focus-visible", "opacity" => "1"),
+    CSS("@media (hover: none)", CSS(".bt-ov-delete", "opacity" => "1")),
     CSS(".bt-ov-empty",
         "font-size" => "var(--bw-font-size-sm)", "color" => "var(--bw-text-muted)",
         "padding" => "6px 0"),
 )
 
-function overview_card_dom(state::ServerState, c::ChatCardData)
+function overview_card_dom(state::ServerState, c::ChatCardData; deletable::Bool = false)
     p = get(state.projects[], c.pid, nothing)
     app = p === nothing ? nothing : app_of(state, p)
     thumb = if app !== nothing
@@ -202,7 +216,12 @@ function overview_card_dom(state::ServerState, c::ChatCardData)
         DOM.div()
     end
     snippets = [DOM.div(s; class = "bt-ov-snippet", title = s) for s in c.snippets]
+    delete = (deletable && p !== nothing && app === nothing) ?
+        DOM.button("Delete"; class = "bt-ov-delete", type = "button",
+                   title = "Delete this chat for good") :
+        DOM.span()
     DOM.div(
+        delete,
         DOM.div(thumb; class = "bt-ov-thumb"),
         DOM.div(
             DOM.div(
@@ -230,20 +249,26 @@ end
 # six chats), but it is not free per frame: don't wire this to a signal that
 # fires per streamed chunk.
 function recent_chats_dom(session::Bonito.Session, state::ServerState,
-                          current_view::Union{Observable{String},Nothing})
+                          current_view::Union{Observable{String},Nothing}; progress = nothing)
     grid = map(state.chat_signal, state.turn_signal, state.projects) do _, _turn, _projects
         cards = page_phase(() -> recent_chat_cards(state), :overview_cards)
         isempty(cards) && return DOM.div("No chats yet — create a project below.";
                                           class = "bt-ov-empty")
-        DOM.div((overview_card_dom(state, c) for c in cards); class = "bt-ov-grid")
+        DOM.div((overview_card_dom(state, c; deletable = current_view !== nothing) for c in cards);
+                class = "bt-ov-grid")
     end
     current_view === nothing &&
         return DOM.div(OverviewStyles, grid; class = "bt-overview")
-    return DOM.div(OverviewStyles, grid;
+    delete_prompt = delete_chat_prompt(session, state; progress)
+    return DOM.div(OverviewStyles, grid, delete_prompt.modal;
         class = "bt-overview",
         onclick = js"""event => {
             const card = event.target.closest('.bt-ov-card');
-            if (card && card.dataset.projectId)
-                $(current_view).notify(card.dataset.projectId);
+            if (!card || !card.dataset.projectId) return;
+            if (event.target.closest('.bt-ov-delete')) {
+                $(delete_prompt.ask).notify(card.dataset.projectId);
+                return;
+            }
+            $(current_view).notify(card.dataset.projectId);
         }""")
 end

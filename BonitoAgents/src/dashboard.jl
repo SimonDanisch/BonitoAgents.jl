@@ -531,6 +531,187 @@ function stop_session!(state::ServerState, p::ProjectInfo)
     return nothing
 end
 
+# The session whose record on the worker goes when chat `p` is deleted, or
+# `nothing` when there is none to remove: no session yet, an agent whose record we
+# can't identify, or a session another chat in that folder on that worker still
+# resumes. The record lives per folder, so the same id elsewhere is another record.
+function deletable_session(state::ServerState, p::ProjectInfo)
+    sid = p.resume_session_id
+    sid === nothing && return nothing
+    session_state_format(project_provider(p)) === nothing && return nothing
+    in_use = any(values(state.projects[])) do q
+        q.id != p.id && q.worker_id == p.worker_id && q.worker_path == p.worker_path &&
+            q.resume_session_id == sid
+    end
+    return in_use ? nothing : sid
+end
+
+"""
+    delete_chat_question(state, p) -> String
+
+What the confirmation asks before chat `p` is deleted, naming what goes and what stays.
+"""
+function delete_chat_question(state::ServerState, p::ProjectInfo)
+    worker = get(state.workers[], p.worker_id, nothing)
+    where_ = worker === nothing ? "its worker" : worker.name
+    removed = if deletable_session(state, p) !== nothing
+        "Its transcript and the agent's session on $(where_) are removed."
+    elseif p.resume_session_id !== nothing && session_state_format(project_provider(p)) === nothing
+        "Its transcript is removed, but $(provider_name(project_provider(p)))'s own copy on $(where_) stays."
+    else
+        "Its transcript is removed."
+    end
+    return "Delete this chat? $(removed) Shared links from it stop working. " *
+           "Project files stay. This can't be undone."
+end
+
+"""
+    delete_chat!(state, p; session = true, memory = false)
+
+Delete chat `p`, its processes, transcript and shared links. Optionally delete
+the agent's saved session and shared project memory on its worker.
+Project files stay. Memory is shared by other chats in the same folder.
+
+Refuses, changing nothing, while the worker holding the agent's record is offline,
+since that record would bring the chat back through the session list later. A
+worker that no longer exists has no record anyone can reach, so it doesn't block.
+"""
+function delete_chat!(state::ServerState, p::ProjectInfo;
+                      session::Bool = true, memory::Bool = false)
+    visible(state, p) || error("This chat isn't yours to delete.")
+    app_of(state, p) === nothing || error("A chat that belongs to an app can't be deleted.")
+    state = root_state(state)
+    worker = get(state.workers[], p.worker_id, nothing)
+    memory && session_state_format(project_provider(p)) === nothing &&
+        error("This agent's project memory location is unknown. Nothing changed.")
+    memory && worker === nothing && error("The worker no longer exists. Its memory can't be deleted.")
+    session_id = !session || worker === nothing ? nothing : deletable_session(state, p)
+    (session_id === nothing && !memory) || isopen(worker) ||
+        error("$(worker.name) is offline, so its agent data can't be deleted. Nothing changed.")
+    # Closed first: a tab showing this chat would otherwise bring it back up the
+    # moment its session stops. The agent has to be gone before its transcript is,
+    # or it writes the transcript back.
+    lock(state.lock) do
+        p.dismissed = true
+        save_projects!(state)
+    end
+    notify_projects!(state)
+    stop_session!(state, p)
+    if session_id !== nothing || memory
+        delete_session_on_worker(state, p.worker_id;
+            provider = provider_name(project_provider(p)), cwd = p.worker_path,
+            session_id = something(session_id, ""), session = session_id !== nothing, memory)
+    end
+    links = lock(state.shares.lock) do
+        [id for (id, link) in state.shares.links[] if link.project_id == p.id]
+    end
+    foreach(id -> revoke_share!(state, id), links)
+    lock(state.lock) do
+        delete!(state.projects[], p.id)
+        delete!(state.review_states, p.id)
+        delete!(state.turns_ended, p.id)
+        rows = get(state.discovered[], p.worker_id, nothing)
+        if session_id !== nothing && rows !== nothing
+            filter!(rows) do row
+                get(row, "session_id", nothing) != session_id &&
+                    get(row, "parent_session_id", nothing) != session_id
+            end
+            save_discovered!(state)
+        end
+        save_projects!(state)
+    end
+    rm(joinpath(state.state_dir, "chats", p.id); recursive = true, force = true)
+    session_id === nothing || notify(state.discovered)
+    notify_projects!(state)
+    notify_chats!(state)
+    @info "Chat deleted" project = p.name id = p.id session = session_id links = length(links)
+    return nothing
+end
+
+const DELETE_CHAT_STYLES = Styles(
+    CSS(".bt-form.bt-delete-chat", "display" => "flex", "flex-direction" => "column",
+        "gap" => "var(--bw-space-3)"),
+    CSS(".bt-delete-chat .bt-form-check", "display" => "flex", "align-items" => "center",
+        "gap" => "var(--bw-space-2)", "color" => "var(--bw-text)", "padding-top" => "0"),
+    CSS(".bt-delete-chat input[type=checkbox]", "width" => "auto", "margin" => "0",
+        "padding" => "0"),
+)
+
+# The modal is mounted with its caller; only the requested chat id crosses the
+# open channel. Read options together on submit, not as independent messages.
+function delete_chat_prompt(session::Bonito.Session, state::ServerState; progress = nothing)
+    busy = progress === nothing ? Observable{Any}(BUSY_IDLE) : progress
+    ask = Observable("")
+    is_open = Observable(false)
+    submit = Observable{Any}(Any[])
+    error = Observable("")
+    deleting = Observable(false)
+    on(session, ask) do pid
+        p = get(state.projects[], pid, nothing)
+        (p === nothing || !visible(state, p)) && return
+        error[] = ""
+        is_open[] = true
+    end
+    on(session, submit) do options
+        deleting[] && return
+        refuse_if_busy(busy, error, "deleting this chat") && return
+        pid, remove_session, remove_memory = options
+        p = get(state.projects[], pid, nothing)
+        p === nothing && return
+        deleting[] = true
+        error[] = ""
+        is_open[] = false
+        busy_start!(busy, "Deleting chat")
+        Base.errormonitor(@async try
+            delete_chat!(state, p; session = remove_session, memory = remove_memory)
+            busy_done!(busy, "Chat deleted")
+        catch e
+            bt = catch_backtrace()
+            @warn "deleting a chat failed" project = p.name exception = (e, bt)
+            busy_fail!(busy, "Deleting chat failed", error_detail(e, bt))
+        finally
+            deleting[] = false
+        end)
+    end
+    modal = Modal(is_open; title = "Delete chat") do
+        p = get(state.projects[], ask[], nothing)
+        p === nothing && return DOM.div("This chat has already been deleted.")
+        known = session_state_format(project_provider(p)) !== nothing
+        can_delete_session = deletable_session(state, p) !== nothing
+        worker = get(state.workers[], p.worker_id, nothing)
+        where_ = worker === nothing ? "its worker" : worker.name
+        session_check = DOM.input(type = "checkbox", class = "bt-delete-session",
+            checked = can_delete_session, disabled = !can_delete_session)
+        memory_check = DOM.input(type = "checkbox", class = "bt-delete-memory",
+            disabled = !known || worker === nothing)
+        DOM.div(DELETE_CHAT_STYLES,
+            DOM.div("Delete “$(p.title[])”? Its BonitoAgents transcript and shared links are removed."),
+            DOM.label(session_check, " Agent's saved session on $(where_)";
+                class = "bt-form-check",
+                title = can_delete_session ? "Includes this session's subagent transcripts." :
+                    "No saved session, an unknown storage format, or another chat still uses this session."),
+            DOM.label(memory_check, " Wipe shared project memory on $(where_)";
+                class = "bt-form-check",
+                title = known ? "Removes the whole agent memory folder for this project." :
+                    "This agent's memory location is unknown."),
+            DOM.div("Memory is shared by all chats in this folder. Project files stay. This can't be undone.";
+                class = "bt-form-note"),
+            DOM.div(error; role = "alert", class = map(session, error) do message
+                isempty(message) ? "bt-delete-error bt-hidden" : "bt-delete-error bt-error"
+            end),
+            DOM.div(
+                DOM.button("Cancel"; class = "bw-btn bw-btn-secondary bt-delete-cancel",
+                    disabled = deleting, onclick = js"event => $(is_open).notify(false)"),
+                DOM.button("Delete chat"; class = "bw-btn bw-btn-danger bt-delete-submit",
+                    disabled = deleting,
+                    onclick = js"event => $(submit).notify([$(p.id), $(session_check).checked, $(memory_check).checked])");
+                class = "bt-form-actions");
+            class = "bt-form bt-delete-chat")
+    end
+    return (; ask, modal = DOM.div(modal,
+        progress === nothing ? progress_overlay(session, busy) : nothing))
+end
+
 """
     continue_on!(state, p, target_worker_id; progress = nothing) -> ProjectInfo
 
@@ -2217,7 +2398,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             # Recent-chats overview — the header IS the landing overview: the
             # last 6 chats as clickable cards (title, count, last prompts,
             # last image), kept fresh via chat_signal/projects (overview.jl).
-            recent_chats_dom(session, state, current_view);
+            recent_chats_dom(session, state, current_view; progress = busy);
             class = "bt-header"),
         stats_strip,
         error_block,

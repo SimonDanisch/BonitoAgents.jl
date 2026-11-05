@@ -2199,6 +2199,9 @@ end
 #     {type:"discard_staging", request_id, staging}
 #  -> {type:"discard_staging_response", request_id}
 #        Remove a staging directory (the source side, after the pull).
+#     {type:"delete_session", request_id, provider, cwd, session_id, session:true, memory:false}
+#  -> {type:"delete_session_response", request_id, entries:[...]}
+#        Remove the selected session entries and shared project memory.
 #
 # Every `staging` path must be a directory directly under a
 # `.bonitoagents-transfer` folder (`AgentProviders.TRANSFER_DIRNAME`); the worker
@@ -2222,6 +2225,36 @@ end
 tree_bytes(path::AbstractString) = isdir(path) ?
     sum(Int[filesize(joinpath(root, f)) for (root, _, files) in walkdir(path) for f in files]; init = 0) :
     filesize(path)
+
+"""
+    delete_session(; provider, cwd, session_id, session = true, memory = false,
+                     home = homedir()) -> Vector{String}
+
+Delete the selected agent data in `cwd` and return the entries removed.
+`session` removes this session's transcript and subagents; `memory` removes the
+whole project memory directory, shared by all sessions in that folder.
+"""
+function delete_session(; provider::AbstractString, cwd::AbstractString,
+                          session_id::AbstractString, session::Bool = true,
+                          memory::Bool = false, home::AbstractString = homedir())
+    # The id becomes a file name, so a bad request must not be able to name
+    # anything else in the transcript directory, or outside it.
+    (!session || (occursin(r"^[A-Za-z0-9._-]+$", session_id) && !(session_id in (".", "..", "memory")))) ||
+        error("invalid session id: $(repr(session_id))")
+    isempty(cwd) && error("session folder is empty")
+    fmt = session_format(provider)
+    dir = AgentProviders.transcript_dir(fmt, home, cwd)
+    removed = String[]
+    entries = session ? AgentProviders.owned_session_entries(fmt, session_id) : String[]
+    memory && push!(entries, "memory")
+    for name in entries
+        path = joinpath(dir, name)
+        ispath(path) || continue
+        rm(path; recursive = true)
+        push!(removed, name)
+    end
+    return removed
+end
 
 """
     stage_session(; provider, cwd, session_id, staging, home = homedir())
@@ -2398,6 +2431,19 @@ function handle_install_session(ws, cmd::AbstractDict)
                               session_id = String(get(cmd, "session_id", "")),
                               staging    = String(get(cmd, "staging", "")))
         Dict{String,Any}("path" => r.path, "entries" => r.entries)
+    end
+end
+
+function handle_delete_session(ws, cmd::AbstractDict)
+    reply = Dict{String,Any}("type" => "delete_session_response",
+                             "request_id" => String(get(cmd, "request_id", "")))
+    reply_with(ws, reply) do
+        entries = delete_session(; provider   = String(get(cmd, "provider", "")),
+                                   cwd        = String(get(cmd, "cwd", "")),
+                                   session_id = String(get(cmd, "session_id", "")),
+                                   session = get(cmd, "session", true)::Bool,
+                                   memory = get(cmd, "memory", false)::Bool)
+        Dict{String,Any}("entries" => entries)
     end
 end
 

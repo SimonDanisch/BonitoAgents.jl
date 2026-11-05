@@ -7987,6 +7987,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
     # Debug BonitoAgents: same destination as the dashboard's button, one click
     # from wherever the user noticed the problem. Runs on THIS chat's worker,
     # which provides the checkout (see `ensure_debug_project!`); needs the window.
+    delete_prompt = delete_chat_prompt(session, state; progress = pane === nothing ? nothing : pane.progress)
     on(session, menu_pick) do action
         isempty(action) && return
         menu_pick[] = ""
@@ -8001,6 +8002,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             end
         elseif action == "restart"
             restart_status[] = "__click__"
+        elseif action == "delete"
+            delete_prompt.ask[] = project_id
         elseif action == "debug"
             pane === nothing && return
             safe_set!(header_status, "Preparing the BonitoAgents checkout…")
@@ -8187,6 +8190,10 @@ function chat_header(session::Bonito.Session, model::ChatModel)
                 $(Bonito.JSString(close_menu_js))
             }""")
 
+    delete_item = (project_now === nothing || app_of(state, project_now) !== nothing) ? nothing :
+        menu_item("Delete chat", "delete"; class = "bw-menu-danger bt-header-delete",
+            title = "Delete this chat for good")
+
     menu = Menu(
         [
             review_item,
@@ -8205,6 +8212,8 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             remote_item,
             messaging_item,
             devmode_item,
+            delete_item === nothing ? nothing : DOM.div(; class = "bw-menu-sep"),
+            delete_item,
         ];
         title = "More actions", class = "bt-header-menu", trigger_class = menu_trigger_class)
 
@@ -8322,7 +8331,7 @@ function chat_header(session::Bonito.Session, model::ChatModel)
             class="bt-header-row"),
         # Lens search bar — always visible. JS (`setupLens`) builds the input
         # + autocomplete + saved-lens chips inside it and wires it to `comm`.
-        DOM.div(class="bt-lens-bar");
+        DOM.div(class="bt-lens-bar"), delete_prompt.modal;
         class="bt-header")
 end
 

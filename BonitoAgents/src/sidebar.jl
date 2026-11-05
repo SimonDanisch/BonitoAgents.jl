@@ -1536,7 +1536,8 @@ function unified_main(session::Bonito.Session, state::ServerState,
         # overlay again, whose loading card brings it back up.
         if cv in cur && !haskey(state.chat_models, cv)
             p = get(state.projects[], cv, nothing)
-            p !== nothing && p.dismissed ? (current_view[] = "") : settled!(ls)
+            # Deleted is the same as closed here: nothing to bring back up.
+            (p === nothing || p.dismissed) ? (current_view[] = "") : settled!(ls)
         end
     end
 

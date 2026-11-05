@@ -732,7 +732,8 @@ function serve_worker_control(state::ServerState, worker_id::String, link::Worke
                              "find_repos_response", "worker_state_response",
                              "read_log_response", "debug_checkout_response",
                              "stage_session_response", "install_session_response",
-                             "discard_staging_response", "open_eval_host_response",
+                             "discard_staging_response", "delete_session_response",
+                             "open_eval_host_response",
                              "close_eval_host_response", "kill_processes_response", "managed_process_response")
                     deliver_rpc_response!(state, rid, Dict{String,Any}(cmd))
                 elseif t == "scan_sessions_result"
@@ -1854,6 +1855,22 @@ function discard_staging_on_worker(state::ServerState, worker_id::AbstractString
     worker_rpc(state, worker_id, "discard_staging",
                Dict{String,Any}("staging" => String(staging)); timeout)
     return nothing
+end
+
+"""
+    delete_session_on_worker(state, worker_id; provider, cwd, session_id, session = true, memory = false) -> entries
+
+Delete the selected session data and shared project memory on the worker.
+Returns the entries removed; a record that is already gone is not an error.
+"""
+function delete_session_on_worker(state::ServerState, worker_id::AbstractString;
+                                  provider::AbstractString, cwd::AbstractString,
+                                  session_id::AbstractString, session::Bool = true,
+                                  memory::Bool = false, timeout::Real = 60.0)
+    resp = worker_rpc(state, worker_id, "delete_session", Dict{String,Any}(
+        "provider" => String(provider), "cwd" => String(cwd),
+        "session_id" => String(session_id), "session" => session, "memory" => memory); timeout)
+    return String[String(e) for e in get(resp, "entries", Any[])]
 end
 
 """
