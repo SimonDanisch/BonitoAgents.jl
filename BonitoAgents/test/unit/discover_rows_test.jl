@@ -31,6 +31,13 @@
         @test renders[] == 1
     end
 
+    @testset "a folder: the same path and summary is the same folder" begin
+        rows = Observable([row()]; ignore_equal_values = true)
+        folder(summary) = BT.SessionGroup("/tmp/x", "x", summary, "w1", rows, Observable(false))
+        @test [folder("1 session")] == [folder("1 session")]
+        @test folder("1 session") != folder("2 sessions")
+    end
+
     @testset "the title: the preview, unless a chat pins one" begin
         @test row().title == "hi"
         @test row(; titles = Dict("other" => "Renamed")).title == "hi"

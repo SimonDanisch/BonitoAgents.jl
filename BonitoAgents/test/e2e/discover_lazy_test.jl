@@ -31,6 +31,8 @@
     folder(name) = "[...document.querySelectorAll('details.bt-group')].find(g => g.querySelector('.bt-group-name').textContent === $(repr(name)))"
     fetches = "performance.getEntriesByType('resource').filter(e => e.initiatorType === 'fetch').length"
 
+    # "+ New thread" really opens a chat here.
+    real_folder = mkpath(joinpath(mktempdir(), "brandnew"))
     server = TK.dev_server(agent = prompt -> [TK.text("echo: $(prompt)"), TK.end_turn()])
     try
         TK.open_browser(server)
@@ -77,7 +79,7 @@
         @testset "a new folder leaves an open folder open" begin
             lock(state.lock) do
                 push!(state.discovered[][wid], Dict{String,Any}(
-                    "session_id" => "sess-new", "path" => "/work/brandnew", "name" => "brandnew",
+                    "session_id" => "sess-new", "path" => real_folder, "name" => "brandnew",
                     "first_prompt" => "the new one", "last_used" => 1.8e9,
                     "kind" => "session", "running" => false))
             end
@@ -97,7 +99,7 @@
             sleep(0.5)
             @test TK.eval_js(server, "window.__row.isConnected") == true
             lock(state.lock) do
-                p = BT.ProjectInfo("renamed", "brandnew", wid, "/work/brandnew", "/work/brandnew", BT.Dates.now())
+                p = BT.ProjectInfo("renamed", "brandnew", wid, real_folder, real_folder, BT.Dates.now())
                 p.resume_session_id = "sess-new"
                 p.title[] = "Renamed Chat"
                 p.dismissed = true
@@ -111,14 +113,29 @@
             notify(state.projects)
         end
 
-        @testset "buttons in a header don't toggle" begin
-            answered = "$(folder("folder3"))"
-            @test TK.eval_js(server, "$(answered).open") == false
-            # Don't go through with the import, only the click matters here.
-            TK.eval_js(server, "$(answered).querySelector('.bt-new-thread').removeAttribute('data-bt-action'); $(answered).querySelector('.bt-new-thread').click(); true")
-            sleep(0.3)
-            @test TK.eval_js(server, "$(answered).open") == false
-            @test TK.eval_js(server, "$(answered).querySelectorAll('.bt-session-row').length") == 0
+        @testset "a new count reaches the header and leaves the folder open" begin
+            @test TK.eval_js(server, "$(folder("folder7")).open") == true
+            lock(state.lock) do
+                push!(state.discovered[][wid], Dict{String,Any}(
+                    "session_id" => "sess-extra", "path" => "/work/folder7", "name" => "folder7",
+                    "first_prompt" => "one more", "last_used" => 1.7e9,
+                    "kind" => "session", "running" => false))
+            end
+            notify(state.discovered)
+            @test TK.wait_for(server, "the new count",
+                "$(folder("folder7")).querySelector('.bt-group-meta').textContent.startsWith('11 sessions')"; timeout = 15) == true
+            @test TK.wait_for(server, "its rows", "$(folder("folder7")).querySelectorAll('.bt-session-row').length === 11"; timeout = 15) == true
+            @test TK.eval_js(server, "$(folder("folder7")).open") == true
+        end
+
+        @testset "+ New thread opens a chat, it doesn't toggle the folder" begin
+            TK.eval_js(server, "$(folder("brandnew")).querySelector('summary').click(); true")
+            @test TK.wait_for(server, "closed", "!$(folder("brandnew")).open"; timeout = 5) == true
+            TK.eval_js(server, "$(folder("brandnew")).querySelector('.bt-new-thread').click(); true")
+            @test TK.wait_for(server, "the chat", "!!document.querySelector('.bt-chatpane[aria-hidden=false] .bt-text-input')"; timeout = 30) == true
+            TK.to_dashboard(server)
+            @test TK.wait_for(server, "back home", "!document.querySelector('.bt-chatpane[aria-hidden=false]')"; timeout = 15) == true
+            @test TK.eval_js(server, "$(folder("brandnew")).open") == false
         end
 
         @testset "Rescan opens a closed list, and doesn't close an open one" begin

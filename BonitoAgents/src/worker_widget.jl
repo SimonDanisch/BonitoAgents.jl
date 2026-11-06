@@ -569,6 +569,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     on_click = js"""(ev) => {
         const btn = ev.target.closest('[data-bt-action="session-pick"]');
         if (!btn) return;
+        ev.preventDefault();   // "+ New thread" sits in a folder's header, this isn't a toggle
         // Optimistic UI: the controller-side import is async, so flip the
         // label + dim immediately so the user sees the click landed. (The
         // "+ New thread" span has no Resume/Import label, leave its text.)
@@ -636,9 +637,9 @@ function discover_panel_body(session::Bonito.Session, c::WorkerCard, wid::String
     # session/subagent rows from that project. The list re-renders only when a
     # folder appears, goes or moves, and a folder's rows only when they differ
     # from what it shows, so nothing re-renders on the frequent `state.projects`
-    # notifications. The cache keeps a folder's open state across rescans, and
+    # notifications. This keeps a folder's rows and open state across rescans, and
     # is pruned each tick for folders that disappeared between scans.
-    session_groups = Dict{String, SessionGroup}()
+    folder_state = Dict{String, Tuple{Observable{Vector{SessionRow}}, Observable{Bool}}}()
 
     # `state.projects` is a dependency too: a chat rename pins a new title on the
     # matching project, and `pinned_titles` reflects it onto the discovered row
@@ -672,24 +673,22 @@ function discover_panel_body(session::Bonito.Session, c::WorkerCard, wid::String
         for (p, rs) in by_path
             sort!(rs; by = r -> -Float64(get(r, "last_used", 0.0)))
             rows = SessionRow[SessionRow(c, r; titles, imported) for r in rs]
-            g = get!(session_groups, p) do
-                SessionGroup(p, basename(p),
-                             Observable(rows; ignore_equal_values = true),
-                             Observable(""; ignore_equal_values = true),
-                             wid, Observable(false))
+            rows_obs, expanded = get!(folder_state, p) do
+                (Observable(rows; ignore_equal_values = true), Observable(false))
             end
-            g.rows_obs[]    = rows
-            g.summary_obs[] = group_summary_string(rs)
-            push!(out, g)
+            rows_obs[] = rows
+            push!(out, SessionGroup(p, basename(p), group_summary_string(rs), wid, rows_obs, expanded))
         end
         # Prune stale cache entries (paths no longer present).
-        for k in collect(keys(session_groups))
-            haskey(by_path, k) || delete!(session_groups, k)
+        for k in collect(keys(folder_state))
+            haskey(by_path, k) || delete!(folder_state, k)
         end
         sort!(out; by = g -> -get(latest_by_path, g.path, 0.0))
         return out
     end
 
-    folders = map(groups -> DOM.div(groups; class = "bt-discover-section"), session, groups_obs)
+    folders = map(session, groups_obs) do groups
+        DOM.div(BonitoWidgets.CollapsibleList(BonitoWidgets.Collapsible.(groups); class = "bt-discover-section"))
+    end
     return DOM.div(spinner_block, empty_block, errors_obs, folders)
 end

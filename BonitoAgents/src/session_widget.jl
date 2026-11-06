@@ -104,20 +104,20 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
         class = "bt-session-row"))
 end
 
-# One project's header + collapsed list of its session/subagent rows. The rows
-# are built when the folder first opens. `expanded` lives here so the folder stays
-# open when the list around it re-renders.
+# One project's header + collapsed list of its session/subagent rows. A snapshot
+# like `SessionRow`: a new count re-renders the list of folders. `rows_obs` and
+# `expanded` carry over between snapshots, so a folder stays open through that.
 struct SessionGroup
     path        :: String                           # identity across rescans
     name        :: String                           # basename(path)
-    rows_obs    :: Observable{Vector{SessionRow}}   # ignores equal values
-    summary_obs :: Observable{String}               # "5 sessions · 12 subagents · Last used …"
+    summary     :: String                           # "5 sessions · 12 subagents · Last used …"
     worker_id   :: String                           # for the "+ New thread" import
+    rows_obs    :: Observable{Vector{SessionRow}}   # ignores equal values
     expanded    :: Observable{Bool}
 end
 
-Base.hash(g::SessionGroup, h::UInt) = hash(g.path, hash(:SessionGroup, h))
-Base.:(==)(a::SessionGroup, b::SessionGroup) = a.path == b.path
+Base.hash(g::SessionGroup, h::UInt) = hash(g.summary, hash(g.path, hash(:SessionGroup, h)))
+Base.:(==)(a::SessionGroup, b::SessionGroup) = a.path == b.path && a.summary == b.summary
 
 # Build the right-of-name summary line for a group given its (raw) result
 # dicts. Counts sessions vs subagents using the `kind` field and reports the
@@ -148,28 +148,32 @@ function group_summary_string(rs::Vector)
     return join(parts, "  ·  ")
 end
 
-function render_part(session::Bonito.Session, g::SessionGroup)   # timed: diagnostics.jl
+# A folder's rows, re-rendered when they differ from what it shows.
+struct SessionRows
+    rows :: Observable{Vector{SessionRow}}
+end
+
+Bonito.jsrender(session::Bonito.Session, r::SessionRows) =
+    Bonito.jsrender(session, map(rows -> DOM.div(rows), session, r.rows))
+
+function BonitoWidgets.Collapsible(g::SessionGroup)
     # Start a brand-new thread (fresh claude session, no resume) in this folder.
     # Like the session rows, this is a delegated `data-bt-action="session-pick"`
     # button (empty session_id ⇒ the import handler uses session/new and
-    # `find_thread` always makes a sibling) — the panel-level listener in
-    # `render_discover_panel` reads these attrs and notifies its SESSION-LOCAL
-    # pick observable. The only inline JS is `preventDefault`, so the click
-    # doesn't toggle the folder; it must NOT stopPropagation, or the event
-    # wouldn't bubble up to the panel's delegated listener.
+    # `find_thread` always makes a sibling): the panel-level listener in
+    # `render_discover_panel` reads these attrs, notifies its SESSION-LOCAL pick
+    # observable and keeps the click from toggling the folder.
     new_thread_btn = DOM.span("+ New thread";
         class             = "bt-new-thread",
         title             = "Start a fresh chat in this folder",
         dataBtAction      = "session-pick",
         dataBtSessionPath = js_path(g.path),
         dataBtSessionId   = "",
-        dataBtWorkerId    = g.worker_id,
-        onclick           = js"event => { event.preventDefault(); }")
+        dataBtWorkerId    = g.worker_id)
     header = Any[DOM.span(g.name; class = "bt-group-name"),
                  DOM.span(g.path; class = "bt-group-path"),
-                 DOM.span(g.summary_obs; class = "bt-group-meta"),
+                 DOM.span(g.summary; class = "bt-group-meta"),
                  new_thread_btn]
-    rows() = DOM.div(map(rows -> DOM.div(rows), session, g.rows_obs); class = "bt-group-body")
-    return Bonito.jsrender(session, BonitoWidgets.Collapsible(header, rows;
-        expanded = g.expanded, class = "bt-group", header_class = "bt-group-summary"))
+    return BonitoWidgets.Collapsible(header, () -> DOM.div(SessionRows(g.rows_obs); class = "bt-group-body");
+        expanded = g.expanded, class = "bt-group", header_class = "bt-group-summary")
 end
