@@ -15,7 +15,6 @@ AgentClientProtocol = {path = "AgentClientProtocol"}
 BonitoAgents = {path = "BonitoAgents"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
 BonitoMCP = {path = "BonitoMCP"}
-BonitoWidgets = {rev = "sd/collapsible", url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git"}
 BonitoWorker = {path = "BonitoWorker"}
 MsgPack = {rev = "master", url = "https://github.com/JuliaIO/MsgPack.jl"}
 RemoteSync = {path = "RemoteSync"}
@@ -23,4 +22,4 @@ WorkerLink = {path = "WorkerLink"}
 
 [compat]
 Bonito = "5.3"
-BonitoWidgets = "0.1.3"
+BonitoWidgets = "0.1.4"

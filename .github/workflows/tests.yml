@@ -17,8 +17,8 @@
 #     Jobs used to compile the stack (~220 s) inside a `timeout 420` wrapper and
 #     get killed mid-suite; the per-ITEM budget now lives in runtests.jl.
 #
-#   • NOBODY RE-RESOLVES. The forks (Bonito, BonitoBook, BonitoWidgets,
-#     ElectronCall, Makie) are pinned to moving branch HEADs in [sources], so a
+#   • NOBODY RE-RESOLVES. The forks (BonitoBook, ElectronCall, Makie) are
+#     pinned to moving branch HEADs in [sources], so a
 #     job that resolved for itself would get other commits than the ones setup
 #     compiled. Manifest.toml is gitignored, so setup shares its resolved ones as
 #     an artifact and every downstream job copies them in before touching Julia.
@@ -70,8 +70,8 @@ jobs:
             ${{ env.DEPOT_KEY_PREFIX }}-${{ runner.os }}-jl${{ env.JULIA_VERSION }}-
 
       - name: Resolve + refresh the git-pinned forks
-        # BonitoBook and BonitoWidgets are [sources] of the main env and Bonito is
-        # the registered release; ElectronCall is TEST-only, and the eval envs carry
+        # BonitoBook is a [sources] pin of the main env, Bonito and BonitoWidgets are
+        # registered releases; ElectronCall is TEST-only, and the eval envs carry
         # their own Makie pins — update each package in the env it actually lives in
         # (`Pkg.update(["ElectronCall"])` on the main env errors with "not found
         # in project or manifest").
