@@ -31,6 +31,8 @@ function docs_styles()
         CSS(".ba-section", "margin-top" => "56px"),
         CSS(".ba-pillars", "display" => "grid", "grid-template-columns" => "repeat(3, minmax(0, 1fr))", "gap" => "28px", "margin-top" => "20px"),
         CSS(".ba-pillars article", "border-top" => "1px solid var(--vp-c-divider)", "padding-top" => "20px"),
+        CSS(".VPHome .ba-overview", "margin-top" => "32px"),
+        CSS(".VPHome .ba-overview img", "display" => "block", "width" => "100%", "height" => "auto"),
         CSS(".ba-pillars p:not(.ba-eyebrow), .ba-workspace p, .ba-start p", "color" => "var(--vp-c-text-2)", "font-size" => "15px"),
         CSS(".ba-pillars a, .ba-workspace a, .ba-start a:not(.VPButton)", "font-size" => "14px", "font-weight" => "550"),
         CSS(".ba-workspace", "display" => "grid", "grid-template-columns" => "minmax(240px, 0.8fr) minmax(0, 1.6fr)", "gap" => "36px", "align-items" => "center"),

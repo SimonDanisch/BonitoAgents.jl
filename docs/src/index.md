@@ -26,6 +26,7 @@
     <article><p class="ba-eyebrow">Your computers</p><h3>Work where the code and hardware are.</h3><p>Connect a laptop, GPU desktop or server to one dashboard. Start work there and follow it from another browser, including your phone.</p><a href="workers.html">Connect your machines →</a></article>
     <article><p class="ba-eyebrow">The actual results</p><h3>Do more than read a reply.</h3><p>Inspect files from any language: plots, notebooks, tables, video, 3D models and git diffs. Julia-powered apps stay interactive while you refine the code.</p><a href="chat.html">Explore the workspace →</a></article>
   </div>
+  <figure class="ba-overview"><img src="assets/how-it-fits.svg" alt="Any ACP agent runs on any of your machines; one dashboard in any browser drives them all and shows what they make" loading="lazy" width="1000" height="470"></figure>
 </section>
 
 <section class="ba-section ba-workspace">
