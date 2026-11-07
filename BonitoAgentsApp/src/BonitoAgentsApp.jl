@@ -65,13 +65,15 @@ across launches:
 # carries the same interpreter + sysimage (`-J`), so in a bundle the worker reuses
 # the app's baked-in precompilation instead of compiling from scratch.
 #
-# The child needs ONE thing to resolve `-m BonitoAgentsApp`: our project. It gets
-# it as `--project`, on its own command line, because `Base.julia_cmd()` does not
-# carry one. This used to be done by exporting `JULIA_LOAD_PATH`/`JULIA_DEPOT_PATH`
-# into the process env — which every descendant then inherited, including the Malt
-# eval workers that are supposed to resolve against the USER'S project. A flag on
-# one command replaces it: we never touch the ambient environment, so nothing
-# downstream has to repair it.
+# The child resolves `-m BonitoAgentsApp` the way this process does: our project as
+# `--project` (`Base.julia_cmd()` does not carry one), and startup files on, so a
+# bundle's own `startup.jl` (AppEnv) sets the worker up exactly like the app, with
+# the bundled precompiled packages. With `--startup-file=no` the worker skipped it
+# and tried to rebuild every package into ~/.julia. This used to be done by
+# exporting `JULIA_LOAD_PATH`/`JULIA_DEPOT_PATH` into the process env — which every
+# descendant then inherited, including the Malt eval workers that are supposed to
+# resolve against the USER'S project. We never touch the ambient environment, so
+# nothing downstream has to repair it.
 function worker_command(; server_url, worker_id, projects_root, data_dir)
     jl = Base.julia_cmd()
     # Opt-in tracing for the precompile harness: when BONITOAGENTS_TRACE_DIR is
@@ -82,7 +84,7 @@ function worker_command(; server_url, worker_id, projects_root, data_dir)
     tracedir = get(ENV, "BONITOAGENTS_TRACE_DIR", "")
     trace = isempty(tracedir) ? `` :
             `--trace-compile=$(joinpath(tracedir, "worker-$(worker_id).jl"))`
-    return `$jl $trace --startup-file=no --project=$(Base.active_project())
+    return `$jl $trace --project=$(Base.active_project())
             -m BonitoAgentsApp worker
             --server-url=$server_url --worker-id=$worker_id
             --projects-root=$projects_root --data-dir=$data_dir`
