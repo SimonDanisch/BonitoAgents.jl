@@ -82,7 +82,10 @@ BonitoAgents.app_id(::Type{TodoApp}) = "todo"
 BonitoAgents.app_title(::TodoApp) = "To-do"
 BonitoAgents.app_description(::TodoApp) =
     "One to-do list for every chat: agents check items off, and its chat starts a chat for an item in the right project."
-BonitoAgents.app_icon(::TodoApp) = joinpath(@__DIR__, "todo.svg")
+# At runtime via pkgdir, NOT @__DIR__: that bakes the build machine's path into a
+# relocated app bundle, and the server refuses to start with an icon that isn't a file.
+BonitoAgents.app_icon(::TodoApp) =
+    joinpath(pkgdir(@__MODULE__)::String, "src", "apps", "BonitoTodo", "todo.svg")
 
 # ── the list ────────────────────────────────────────────────────────────────
 
