@@ -27,8 +27,7 @@ const APP_A = """using WGLMakie, Bonito
 App() do
     figs = [$(join((figure_code("A", i) for i in 1:3), ", "))]
     clicks = Observable(0)
-    title = map(c -> "A 1 Ω1 clicked " * string(c) * " ⊕", clicks)
-    figs[1].content[1].title = title
+    on(c -> (figs[1].content[1].title = "A 1 Ω1 clicked " * string(c) * " ⊕"), clicks)
     btn = DOM.div("retitle"; class = "multi-btn", onclick = js"(e) => \$(clicks).notify(\$(clicks).value + 1)")
     out = map(c -> "CLICKS=" * string(c), clicks)
     DOM.div(DOM.span("MULTI-A "), DOM.span(out; class = "multi-out"), btn, DOM.div(figs...; style = "display:flex; flex-wrap:wrap"))
@@ -93,6 +92,10 @@ function run_suite(server)
             "document.body.innerText.includes('MULTI-A') && document.body.innerText.includes('MULTI-B') && document.querySelectorAll('canvas').length === 6";
             timeout = 180) == true
         @test TK.wait_for(server, "six figures drawn with their text", rendered_js(6); timeout = 60) == true
+        # The chat page already carries a Three.js of its own; WGLMakie's bundle brings
+        # another and THREE warns once about it. Nothing else may be logged.
+        logged = TK.check_console!()
+        @test length(logged) == 1 && occursin("Multiple instances of Three.js", only(logged))
         @test TK.wait_for(server, "initial clicks", "(() => { const e=document.querySelector('.multi-out'); return !!(e && e.innerText==='CLICKS=0'); })()"; timeout = 30) == true
         @test click_until(server, "CLICKS=1")
         @test TK.wait_for(server, "retitled figure still drawn", rendered_js(6); timeout = 30) == true
@@ -102,11 +105,14 @@ function run_suite(server)
     @testset "all embeds come back with their text after a reload" begin
         @test reload_and_reopen(server, pid)
         @test TK.wait_for(server, "six figures drawn again", rendered_js(6); timeout = 120) == true
-        # The worker kept the apps: the counter continues where it was.
-        @test TK.wait_for(server, "counter kept", "(() => { const e=document.querySelector('.multi-out'); return !!(e && e.innerText==='CLICKS=1'); })()"; timeout = 30) == true
-        @test click_until(server, "CLICKS=2")
+        # A reload re-renders the apps as fresh instances (see app_reload.jl), and
+        # the fresh ones still round-trip through the worker.
+        @test TK.wait_for(server, "fresh counter", "(() => { const e=document.querySelector('.multi-out'); return !!(e && e.innerText==='CLICKS=0'); })()"; timeout = 30) == true
+        @test click_until(server, "CLICKS=1")
         @test TK.wait_for(server, "figures drawn after the update", rendered_js(6); timeout = 30) == true
         TK.screenshot(server, joinpath(tempdir(), "bt-eval-multiplot-reloaded.png"))
+        logged = TK.check_console!()
+        @test length(logged) == 1 && occursin("Multiple instances of Three.js", only(logged))
     end
     return
 end
