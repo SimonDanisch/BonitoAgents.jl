@@ -156,6 +156,14 @@
   border-top: 1px solid var(--vp-c-divider);
   padding-top: 20px;
 }
+.VPHome .ba-overview {
+  margin-top: 32px;
+}
+.VPHome .ba-overview img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
 .ba-pillars p:not(.ba-eyebrow), .ba-workspace p, .ba-start p {
   color: var(--vp-c-text-2);
   font-size: 15px;
