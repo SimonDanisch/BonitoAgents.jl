@@ -6,8 +6,9 @@
 #
 # Approach borrowed from dev/TracePrecompiles: the emitted file is a self-contained
 # submodule that
-#   * binds every referenced module via `require(PkgId(uuid, name))` — they're all
-#     loaded transitively, so no new deps, and PkgId/uuid is exact,
+#   * binds every referenced module via `bound(PkgId(uuid, name))` — they're all
+#     loaded transitively, so no new deps, and PkgId/uuid is exact; one this Julia
+#     doesn't have binds `nothing`,
 #   * wraps each call in a `@precompile` macro that only fires during precompilation
 #     and try/catches at @debug. That guard wraps the *argument construction* too,
 #     so an unstable anonymous-closure gensym (`var"#84#85"`) just SKIPS at @debug
@@ -70,7 +71,7 @@ rootof(l) = (m = match(r"([A-Za-z_][A-Za-z0-9_]*)\.", l); m === nothing ? "?" : 
 roots = Set(rootof(s) for s in cands)
 
 const SCOPE = Module(:PrecompileScope)
-pkg_binds = Pair{String,String}[]   # name => "require(PkgId(UUID(\"...\"), \"name\"))"
+pkg_binds = Pair{String,String}[]   # name => "bound(PkgId(UUID(\"...\"), \"name\"))"
 nested_binds = Pair{Symbol,Expr}[]
 for r in roots
     sym = Symbol(r)
@@ -87,7 +88,7 @@ for r in roots
         try
             Core.eval(SCOPE, :(const $sym = $m))
             expr = r == TARGET ? "parentmodule(@__MODULE__)" :
-                                 "require(PkgId(UUID(\"$(pid.uuid)\"), \"$r\"))"
+                                 "bound(PkgId(UUID(\"$(pid.uuid)\"), \"$r\"))"
             push!(pkg_binds, r => expr)
         catch e
             @warn "can't bind $r; its statements are dropped" exception = e
@@ -126,6 +127,16 @@ open(OUT, "w") do io
                 STALE[] += 1
             end
         end
+    end
+
+    # A module the statements name, or `nothing` where this Julia has none by that id
+    # (an extension a newer Julia dropped, like Pkg's REPLExt in 1.13): its
+    # statements then count as stale instead of failing the build.
+    function bound(id::PkgId)
+        loaded = get(Base.loaded_modules, id, nothing)
+        loaded === nothing || return loaded
+        Base.locate_package(id) === nothing && return nothing
+        return require(id)
     end""")
     println(io)
     for (name, expr) in sort(pkg_binds; by=first); println(io, "const $name = $expr"); end
