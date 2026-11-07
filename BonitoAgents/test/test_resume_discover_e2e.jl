@@ -51,10 +51,10 @@ mkpath(RESUME_SHOT_DIR)
         notify(state.discovered)
 
         # ── 1. Opening projects: the discovered session shows a Resume button ──
+        # Rows are built when the worker's "projects (N)" list and its folder open.
+        TK.open_discover!(s)
         TK.wait_for(s, "discover row present",
             """document.querySelector('[data-bt-session-id="$sid"]') !== null"""; timeout = 10)
-        # Expand the worker's "projects (N)" <details> so the rows are visible.
-        TK.eval_js(s, "document.querySelectorAll('details').forEach(d=>d.open=true); true")
         btn_label = TK.eval_js(s, """(() => {
             const b = document.querySelector('[data-bt-session-id="$sid"]');
             return b ? b.textContent.trim() : "NONE";
@@ -93,7 +93,7 @@ mkpath(RESUME_SHOT_DIR)
         })()""")
         TK.wait_for(s, "back on dashboard",
             "document.querySelector('.bt-worker-cell, .bt-card') !== null"; timeout = 10)
-        TK.eval_js(s, "document.querySelectorAll('details').forEach(d=>d.open=true); true")
+        TK.open_discover!(s)
         @test TK.wait_for(s, "resumed row still in discover",
             """document.querySelectorAll('[data-bt-session-id="$sid"]').length >= 1"""; timeout = 10) == true
         @test TK.wait_for(s, "row carries the 'in sidebar' pill",

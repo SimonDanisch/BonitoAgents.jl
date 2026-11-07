@@ -28,9 +28,8 @@ BonitoWorker = {path = "../BonitoWorker"}
 RemoteSync = {path = "../RemoteSync"}
 WorkerLink = {path = "../WorkerLink"}
 BonitoBook = {rev = "sd/llm-improvements", url = "https://github.com/SimonDanisch/BonitoBook.jl.git"}
-BonitoWidgets = {url = "https://github.com/SimonDanisch/BonitoWidgets.jl.git", rev = "main"}
 MsgPack = {url = "https://github.com/JuliaIO/MsgPack.jl", rev = "master"}
 
 [compat]
 Bonito = "5.3"
-BonitoWidgets = "0.1.3"
+BonitoWidgets = "0.1.4"

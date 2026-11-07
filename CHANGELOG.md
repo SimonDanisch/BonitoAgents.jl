@@ -137,6 +137,12 @@ live.
 
 ### Chat and workspace
 
+- **Delete a chat for good.** From the chat's ⋯ menu or its card in the recent
+  chats overview: removes the transcript and shared links, with options to delete
+  the agent's saved session and wipe shared project memory. Project files stay.
+- **Faster page loads.** A worker's list of past sessions is built when you open
+  it, not with every page. A page with hundreds of past sessions, on a phone
+  especially, no longer waits for rows it isn't showing.
 - The transcript opens at its newest messages and loads older ones as you
   scroll, keeping a bounded number of rows in the page; the reading position
   is anchored to content.

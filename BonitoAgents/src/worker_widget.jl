@@ -471,9 +471,8 @@ end
 # Persistent folder→threads browser for one worker. Reads from the
 # server-side `state.discovered[wid]` cache (saved to discovered.json), so the
 # tree survives a restart with no re-scan; the per-card Rescan button refreshes
-# it. All pieces (spinner, empty, errors, the KeyedList of folder groups) are
-# mounted simultaneously; class-bound observables flip visibility so nothing
-# re-renders on busy / results transitions.
+# it. Only the header is built with the page. The rest is built when it first
+# opens (`discover_panel_body`).
 function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::String)
     # Per-card scan-in-flight flag so rescanning one worker doesn't spin every
     # other worker's panel.
@@ -535,10 +534,64 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         }""")
 
     # This worker's persisted scan results (worker_id → Vector of session dicts).
-    results_obs = map(c.state.discovered) do d
+    results_obs = map(session, c.state.discovered) do d
         get(d, wid, Dict{String,Any}[])
     end
 
+    # Live count of distinct project folders for the inline "projects (N)" label.
+    # Same dedup the groups_obs builder uses (skip errors + subagents).
+    project_count_obs = map(session, results_obs) do results
+        seen = Set{String}()
+        for r in results
+            haskey(r, "error") && continue
+            String(get(r, "kind", "session")) == "subagent" && continue
+            push!(seen, String(get(r, "path", "")))
+        end
+        length(seen)
+    end
+    title_obs = map(n -> "projects ($n)", session, project_count_obs)
+
+    # The tree is built when it first opens, so a page load pays for the header
+    # only. Rescan inside the header preventDefaults the toggle and force-opens,
+    # so the user always sees scan progress + refreshed results.
+    panel = BonitoWidgets.Collapsible(
+        Any[DOM.span(title_obs; class = "bt-discover-title"),
+            DOM.div(rescan_btn; class = "bt-discover-actions")],
+        () -> discover_panel_body(session, c, wid, results_obs, scan_busy);
+        expanded = false, class = "bt-discover-panel", header_class = "bt-discover-header")
+
+    # One delegated click for the whole panel: every session row AND the
+    # per-group "+ New thread" button share ONE listener (matched by the
+    # `data-bt-action="session-pick"` attr) instead of N per-row onclick rebinds,
+    # and it covers what's built later. It notifies the SESSION-LOCAL `pick` above:
+    # `$(pick)` resolves because it was created in this render's session, unlike
+    # the old cross-session `import_path` (see the `pick` comment).
+    on_click = js"""(ev) => {
+        const btn = ev.target.closest('[data-bt-action="session-pick"]');
+        if (!btn) return;
+        ev.preventDefault();   // "+ New thread" sits in a folder's header, this isn't a toggle
+        // Optimistic UI: the controller-side import is async, so flip the
+        // label + dim immediately so the user sees the click landed. (The
+        // "+ New thread" span has no Resume/Import label, leave its text.)
+        btn.classList.add('bt-clicked');
+        const t = btn.textContent.trim();
+        if (t === 'Resume')      btn.textContent = 'Resuming…';
+        else if (t === 'Import') btn.textContent = 'Importing…';
+        $(pick).notify({
+            path:       btn.dataset.btSessionPath || '',
+            session_id: btn.dataset.btSessionId   || '',
+            provider:   btn.dataset.btProvider    || '',
+            worker:     btn.dataset.btWorkerId    || '',
+        });
+    }"""
+    # `display: contents` so the wrapper is transparent to the card's layout.
+    return DOM.div(panel; style = Styles("display" => "contents"), onclick = on_click)
+end
+
+# What an open discover panel shows: a spinner, an empty note and errors, whose
+# class-bound observables flip visibility, and one folder per cwd with its session rows.
+function discover_panel_body(session::Bonito.Session, c::WorkerCard, wid::String,
+                             results_obs::Observable, scan_busy::Observable{Bool})
     # Session ids that are an OPEN chat in the homebar on this worker (a project
     # whose `resume_session_id` matches AND that `chat_in_sidebar` shows). Used
     # to tag those discover rows with an "in sidebar" pill — the rows stay
@@ -552,41 +605,28 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             if p.resume_session_id !== nothing && p.worker_id == wid && chat_in_sidebar(p))
     end
 
-    display_name_obs = map(c.state.workers) do workers
+    display_name_obs = map(session, c.state.workers) do workers
         w = get(workers, wid, nothing)
         w === nothing ? wid : w.name
     end
-    # Live count of distinct project folders for the inline "projects (N)" label.
-    # Same dedup the groups_obs builder below uses (skip errors + subagents).
-    project_count_obs = map(results_obs) do results
-        seen = Set{String}()
-        for r in results
-            haskey(r, "error") && continue
-            String(get(r, "kind", "session")) == "subagent" && continue
-            push!(seen, String(get(r, "path", "")))
-        end
-        length(seen)
-    end
-    title_obs = map(n -> "projects ($n)", project_count_obs)
-
-    spinner_msg_obs = map(n -> "Scanning $n for Claude Code sessions…", display_name_obs)
-    spinner_class = map(b -> b ? "bt-spinner-row" : "bt-spinner-row bt-hidden", scan_busy)
+    spinner_msg_obs = map(n -> "Scanning $n for Claude Code sessions…", session, display_name_obs)
+    spinner_class = map(b -> b ? "bt-spinner-row" : "bt-spinner-row bt-hidden", session, scan_busy)
     spinner_block = DOM.div(
         DOM.div(class = "bt-spinner"),
         DOM.span(spinner_msg_obs);
         class = spinner_class)
 
-    empty_msg_obs = map(n -> "No Claude Code sessions found on $n yet — click Rescan.", display_name_obs)
-    show_empty_obs = map(scan_busy, results_obs) do busy, results
+    empty_msg_obs = map(n -> "No Claude Code sessions found on $n yet — click Rescan.", session, display_name_obs)
+    show_empty_obs = map(session, scan_busy, results_obs) do busy, results
         !busy && isempty(results)
     end
-    empty_class = map(show -> show ? "bt-empty" : "bt-empty bt-hidden", show_empty_obs)
+    empty_class = map(show -> show ? "bt-empty" : "bt-empty bt-hidden", session, show_empty_obs)
     empty_block = DOM.div(empty_msg_obs; class = empty_class)
 
     # Errors are 0..N small spans, rebuilt via map(); KeyedList overkill.
     # Not while a rescan runs: the error is the previous attempt's, and next to
     # the spinner it read as this one having failed already.
-    errors_obs = map(results_obs, scan_busy) do results, busy
+    errors_obs = map(session, results_obs, scan_busy) do results, busy
         DOM.div(
             (DOM.div("Error: $(r["error"])"; class = "bt-error")
              for r in results if haskey(r, "error") && !busy);
@@ -594,25 +634,18 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
     end
 
     # Two-level rendering: one project group per cwd, each containing the
-    # session/subagent rows from that project. Both levels use KeyedList
-    # for stable identity across rescans — opening a group survives a
-    # Refresh because the <details> DOM node is preserved when its key
-    # (= path) is unchanged.
-    #
-    # Caches are pruned each tick to avoid unbounded growth if a project
-    # disappears between scans (e.g. its on-disk jsonl was deleted).
-    session_groups = Dict{String, SessionGroup}()
-    session_rows   = Dict{String, SessionRow}()
-
-    function get_session_row(r::AbstractDict)
-        sr = SessionRow(c, r)
-        get!(session_rows, sr.row_key, sr)
-    end
+    # session/subagent rows from that project. The list re-renders only when a
+    # folder appears, goes or moves, and a folder's rows only when they differ
+    # from what it shows, so nothing re-renders on the frequent `state.projects`
+    # notifications. This keeps a folder's rows and open state across rescans, and
+    # is pruned each tick for folders that disappeared between scans.
+    folder_state = Dict{String, Tuple{Observable{Vector{SessionRow}}, Observable{Bool}}}()
 
     # `state.projects` is a dependency too: a chat rename pins a new title on the
-    # matching project, and `resolve_session_title!` below reflects it onto the
-    # discovered row (live, and across restarts since the title is persisted).
-    groups_obs = map(results_obs, imported_sids, c.state.projects) do results, imported, projects
+    # matching project, and `pinned_titles` reflects it onto the discovered row
+    # (live, and across restarts since the title is persisted).
+    groups_obs = map(session, results_obs, imported_sids, c.state.projects; ignore_equal_values = true) do results, imported, projects
+        titles = pinned_titles(projects, wid)
         by_path  = Dict{String, Vector{Any}}()
         latest_by_path = Dict{String, Float64}()
         for r in results
@@ -637,78 +670,25 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             t > get(latest_by_path, p, 0.0) && (latest_by_path[p] = t)
         end
         out = SessionGroup[]
-        seen_row_keys = Set{String}()
         for (p, rs) in by_path
             sort!(rs; by = r -> -Float64(get(r, "last_used", 0.0)))
-            rows = SessionRow[get_session_row(r) for r in rs]
-            for sr in rows
-                resolve_session_title!(sr, projects)   # renamed title pins here too
-                resolve_session_open!(sr, imported)    # "in sidebar" pill state
-                push!(seen_row_keys, sr.row_key)
+            rows = SessionRow[SessionRow(c, r; titles, imported) for r in rs]
+            rows_obs, expanded = get!(folder_state, p) do
+                (Observable(rows; ignore_equal_values = true), Observable(false))
             end
-            g = get!(session_groups, p) do
-                SessionGroup(p, basename(p),
-                             Observable(rows), Observable(""),
-                             wid)
-            end
-            g.rows_obs[]    = rows
-            g.summary_obs[] = group_summary_string(rs)
-            push!(out, g)
+            rows_obs[] = rows
+            push!(out, SessionGroup(p, basename(p), group_summary_string(rs), wid, rows_obs, expanded))
         end
-        # Prune stale cache entries (paths/rows no longer present).
-        for k in collect(keys(session_groups))
-            haskey(by_path, k) || delete!(session_groups, k)
-        end
-        for k in collect(keys(session_rows))
-            k in seen_row_keys || delete!(session_rows, k)
+        # Prune stale cache entries (paths no longer present).
+        for k in collect(keys(folder_state))
+            haskey(by_path, k) || delete!(folder_state, k)
         end
         sort!(out; by = g -> -get(latest_by_path, g.path, 0.0))
         return out
     end
 
-    groups_keyed_list = KeyedList(groups_obs; key = g -> g.path)
-
-    # The whole tree is now a collapsable `<details>` so the worker card stays
-    # compact by default ("BOOM — opens the list on click"). Rescan inside the
-    # summary preventDefaults the toggle and force-opens, so the user always
-    # sees scan progress + refreshed results.
-    panel = DOM.details(
-        DOM.summary(
-            DOM.span(title_obs; class = "bt-discover-title"),
-            DOM.div(rescan_btn; class = "bt-discover-actions");
-            class = "bt-discover-header"),
-        spinner_block,
-        empty_block,
-        errors_obs,
-        DOM.div(groups_keyed_list; class = "bt-discover-section");
-        class = "bt-discover-panel")
-
-    # One delegated click for the whole panel — every session row AND the
-    # per-group "+ New thread" button share ONE listener (matched by the
-    # `data-bt-action="session-pick"` attr) instead of N per-row onclick rebinds.
-    # Installed as an inline `js"…"` CHILD (serialized with this subtree), and it
-    # notifies the SESSION-LOCAL `pick` above — `$(pick)` resolves because it was
-    # created in this render's session, unlike the old cross-session
-    # `import_path` (see the `pick` comment).
-    click_listener = js"""
-        $(panel).addEventListener('click', (ev) => {
-            const btn = ev.target.closest('[data-bt-action="session-pick"]');
-            if (!btn) return;
-            // Optimistic UI: the controller-side import is async, so flip the
-            // label + dim immediately so the user sees the click landed. (The
-            // "+ New thread" span has no Resume/Import label — leave its text.)
-            btn.classList.add('bt-clicked');
-            const t = btn.textContent.trim();
-            if (t === 'Resume')      btn.textContent = 'Resuming…';
-            else if (t === 'Import') btn.textContent = 'Importing…';
-            $(pick).notify({
-                path:       btn.dataset.btSessionPath || '',
-                session_id: btn.dataset.btSessionId   || '',
-                provider:   btn.dataset.btProvider    || '',
-                worker:     btn.dataset.btWorkerId    || '',
-            });
-        });
-    """
-    # `display: contents` so the wrapper is transparent to the card's layout.
-    return DOM.div(panel, click_listener; style = Styles("display" => "contents"))
+    folders = map(session, groups_obs) do groups
+        DOM.div(BonitoWidgets.CollapsibleList(BonitoWidgets.Collapsible.(groups); class = "bt-discover-section"))
+    end
+    return DOM.div(spinner_block, empty_block, errors_obs, folders)
 end

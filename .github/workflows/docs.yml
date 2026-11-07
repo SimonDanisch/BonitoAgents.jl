@@ -1,7 +1,7 @@
 # Build (and, on main, deploy) the BonitoAgents documentation — the
 # DocumenterBonito site under docs/. The docs env (docs/Project.toml) already
 # pins every unregistered package: the monorepo subpackages by relative path
-# and the forks (Bonito/BonitoBook/BonitoWidgets/MsgPack) by git url+rev, so a
+# and the forks (BonitoBook/MsgPack) by git url+rev, so a
 # plain `instantiate` resolves the whole tree — no `Pkg.develop` needed.
 name: Documentation
 

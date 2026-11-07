@@ -60,11 +60,11 @@
         end
         notify(state.discovered)
 
-        # The discovered Resume row appears; expand the worker's "projects (N)"
-        # <details> so the row is visible/clickable.
+        # The discovered Resume row is built when the worker's "projects (N)" list
+        # and its folder open.
+        TK.open_discover!(s)
         TK.wait_for(s, "discover row present",
             """document.querySelector('[data-bt-session-id="$sid"]') !== null"""; timeout = 10)
-        TK.eval_js(s, "document.querySelectorAll('details').forEach(d=>d.open=true); true")
         btn_label = TK.eval_js(s, """(() => {
             const b = document.querySelector('[data-bt-session-id="$sid"]');
             return b ? b.textContent.trim() : "NONE";
@@ -92,7 +92,7 @@
         TK.to_dashboard(s)
         TK.wait_for(s, "back on dashboard",
             "document.querySelector('.bt-worker-cell, .bt-card') !== null"; timeout = 10)
-        TK.eval_js(s, "document.querySelectorAll('details').forEach(d=>d.open=true); true")
+        TK.open_discover!(s)
 
         # Re-open the resumed chat from the sidebar — another current_view flip,
         # the exact path the buggy onclick dereferenced a freed Observable on.

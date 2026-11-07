@@ -68,9 +68,8 @@ timing_row(e::TimingEntry) =
 
 # The page parts there can be many of, timed as they render: what a page spends
 # in Bonito after its handler returned (`render`) is spent in parts like these.
-const TimedPart = Union{WorkerCard,SessionGroup,SessionRow,SidebarChat}
+const TimedPart = Union{WorkerCard,SessionRow,SidebarChat}
 part_phase(::WorkerCard)   = :worker_cards
-part_phase(::SessionGroup) = :session_groups
 part_phase(::SessionRow)   = :session_rows
 part_phase(::SidebarChat)  = :sidebar_chats
 Bonito.jsrender(session::Bonito.Session, part::TimedPart) =

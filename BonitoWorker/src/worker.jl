@@ -451,6 +451,8 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
         @async handle_install_session(ws, cmd)
     elseif t == "discard_staging"
         @async handle_discard_staging(ws, cmd)
+    elseif t == "delete_session"
+        @async handle_delete_session(ws, cmd)
     elseif t == "force_update"
         if c.update_config === nothing
             report_update!(w, "unsupported"; error = "this worker runs without an update config")

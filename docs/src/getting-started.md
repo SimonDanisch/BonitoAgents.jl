@@ -2,11 +2,8 @@
 
 ## Install
 
-The fastest way onto one machine is the installer. It downloads the prebuilt
-bundle for your platform (a self-contained Julia + BonitoAgents, with no
-separate Julia install needed), puts a `bonito-agents` command on your PATH, and
-immediately starts the desktop app: a local dashboard server plus a worker for
-this machine, opened in your browser.
+Install the desktop app on the machine where you want agents to work. The bundle
+includes Julia, a local server and a worker; it opens the workspace in your browser.
 
 Linux / macOS:
 
@@ -19,6 +16,25 @@ Windows (PowerShell):
 ```powershell
 irm https://agents.bonito.sh/install.ps1 | iex
 ```
+
+## Your first chat
+
+1. Choose a project folder and start a chat.
+2. Pick an agent and sign in with your own account if needed.
+3. Give it a concrete task. For example:
+
+   > Find and fix one small issue in this project. Run the relevant checks and
+   > show me the diff. Leave the changes uncommitted.
+
+4. Use **⋯ → Review changes** in the chat header to inspect the patch. Ask about a line or send
+   feedback, then have the agent run the relevant checks.
+
+When a task produces a plot, notebook, report or app, ask the agent to show it.
+Open the result beside the chat so you can inspect it while you refine the work.
+
+[See a complete workflow](@ref "A Day with BonitoAgents") · [Choose an agent](@ref "Agent Providers")
+
+## Updating and installer options
 
 Start it again any time with `bonito-agents`. **Re-run the same install line to
 auto-update** to the newest release; it skips the download when you are already

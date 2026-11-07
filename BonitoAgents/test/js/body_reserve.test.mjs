@@ -12,9 +12,9 @@ test('unmeasured tool placeholders never require a layout measurement', () => {
     const chat = Object.create(BonitoChat.prototype);
     chat.bodyWidth = () => { throw new Error('unexpected layout read'); };
     for (const sizes of [undefined, {}]) {
-        assert.equal(chat.bodyReserve({ collapsable: {}, __btBodyH: sizes }), null);
+        assert.equal(chat.bodyReserve({ collapsible: {}, __btBodyH: sizes }), null);
         assert.deepEqual(chat.bodyReserve({
-            collapsable: {}, __btBodyH: sizes, __btMedia: [1200, 600], __btMediaExtra: 24,
+            collapsible: {}, __btBodyH: sizes, __btMedia: [1200, 600], __btMediaExtra: 24,
         }), {
             boxSizing: 'content-box', padding: '24px 0 0', width: '1200px',
             maxWidth: '100%', aspectRatio: '1200 / 600', overflow: 'hidden',
@@ -26,7 +26,7 @@ test('saved body sizes still match the current transcript width', () => {
     const chat = Object.create(BonitoChat.prototype);
     let reads = 0;
     chat.bodyWidth = () => { reads++; return 800; };
-    assert.deepEqual(chat.bodyReserve({ collapsable: {}, __btBodyH: { 799: 350 } }), { height: '350px' });
-    assert.equal(chat.bodyReserve({ collapsable: {}, __btBodyH: { 700: 350 } }), null);
+    assert.deepEqual(chat.bodyReserve({ collapsible: {}, __btBodyH: { 799: 350 } }), { height: '350px' });
+    assert.equal(chat.bodyReserve({ collapsible: {}, __btBodyH: { 700: 350 } }), null);
     assert.equal(reads, 2);
 });

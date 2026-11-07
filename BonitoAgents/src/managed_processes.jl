@@ -465,7 +465,7 @@ function Bonito.jsrender(session::Session, job::ProcessJob)
     parts = Any[PROCESS_CARD_STYLES, facts]
     if !isempty(job.output)
         kept = sizeof(job.output)
-        push!(parts, Collapsable("Output", console_block(job.output);
+        push!(parts, tool_subsection("Output", console_block(job.output);
             preview = kept < job.output_bytes ? "last $(kept) of $(job.output_bytes) bytes" : "",
             summary_lines = 10, pin_end = true, console = true))
     end
@@ -476,7 +476,7 @@ function Bonito.jsrender(session::Session, list::ProcessJobList)
     isempty(list.jobs) && return Bonito.jsrender(session,
         DOM.div("No background commands in this chat."; class = "bt-tool-empty"))
     # A node, because a section's text label is set in capitals: a command's case matters.
-    rows = Any[Collapsable(DOM.span(job_name(job); class = "bt-process-job-name"), job;
+    rows = Any[tool_subsection(DOM.span(job_name(job); class = "bt-process-job-name"), job;
                            preview = job_state(job), state = :collapsed,
                            summary_lines = 16, full_lines = 40) for job in list.jobs]
     return Bonito.jsrender(session, DOM.div(PROCESS_CARD_STYLES, rows; class = "bt-process-card"))

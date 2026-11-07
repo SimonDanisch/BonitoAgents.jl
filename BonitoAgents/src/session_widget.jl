@@ -1,10 +1,6 @@
-# KeyedList widget for one discovered Claude Code session row. Keyed on
-# (path, session_id); re-scans returning the same data hit the same key and
-# touch nothing. The row carries no in-progress UI state (the "Importing…"
-# feedback lives only in the JS onclick handler), so we don't need extra
-# instance stability beyond the key.
-
-mutable struct SessionRow
+# One discovered session, as its row shows it. A row is a snapshot: a rename or a
+# chat opening builds a new one, and its folder re-renders when its rows differ.
+struct SessionRow
     worker_id   :: String   # which worker this thread lives on (import payload)
     path        :: String
     name        :: String
@@ -16,21 +12,15 @@ mutable struct SessionRow
     # from the Claude file scan. Imported onto the project so a resumed thread
     # comes back up under the agent that minted its id.
     provider    :: String
-    row_key     :: String   # "path|session_id"
-    # Display title shown for the row. Defaults to the first-prompt preview, but
-    # `resolve_session_title!` overrides it with the renamed `ProjectInfo.title`
-    # when a project resumes THIS session id — so a user-renamed chat keeps that
-    # title here too (the same persisted source the sidebar/header read), live
-    # on rename and across worker/server restarts. Reactive so the cached row's
-    # DOM updates in place when the title changes.
-    title_obs   :: Observable{String}
+    # The first-prompt preview, or the renamed `ProjectInfo.title` when a project
+    # resumes THIS session id, so a user-renamed chat keeps that title here too.
+    title       :: String
     # True while a project resuming THIS session is open in the sidebar. The
-    # row is NOT hidden then (discover shows every session unconditionally) —
+    # row is NOT hidden then (discover shows every session unconditionally):
     # it carries an "in sidebar" pill instead, and clicking it reuses the
     # existing thread (`find_thread` dedup in `create_project_from_worker!`)
-    # rather than importing a duplicate. Reactive: rows are cached across
-    # rescans, so open/close must update the pill in place.
-    open_obs    :: Observable{Bool}
+    # rather than importing a duplicate.
+    open        :: Bool
 end
 
 # The preview-derived fallback title — what we show when no renamed project
@@ -38,7 +28,8 @@ end
 session_preview_title(preview::AbstractString) =
     isempty(preview) ? "Untitled session" : String(preview)
 
-function SessionRow(c::WorkerCard, r::AbstractDict)
+function SessionRow(c::WorkerCard, r::AbstractDict;
+                    titles::AbstractDict = Dict{String,String}(), imported::AbstractSet = Set{String}())
     path       = String(get(r, "path", ""))
     name       = String(get(r, "name", basename(path)))
     sid_raw    = get(r, "session_id", nothing)
@@ -62,39 +53,17 @@ function SessionRow(c::WorkerCard, r::AbstractDict)
     # explicit `true` produces a UI badge. `nothing` (OS check unavailable)
     # falls through silently.
     running = get(r, "running", nothing) === true
-    row_key = string(path, '|', session_id)
     SessionRow(c.worker_id, path, name, session_id, preview, meta, running, provider,
-               row_key, Observable(session_preview_title(preview)), Observable(false))
+               get(titles, session_id, session_preview_title(preview)),
+               !isempty(session_id) && session_id in imported)
 end
 
-# Point the row's display title at the renamed project's title when one resumes
-# this exact session id; otherwise fall back to the first-prompt preview. Set
-# only on change so we don't churn the bound observable on every rescan.
-function resolve_session_title!(sr::SessionRow, projects::AbstractDict)
-    want = session_preview_title(sr.preview)
-    if !isempty(sr.session_id)
-        for p in values(projects)
-            if p.worker_id == sr.worker_id && p.resume_session_id == sr.session_id
-                want = p.title[]
-                break
-            end
-        end
-    end
-    sr.title_obs[] == want || (sr.title_obs[] = want)
-    return sr
+# The titles renamed chats pin on this worker's sessions, by session id.
+function pinned_titles(projects::AbstractDict, worker_id::AbstractString)
+    return Dict{String,String}(String(p.resume_session_id) => p.title[] for p in values(projects)
+                               if p.worker_id == worker_id && !isnothing(p.resume_session_id) &&
+                                  !isempty(p.resume_session_id))
 end
-
-# Point the row's "in sidebar" pill at whether an OPEN chat currently resumes
-# this session (the caller passes the same in-sidebar sid set the old code used
-# to hide these rows). Set only on change, like `resolve_session_title!`.
-function resolve_session_open!(sr::SessionRow, imported::AbstractSet)
-    want = !isempty(sr.session_id) && sr.session_id in imported
-    sr.open_obs[] == want || (sr.open_obs[] = want)
-    return sr
-end
-
-Base.hash(s::SessionRow, h::UInt) = hash(s.row_key, hash(:SessionRow, h))
-Base.:(==)(a::SessionRow, b::SessionRow) = a.row_key == b.row_key
 
 function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnostics.jl
     btn_label = isempty(s.session_id) ? "Import" : "Resume"
@@ -104,12 +73,10 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
     # "in sidebar" pill: this session already has an open chat. The row stays
     # visible (discover is unconditional); the pill just says where it lives,
     # and Resume reuses that thread instead of duplicating it.
-    open_pill = DOM.span("in sidebar";
-        class = map(o -> o ? "bt-pill bt-pill-muted" : "bt-pill bt-hidden", s.open_obs))
+    open_pill = s.open ? DOM.span("in sidebar"; class = "bt-pill bt-pill-muted") : DOM.span()
     # The folder is already in the group header, so the row LEADS with the
-    # chat's title: the renamed `ProjectInfo.title` when one pins this session
-    # (resolved into `title_obs`), else the cleaned first prompt the user typed,
-    # else a neutral fallback. Reactive so a rename updates the row in place.
+    # chat's title: the renamed `ProjectInfo.title` when one pins this session,
+    # else the cleaned first prompt the user typed, else a neutral fallback.
     # No inline `onclick` per row — that would queue N jscall-id-keyed setup
     # messages per dashboard render. The delegated listener at the panel level
     # (`render_discover_panel`) reads these `data-bt-*` attrs and notifies.
@@ -117,7 +84,7 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
         DOM.div(
             DOM.div(
                 # Wrap the title in a span so it ellipsizes when the row is narrow.
-                DOM.span(s.title_obs; class = "bt-session-name-text"),
+                DOM.span(s.title; class = "bt-session-name-text"),
                 running_pill,
                 open_pill;
                 class = "bt-session-name"),
@@ -137,19 +104,20 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
         class = "bt-session-row"))
 end
 
-# One project's header + collapsed list of its session/subagent rows.
-# Keyed on `path`; remounts only when a project disappears or appears. The
-# nested KeyedList over `rows_obs` preserves child identity inside.
-mutable struct SessionGroup
-    path        :: String                           # KeyedList key
+# One project's header + collapsed list of its session/subagent rows. A snapshot
+# like `SessionRow`: a new count re-renders the list of folders. `rows_obs` and
+# `expanded` carry over between snapshots, so a folder stays open through that.
+struct SessionGroup
+    path        :: String                           # identity across rescans
     name        :: String                           # basename(path)
-    rows_obs    :: Observable{Vector{SessionRow}}   # nested KeyedList input
-    summary_obs :: Observable{String}               # "5 sessions · 12 subagents · Last used …"
+    summary     :: String                           # "5 sessions · 12 subagents · Last used …"
     worker_id   :: String                           # for the "+ New thread" import
+    rows_obs    :: Observable{Vector{SessionRow}}   # ignores equal values
+    expanded    :: Observable{Bool}
 end
 
-Base.hash(g::SessionGroup, h::UInt) = hash(g.path, hash(:SessionGroup, h))
-Base.:(==)(a::SessionGroup, b::SessionGroup) = a.path == b.path
+Base.hash(g::SessionGroup, h::UInt) = hash(g.summary, hash(g.path, hash(:SessionGroup, h)))
+Base.:(==)(a::SessionGroup, b::SessionGroup) = a.path == b.path && a.summary == b.summary
 
 # Build the right-of-name summary line for a group given its (raw) result
 # dicts. Counts sessions vs subagents using the `kind` field and reports the
@@ -180,31 +148,32 @@ function group_summary_string(rs::Vector)
     return join(parts, "  ·  ")
 end
 
-function render_part(session::Bonito.Session, g::SessionGroup)   # timed: diagnostics.jl
+# A folder's rows, re-rendered when they differ from what it shows.
+struct SessionRows
+    rows :: Observable{Vector{SessionRow}}
+end
+
+Bonito.jsrender(session::Bonito.Session, r::SessionRows) =
+    Bonito.jsrender(session, map(rows -> DOM.div(rows), session, r.rows))
+
+function BonitoWidgets.Collapsible(g::SessionGroup)
     # Start a brand-new thread (fresh claude session, no resume) in this folder.
     # Like the session rows, this is a delegated `data-bt-action="session-pick"`
     # button (empty session_id ⇒ the import handler uses session/new and
-    # `find_thread` always makes a sibling) — the panel-level listener in
-    # `render_discover_panel` reads these attrs and notifies its SESSION-LOCAL
-    # pick observable. The only inline JS is `preventDefault` so the click
-    # doesn't toggle the enclosing group <details>; it must NOT stopPropagation,
-    # or the event wouldn't bubble up to the panel's delegated listener.
+    # `find_thread` always makes a sibling): the panel-level listener in
+    # `render_discover_panel` reads these attrs, notifies its SESSION-LOCAL pick
+    # observable and keeps the click from toggling the folder.
     new_thread_btn = DOM.span("+ New thread";
         class             = "bt-new-thread",
         title             = "Start a fresh chat in this folder",
         dataBtAction      = "session-pick",
         dataBtSessionPath = js_path(g.path),
         dataBtSessionId   = "",
-        dataBtWorkerId    = g.worker_id,
-        onclick           = js"event => { event.preventDefault(); }")
-    return Bonito.jsrender(session, DOM.details(
-        DOM.summary(
-            DOM.span(g.name; class = "bt-group-name"),
-            DOM.span(g.path; class = "bt-group-path"),
-            DOM.span(g.summary_obs; class = "bt-group-meta"),
-            new_thread_btn;
-            class = "bt-group-summary"),
-        DOM.div(KeyedList(g.rows_obs; key = sr -> sr.row_key);
-            class = "bt-group-body");
-        class = "bt-group"))   # default-closed: no `open` attribute
+        dataBtWorkerId    = g.worker_id)
+    header = Any[DOM.span(g.name; class = "bt-group-name"),
+                 DOM.span(g.path; class = "bt-group-path"),
+                 DOM.span(g.summary; class = "bt-group-meta"),
+                 new_thread_btn]
+    return BonitoWidgets.Collapsible(header, () -> DOM.div(SessionRows(g.rows_obs); class = "bt-group-body");
+        expanded = g.expanded, class = "bt-group", header_class = "bt-group-summary")
 end

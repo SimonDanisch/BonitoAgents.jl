@@ -236,7 +236,7 @@ managed_packages() = String[pkg for pkg in npm_package.(current_providers()) if 
 # The mock agent keeps the same layout under `~/.mockacp/`, so the move is
 # testable end to end without a real agent.
 export session_state_format, JsonlTranscripts, transcript_dir, session_state_entries,
-       claude_project_key
+       owned_session_entries, claude_project_key
 
 """
     JsonlTranscripts(root)
@@ -279,6 +279,16 @@ session_state_entries(::JsonlTranscripts, session_id::AbstractString) = [
     (name = String(session_id),            required = false),
     (name = "memory",                      required = false),
 ]
+
+"""
+    owned_session_entries(format::JsonlTranscripts, session_id) -> Vector{String}
+
+The entries of `transcript_dir` that belong to this session alone, which is what
+deleting it removes. The project memory is left out: every session in the folder
+shares it.
+"""
+owned_session_entries(::JsonlTranscripts, session_id::AbstractString) =
+    [String(session_id) * ".jsonl", String(session_id)]
 
 # The directory under a worker's projects root where session state is staged
 # while it travels (source: packed for the pull; target: landed by the push,

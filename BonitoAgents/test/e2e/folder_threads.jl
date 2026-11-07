@@ -17,7 +17,7 @@
 #       folder name), every folder has a "+ New thread" (`.bt-new-thread`), and
 #       discovered sessions render a "Resume" button (`.bt-session-row`),
 #     * there is NO "Discover" toggle button (the panel is always present),
-#     * expanding a folder's `details.bt-group` reveals both sibling previews,
+#     * expanding a folder's `details.bt-group` builds and reveals both sibling previews,
 #     * the tree SURVIVES navigating away (closing the chat → dashboard re-mounts
 #       and the persisted scan re-renders).
 #
@@ -98,28 +98,20 @@ function run_suite(server)
                 "!!document.querySelector('.bt-sidebar .bt-side-item[data-project-id=$(repr(pid))] .bt-side-close')") == true
         end
 
-        @testset "folder→threads tree mounts (KeyedList renders)" begin
-            # Two folder groups render straight from the persisted scan — the live
-            # proof the KeyedList content actually mounts in the browser.
+        @testset "folder→threads tree mounts when opened" begin
+            # Nothing below the header until the panel opens.
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-group').length") == 0
+
+            # Two folder groups render straight from the persisted scan.
+            open_discover_panel(server)
             @test TK.wait_for(server, "two folder groups",
                 "document.querySelectorAll('.bt-group').length >= 2"; timeout = 10) == true
-
-            # Open the default-collapsed discover panel so its body shows up.
-            open_discover_panel(server)
             @test TK.wait_for(server, "folder name MyApp shown",
                 "document.body.innerText.indexOf('MyApp') !== -1"; timeout = 5) == true
 
-            # Rows lead with the prompt (not the repeated folder name); present in
-            # the DOM even while the per-folder <details> stays collapsed.
-            @test TK.eval_js(server, """
-                [...document.querySelectorAll('.bt-session-name-text')]
-                    .some(e => e.textContent.indexOf('refactor the parser') !== -1)""") == true
-            # "+ New thread" present per folder.
+            # "+ New thread" present per folder, its rows not built until it opens.
             @test TK.eval_js(server, "!!document.querySelector('.bt-new-thread')") == true
-            # Resume buttons for discovered (session-bearing) rows.
-            @test TK.eval_js(server, """
-                [...document.querySelectorAll('.bt-session-row')]
-                    .some(r => r.textContent.indexOf('Resume') !== -1)""") == true
+            @test TK.eval_js(server, "document.querySelectorAll('.bt-session-row').length") == 0
             # No "Discover" toggle button — the panel is always present.
             @test TK.eval_js(server, """
                 ![...document.querySelectorAll('button')].some(b => (b.innerText||'').trim() === 'Discover')""") == true
@@ -135,6 +127,14 @@ function run_suite(server)
             @test TK.wait_for(server, "both sibling threads visible",
                 """document.body.innerText.indexOf('refactor the parser') !== -1 &&
                    document.body.innerText.indexOf('add tests for IO') !== -1"""; timeout = 5) == true
+            # Rows lead with the prompt (not the repeated folder name), and
+            # discovered (session-bearing) rows have a Resume button.
+            @test TK.eval_js(server, """
+                [...document.querySelectorAll('.bt-session-name-text')]
+                    .some(e => e.textContent.indexOf('refactor the parser') !== -1)""") == true
+            @test TK.eval_js(server, """
+                [...document.querySelectorAll('.bt-session-row')]
+                    .some(r => r.textContent.indexOf('Resume') !== -1)""") == true
         end
 
         @testset "a renamed chat's title shows in the discovered row" begin
@@ -209,6 +209,7 @@ function run_suite(server)
 
             # Back on the dashboard, the folder→threads tree must still be there
             # (the dashboard re-mounts on navigation; the persisted scan re-renders).
+            open_discover_panel(server)
             @test TK.wait_for(server, "folder tree still present after navigating back",
                 "document.querySelectorAll('.bt-group').length >= 2"; timeout = 10) == true
         end

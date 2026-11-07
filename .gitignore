@@ -15,3 +15,6 @@ build/
 # bt_julia_eval rich-output files (PNG/SVG) land in the eval cwd; test runs
 # write them into the committed test envs.
 .bonitoAgents/
+
+# Generated from docs/styles.jl when building the docs.
+/docs/src/assets/site.css
