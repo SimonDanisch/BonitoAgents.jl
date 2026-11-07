@@ -42,13 +42,17 @@ plugin_marker(project::AbstractString) = begin
 end
 
 "Load direct dependencies whose Project.toml explicitly marks them as plugins."
-function load_plugins!()
+load_plugins!() = load_plugins!(Base.active_project())
+load_plugins!(::Nothing) = registered_apps()
+
+function load_plugins!(active::AbstractString)
+    # The desktop app's active project is a file in its data dir that nothing has
+    # written yet on a first start: no file, no dependencies, so no plugins.
+    isfile(active) || return registered_apps()
     # Read the active project's `[deps]` rather than Pkg.dependencies(): the
     # latter may hold the package's precompile-time context when called from a
     # server package. `locate_package` resolves each declared UUID against the
     # actual active manifest, including the service user's depot.
-    active = Base.active_project()
-    active === nothing && return registered_apps()
     dependencies = get(TOML.parsefile(active), "deps", Dict{String,Any}())
     for (raw_name, raw_uuid) in dependencies
         name = String(raw_name)
