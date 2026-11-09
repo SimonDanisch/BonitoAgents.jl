@@ -40,7 +40,15 @@
         n = Int(TK.eval_js(s, DIFFS))
         @test 0 < n < N ÷ 2
         # Freed, or never built: a body far away waits until the reader is near.
-        @test TK.eval_js(s, "[1, 2, 3, 4, 5, 6].every(i => !$C.querySelector(`.bt-tool-msg[data-msg-id*=\"fb-\${i}-e\"] .bt-code-diff`))") == true
+        # The observer reports a row when it crosses the line, on its own time, so
+        # this waits as the later checks do. A timeout prints each row's state.
+        @test TK.wait_for(s, "the first rows hold no diffs",
+            "[1, 2, 3, 4, 5, 6].every(i => !$C.querySelector(`.bt-tool-msg[data-msg-id*=\"fb-\${i}-e\"] .bt-code-diff`))";
+            timeout = 30, describe = """JSON.stringify([1, 2, 3, 4, 5, 6].map(i => {
+                const n = $C.querySelector(`.bt-tool-msg[data-msg-id*="fb-\${i}-e"]`), c = n?.collapsible;
+                return n ? {i, diff: !!n.querySelector('.bt-code-diff'), freed: n.dataset.btFreed || '', loaded: c?.loaded,
+                    shown: c?.body ? c.body.offsetParent !== null : null, top: Math.round(n.getBoundingClientRect().top)} : {i, row: false}; })
+                .concat([{visible: $CH.paneVisible, height: $C.clientHeight, scroll: Math.round($C.scrollTop)}]))""") == true
     end
 
     # Home and End, as the reader presses them: a press in the transcript first.
