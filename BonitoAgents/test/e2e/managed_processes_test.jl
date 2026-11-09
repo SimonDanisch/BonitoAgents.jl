@@ -31,7 +31,7 @@
                 arguments=Dict{String,Any}("action"=>"finish","id"=>"card_job")),TK.end_turn()]
         elseif prompt == "restart fixture"
             [call("start";card="process-restart-start",id="restart-1",argv=["sh","-c","echo restart-ready; sleep 300"],label="Restart fixture",cwd),TK.end_turn()]
-        elseif prompt == "inspect restarted"
+        elseif endswith(prompt, "inspect restarted")   # the old job's end note rides it
             [call("status";card="process-after-restart",id="restart-1"),TK.end_turn()]
         else
             [TK.text("Received notification"),TK.end_turn()]
