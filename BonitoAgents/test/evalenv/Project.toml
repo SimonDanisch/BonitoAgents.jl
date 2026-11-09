@@ -3,8 +3,8 @@
 # with the packages those tests render (color images via ImageShow, tables via
 # DataFrames/Tables; Markdown + Pkg are stdlibs, reachable from @stdlib). Bonito
 # is the registered 5.3 the server-side test env uses, so both sides of the eval
-# proxy agree. The Makie stack is git-pinned to sd/electroncall, which carries the
-# GlyphSync fix. Keep these in sync with BonitoAgents/test/Project.toml. Local
+# proxy agree. The Makie stack is git-pinned to Makie's master, which carries the
+# GlyphSync fix (#5584). Keep these in sync with BonitoAgents/test/Project.toml. Local
 # Bonito/Makie dev repoints these to paths uncommitted.
 #
 # Instantiated once as a warmup in runtests.jl (the packages are precompiled in
@@ -40,9 +40,9 @@ Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
 ComputePipeline = "95dc2771-c249-4cd0-9c9f-1f3b4330693c"
 
 [sources]
-WGLMakie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "WGLMakie"}
-Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "Makie"}
-ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "sd/electroncall", subdir = "ComputePipeline"}
+WGLMakie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "WGLMakie"}
+Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "Makie"}
+ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "ComputePipeline"}
 
 [compat]
 Bonito = "5.3"
