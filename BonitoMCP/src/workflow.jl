@@ -72,6 +72,11 @@ this supervisor. A signal request is not an exit: keep the task visible until
 the worker confirms termination. `wait` requires bounded `seconds` and wakes
 on incoming messages. Agent turns and MCP reconnects preserve jobs; closing or
 restarting the chat requests cleanup. For Julia work keep using persistent eval.
+When sudo needs a password, use `bt_sudo(id=..., argv=[...])`, and on a server
+`bt_sudo(..., ssh=<bt_ssh id>)`; for an ssh login that asks for a password, a key
+passphrase or a host key confirmation, use `bt_ssh(id=..., destination=...)`.
+The chat asks the user every time and hands the answer to sudo or ssh, never to
+you: don't open a password dialog, and don't ask for a password in a message.
 Wait with `bt_wait(seconds=..., reason=...)`, optionally with an `until` shell
 condition, rather than starting sleep/poll watcher tasks. Incoming messages can
 wake a wait; read them and then continue the original work as appropriate.

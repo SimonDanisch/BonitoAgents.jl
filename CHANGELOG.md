@@ -60,6 +60,12 @@ live.
   reconnects without needing the chat's Restart action.
 - Message queues are explicit: queue for when the agent is done, after the
   current message, or interrupt and send.
+- Passwords for `sudo` and `ssh` are typed into the chat. `bt_sudo` runs a
+  command as root, on the worker or, with `ssh`, on a server through a
+  connection that `bt_ssh` opened. That connection's control socket also lets
+  later ssh, scp and rsync calls log in without asking. Each question sudo or ssh asks shows as
+  a card naming the command, and also appears after a reload. The answer goes
+  from the card through the worker to sudo or ssh, never to the agent.
 
 ### Machines and workers
 

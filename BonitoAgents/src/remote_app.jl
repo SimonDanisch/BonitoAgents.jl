@@ -598,7 +598,7 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
         input = false
         for i in length(s.msgs_store):-1:(baseline + 1)
             msg = s.msgs_store[i]
-            if msg isa MCPToolMsg && tool_key(msg) in ("bt_wait","bt_process") &&
+            if msg isa MCPToolMsg && tool_key(msg) in ("bt_wait","bt_process","bt_sudo","bt_ssh") &&
                     (isempty(id) || tool_id(msg) == id)
                 return input
             end

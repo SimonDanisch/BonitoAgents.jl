@@ -1,16 +1,10 @@
-function process_handler(args::AbstractDict)
-    action = String(get(args,"action","list"))
-    request = Dict{String,Any}(String(k)=>v for (k,v) in args if !startswith(String(k),"_"))
-    request["epoch"] = get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")
-    if action == "start"
-        request["env"] = merge(Dict("PATH"=>get(ENV,"PATH","")),
-            BonitoProgress.progress_context(), get(args,"env",Dict{String,String}()),
-            Dict("BONITOAGENTS_PROCESS_ID"=>String(get(args,"id",""))))
-    end
-    action == "wait" || return dev_call("managed_process"; (Symbol(k)=>v for (k,v) in request)...)
-    secs = get(args,"seconds",nothing)
-    secs isa Real && isfinite(secs) && 0 < secs <= 3600 ||
-        return tool_error("wait requires seconds between 0 and 3600")
+const ACTIVE_JOB = ("starting","running","interrupting","terminating","killing")
+
+job_ended(d) = d["status"] in ACTIVE_JOB ? nothing : "exited"
+
+# Observe job `request["id"]` until `done` names a reason, `seconds` pass or a
+# message for the agent arrives. The job goes on in any case.
+function wait_for_job(request::AbstractDict, args::AbstractDict, secs::Real; done = job_ended)
     wake = Channel{Nothing}(0)
     lock(() -> push!(SERVER.waits.active,wake),SERVER.waits.lock)
     note_wait_request!(args,wake)
@@ -19,12 +13,11 @@ function process_handler(args::AbstractDict)
             close(wake)
         end
         deadline = time()+secs
-        request["action"] = "observe"
+        observe = merge(request,Dict{String,Any}("action"=>"observe"))
         while true
-            status = call_server("managed_process"; (Symbol(k)=>v for (k,v) in request)...)
-            if !(status["status"] in ("starting","running","interrupting","terminating","killing"))
-                return dev_result(merge(status,Dict("wait_reason"=>"exited")))
-            end
+            status = call_server("managed_process"; (Symbol(k)=>v for (k,v) in observe)...)
+            reason = done(status)
+            reason === nothing || return dev_result(merge(status,Dict("wait_reason"=>reason)))
             !isopen(wake) && return dev_result(merge(status,Dict("wait_reason"=>"message")))
             time() >= deadline && return dev_result(merge(status,Dict("wait_reason"=>"timeout")))
             wait_sleep(wake,min(1.0,max(0.0,deadline-time())))
@@ -37,6 +30,46 @@ function process_handler(args::AbstractDict)
         isopen(wake) && close(wake)
     end
 end
+
+valid_seconds(secs) = secs isa Real && isfinite(secs) && 0 < secs <= 3600
+
+job_request(args::AbstractDict) = merge(
+    Dict{String,Any}(String(k)=>v for (k,v) in args if !startswith(String(k),"_")),
+    Dict{String,Any}("epoch"=>get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
+
+function process_handler(args::AbstractDict)
+    action = String(get(args,"action","list"))
+    request = job_request(args)
+    if action == "start"
+        request["env"] = merge(Dict("PATH"=>get(ENV,"PATH","")),
+            BonitoProgress.progress_context(), get(args,"env",Dict{String,String}()),
+            Dict("BONITOAGENTS_PROCESS_ID"=>String(get(args,"id",""))))
+    end
+    action == "wait" || return dev_call("managed_process"; (Symbol(k)=>v for (k,v) in request)...)
+    secs = get(args,"seconds",nothing)
+    valid_seconds(secs) || return tool_error("wait requires seconds between 0 and 3600")
+    return wait_for_job(request,args,secs)
+end
+
+# Start a sudo or ssh job, then wait for it as `bt_process` wait would.
+function prompting_job_handler(args::AbstractDict, action::AbstractString; done = job_ended)
+    secs = get(args,"seconds",300)
+    valid_seconds(secs) || return tool_error("seconds must be between 0 and 3600")
+    request = job_request(args)
+    delete!(request,"seconds")
+    request["action"] = action
+    try
+        call_server("managed_process"; (Symbol(k)=>v for (k,v) in request)...)
+    catch e
+        e isa InterruptException && rethrow()
+        return tool_error(sprint(showerror,e))
+    end
+    return wait_for_job(request,args,secs; done)
+end
+
+sudo_handler(args::AbstractDict) = prompting_job_handler(args,"sudo")
+ssh_ready(d) = get(d,"ready",false) === true ? "ready" : job_ended(d)
+ssh_handler(args::AbstractDict) = prompting_job_handler(args,"ssh"; done = ssh_ready)
 
 register!("bt_process", """
 Launch and control worker-owned background commands, with output and taskbar
@@ -76,3 +109,56 @@ bt_progress reports measured work and does not itself supervise processes.
     "offset"=>Dict("type"=>"integer","minimum"=>0),
     "max_bytes"=>Dict("type"=>"integer","minimum"=>1,"maximum"=>65536)),"required"=>["action"]),
     process_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
+
+register!("bt_sudo", """
+Run a command as root with sudo, when sudo needs the user's password. The chat
+shows the user the command and asks for the password; it goes from the chat to
+sudo and never to you. Use this for every sudo, here or on a server: running
+sudo yourself has no way to ask. Never ask the user for a password in a message.
+
+argv is the command (an argument array, not shell syntax), without "sudo". id is
+a stable id for this attempt, as for bt_process; cwd and label are optional.
+Example: {id:"install-1", argv:["zypper","--non-interactive","install","ripgrep"],
+label:"Install ripgrep"}.
+
+ssh is the id of an open bt_ssh connection of this chat: the command then runs as
+root on that host, in the remote user's home directory (cwd is ignored there).
+Example: {id:"restart-1", ssh:"server-1", argv:["systemctl","restart","nginx"]}.
+
+The command runs as a bt_process job, in the taskbar, and reads no input. sudo
+gets one password: a wrong one fails the job, so start a new id to try again, and
+a refusal fails it too. Returns the job once it ends, or after seconds (default
+300, at most 3600) or an incoming message; while it still waits for the
+password, its record has a prompt. Use bt_process wait/status/output with the
+same id after that.
+""",Dict{String,Any}("type"=>"object","properties"=>Dict{String,Any}(
+    "id"=>Dict("type"=>"string","description"=>"Stable unique id for this attempt: letters, digits, - or _."),
+    "argv"=>Dict("type"=>"array","items"=>Dict("type"=>"string")),
+    "cwd"=>Dict("type"=>"string"),"label"=>Dict("type"=>"string"),
+    "ssh"=>Dict("type"=>"string","description"=>"Run on the host of this bt_ssh connection id instead of the worker."),
+    "seconds"=>Dict("type"=>"number","exclusiveMinimum"=>0,"maximum"=>3600)),"required"=>["id","argv"]),
+    sudo_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
+
+register!("bt_ssh", """
+Open an ssh connection that needs a password, a key passphrase or a host key
+confirmation. The chat shows the user each question ssh asks and sends the answer
+to ssh; you never see it. Never ask the user to type a password into a message.
+
+destination is what you'd give ssh (user@host, or a Host from ~/.ssh/config);
+options are extra ssh options as "Key=Value", such as "Port=2222" or
+"IdentityFile=~/.ssh/deploy". id is a stable id for this attempt, as for
+bt_process.
+
+Returns once the connection is ready, has failed, or after seconds (default 300,
+at most 3600). Ready, the job's control_path is a socket through which ssh, scp
+and rsync log in without asking: `ssh -S <control_path> <destination> <command>`,
+`scp -o ControlPath=<control_path> ...`, `rsync -e "ssh -S <control_path>" ...`.
+The connection stays open as a bt_process job, in the taskbar; end it with
+bt_process terminate on the same id.
+""",Dict{String,Any}("type"=>"object","properties"=>Dict{String,Any}(
+    "id"=>Dict("type"=>"string","description"=>"Stable unique id for this attempt: letters, digits, - or _."),
+    "destination"=>Dict("type"=>"string"),
+    "options"=>Dict("type"=>"array","items"=>Dict("type"=>"string")),
+    "label"=>Dict("type"=>"string"),
+    "seconds"=>Dict("type"=>"number","exclusiveMinimum"=>0,"maximum"=>3600)),"required"=>["id","destination"]),
+    ssh_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))

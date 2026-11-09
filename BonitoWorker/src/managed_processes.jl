@@ -2,12 +2,18 @@
 const PROCESS_ACTIVE = ("starting", "running", "interrupting", "terminating", "killing")
 const PROCESS_LOG_BYTES = 8 * 1024 * 1024
 
+# How a job is started. A plain command reads nothing: its input closes once it may
+# run. The jobs that ask for passwords, sudo and ssh, are in password_prompts.jl.
+abstract type Launch end
+struct PlainLaunch <: Launch end
+
 mutable struct ManagedProcess
     record::Dict{String,Any}
     proc::Union{Base.Process,Nothing}
     pump::Union{Task,Nothing}
     pipe::Union{Pipe,Nothing}
     job_handle::Ptr{Cvoid}
+    launch::Launch
 end
 
 mutable struct ProcessSupervisor
@@ -18,15 +24,18 @@ mutable struct ProcessSupervisor
     closed::Bool
     monitor::Union{Task,Nothing}
     publish::Function
+    sudo::String       # the sudo to run instead of the PATH's, "" for that one (`sudo_program`, `ssh_route`)
 end
 
 process_key(project, id) = string(project, '\0', id)
 process_text(bytes) = join(isvalid(c) ? c : '�' for c in String(copy(bytes)))
 
-function ProcessSupervisor(directory::AbstractString)
+# `sudo` is read once, when the worker starts, from an environment the agent can't
+# change; the tests point it at a stand-in.
+function ProcessSupervisor(directory::AbstractString; sudo::AbstractString = get(ENV, "BONITOAGENTS_SUDO_PROGRAM", ""))
     mkpath(directory)
     return ProcessSupervisor(ReentrantLock(), Dict{String,ManagedProcess}(), Set{String}(),
-        String(directory), false, nothing, _ -> nothing)
+        String(directory), false, nothing, _ -> nothing, String(sudo))
 end
 
 function save_process_jobs!(s::ProcessSupervisor)
@@ -63,27 +72,33 @@ function publish_process!(s::ProcessSupervisor, j::ManagedProcess)
     return snapshot
 end
 
+# Under the supervisor lock.
+function append_log!(j::ManagedProcess, io::IO, data::Vector{UInt8})
+    isempty(data) && return nothing
+    received = length(data)
+    if received > PROCESS_LOG_BYTES
+        data = data[end-PROCESS_LOG_BYTES+1:end]
+    end
+    if position(io) + length(data) > PROCESS_LOG_BYTES
+        kept = min(position(io), PROCESS_LOG_BYTES ÷ 2, PROCESS_LOG_BYTES-length(data))
+        seek(io, position(io) - kept)
+        tail = read(io)
+        seekstart(io); truncate(io, 0); write(io, tail)
+    end
+    write(io, data); flush(io)
+    j.record["output_bytes"] += received
+    return nothing
+end
+
 function process_log_pump(s::ProcessSupervisor, j::ManagedProcess)
     try
         open(j.record["log"], "w+") do io
             while !eof(j.pipe)
                 data = readavailable(j.pipe)
                 isempty(data) && continue
-                lock(s.lock) do
-                    received = length(data)
-                    if received > PROCESS_LOG_BYTES
-                        data = data[end-PROCESS_LOG_BYTES+1:end]
-                    end
-                    if position(io) + length(data) > PROCESS_LOG_BYTES
-                        kept = min(position(io), PROCESS_LOG_BYTES ÷ 2, PROCESS_LOG_BYTES-length(data))
-                        seek(io, position(io) - kept)
-                        tail = read(io)
-                        seekstart(io); truncate(io, 0); write(io, tail)
-                    end
-                    write(io, data); flush(io)
-                    j.record["output_bytes"] += received
-                end
+                lock(() -> append_log!(j, io, screen_output!(j.launch, j, data)), s.lock)
             end
+            lock(() -> append_log!(j, io, held_output!(j.launch)), s.lock)
         end
     catch e
         (e isa Base.IOError || e isa SystemError) || rethrow()
@@ -107,8 +122,10 @@ id="build-1", cwd=pwd(), label="Build")`.
 """
 function start_process!(s::ProcessSupervisor, project::AbstractString, argv::AbstractVector;
                         id::AbstractString, cwd::AbstractString, label::AbstractString,
-                        env::AbstractDict=Dict{String,String}(), epoch::AbstractString="")
+                        env::AbstractDict=Dict{String,String}(), epoch::AbstractString="",
+                        launch::Launch=PlainLaunch())
     occursin(r"^[A-Za-z0-9_-]{1,80}$", id) || throw(ArgumentError("id must use 1–80 letters, digits, underscores or hyphens"))
+    check_launch(launch, env)
     !isempty(argv) && all(a -> a isa AbstractString && !occursin('\0', a), argv) ||
         throw(ArgumentError("argv must be a nonempty array of strings"))
     isabspath(cwd) && isdir(cwd) || throw(ArgumentError("cwd must be an existing absolute worker directory"))
@@ -141,21 +158,24 @@ function start_process!(s::ProcessSupervisor, project::AbstractString, argv::Abs
             "status"=>"starting", "pid"=>0, "pgid"=>0, "started"=>time(),
             "finished"=>nothing, "exitcode"=>nothing, "signal"=>nothing,
             "output_bytes"=>0, "log"=>joinpath(s.directory, token * ".log"),
-            "error"=>"", "last_action"=>"", "revision"=>1)
+            "error"=>"", "last_action"=>"", "revision"=>1,
+            "kind"=>job_kind(launch), "prompt"=>nothing, "prompt_seq"=>0)
+        merge!(record, launch_record(launch))
         record["epoch"] = String(epoch)
-        j = ManagedProcess(record, nothing, nothing, nothing, C_NULL)
+        j = ManagedProcess(record, nothing, nothing, nothing, C_NULL, launch)
         s.jobs[key] = j
         save_process_jobs!(s)
-        gate = Pipe()
+        input = job_input(launch)
         try
             pipe = Pipe()
             j.pipe = pipe
-            cmd = addenv(detach(Cmd(process_launch_command(String.(argv)); dir=String(cwd))),
-                (String(k)=>String(v) for (k,v) in env)...)
-            Sys.iswindows() && (cmd = addenv(cmd,"BONITOAGENTS_JOB_ARGV"=>JSON.json(argv)))
-            j.proc = run(pipeline(cmd; stdin=gate, stdout=pipe, stderr=pipe); wait=false)
+            command = launch_argv(launch, String.(argv))
+            cmd = addenv(detach(Cmd(process_launch_command(launch, command); dir=String(cwd))),
+                (String(k)=>String(v) for (k,v) in env)..., launch_env(launch)...)
+            Sys.iswindows() && (cmd = addenv(cmd,"BONITOAGENTS_JOB_ARGV"=>JSON.json(command)))
+            j.proc = run(pipeline(cmd; stdin=child_end(input), stdout=pipe, stderr=pipe); wait=false)
             close(pipe.in)
-            close(gate.out)
+            close_child_end!(input)
             record["pid"] = Int(getpid(j.proc))
             j.job_handle = process_job_handle(record["pid"])
             record["pgid"] = Sys.isunix() ? Int(ccall(:getpgid, Cint, (Cint,), record["pid"])) : 0
@@ -167,7 +187,8 @@ function start_process!(s::ProcessSupervisor, project::AbstractString, argv::Abs
             # the worker dies earlier, EOF makes the launcher exit without
             # starting user work. This also prevents fast exits racing getpid.
             save_process_jobs!(s)
-            write(gate,"go\n"); flush(gate)
+            write(input, gate_lines(launch)); flush(input)
+            keep_input!(launch, input, s, j)
         catch e
             if j.proc !== nothing && process_running(j.proc)
                 kill_proc!(j.proc)
@@ -180,7 +201,7 @@ function start_process!(s::ProcessSupervisor, project::AbstractString, argv::Abs
             save_process_jobs!(s)
             (e isa Base.IOError || e isa SystemError || e isa ArgumentError || e isa ErrorException) || rethrow()
         finally
-            close(gate)
+            release_input!(launch, input)
         end
         save_process_jobs!(s)
         j
@@ -188,7 +209,7 @@ function start_process!(s::ProcessSupervisor, project::AbstractString, argv::Abs
     return publish_process!(s, job)
 end
 
-function process_launch_command(argv)
+function process_launch_command(::PlainLaunch, argv)
     if Sys.iswindows()
         script = "if ([Console]::In.ReadLine() -ne 'go') { exit 125 }; " *
             "\$v = @(ConvertFrom-Json \$env:BONITOAGENTS_JOB_ARGV); Remove-Item Env:BONITOAGENTS_JOB_ARGV; " *
@@ -292,8 +313,12 @@ function monitor_processes!(s::ProcessSupervisor)
                         d["last_action"] in ("interrupt","terminate") ? "interrupted" :
                         success(j.proc) && isempty(d["error"]) ? "succeeded" : "failed"
                     d["revision"] += 1
+                    d["prompt"] = nothing
                     close_process_handle!(j)
+                    finish!(j.launch)
                     save_process_jobs!(s)
+                elseif observe!(j.launch, d)
+                    d["revision"] += 1
                 end
                 fingerprint = (Int(d["output_bytes"]), Int(d["revision"]))
                 key = process_key(d["project_id"], d["id"])
@@ -313,7 +338,10 @@ function managed_process_request(s::ProcessSupervisor, project, args::AbstractDi
     action == "start" && return start_process!(s, project, get(args,"argv",Any[]);
         id=String(get(args,"id","")), cwd=String(get(args,"cwd","")),
         label=String(get(args,"label",get(args,"id",""))), env=get(args,"env",Dict()), epoch=String(get(args,"epoch","")))
+    action == "sudo" && return start_sudo!(s, project, args)
+    action == "ssh" && return start_ssh!(s, project, args)
     id = String(get(args,"id",""))
+    action == "answer" && return answer_prompt!(s, project, id, args)
     action in ("interrupt","terminate","kill") && return signal_process!(s,project,id,action)
     action in ("list","status","output") || throw(ArgumentError("unknown process action '$action'"))
     limit = get(args,"max_bytes",8192)
@@ -384,7 +412,9 @@ function restore_process_jobs!(s::ProcessSupervisor)
         union!(s.closed_epochs,String.(stored["closed_epochs"]))
         for raw in stored["jobs"]
             d = Dict{String,Any}(raw)
-            j = ManagedProcess(d,nothing,nothing,nothing,C_NULL)
+            j = ManagedProcess(d,nothing,nothing,nothing,C_NULL,PlainLaunch())
+            # Nothing is left to answer: its input died with the old worker.
+            d["prompt"] = nothing
             s.jobs[process_key(d["project_id"],d["id"])] = j
             d["status"] in PROCESS_ACTIVE || continue
             # A crash may leave additional flushed log bytes after the last

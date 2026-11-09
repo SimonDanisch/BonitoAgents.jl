@@ -104,11 +104,11 @@ function managed_process_update!(state,worker,d)
     p === nothing && return nothing
     p.worker_id == worker || return nothing
     book = process_book(state,pid)
-    retired = lock(book.lock) do
+    retired, prompt_changed = lock(book.lock) do
         key = managed_task_id(worker,String(d["id"]))
         previous = get(book.jobs,key,nothing)
         previous !== nothing && (d["revision"],d["output_bytes"]) <
-            (previous["revision"],previous["output_bytes"]) && return false
+            (previous["revision"],previous["output_bytes"]) && return (false, false)
         record = merge(Dict{String,Any}(d),Dict("worker"=>String(worker),"connected"=>true))
         record["output"] = last(String(get(record,"output","")),2048)
         record["notify_pending"] = get(previous === nothing ? Dict() : previous,"notify_pending",false) ||
@@ -126,10 +126,13 @@ function managed_process_update!(state,worker,d)
         end
         changed_state = previous === nothing || previous["status"] != record["status"]
         (changed_state || time()-book.last_saved > 5) && save_process_book!(book)
-        get(d,"epoch","") in book.retired && d["status"] in BonitoWorker.PROCESS_ACTIVE && d["status"] != "killing"
+        asked(r) = r === nothing ? nothing : get(r,"prompt",nothing)
+        (get(d,"epoch","") in book.retired && d["status"] in BonitoWorker.PROCESS_ACTIVE && d["status"] != "killing",
+         asked(previous) != asked(record) || (changed_state && asked(record) !== nothing))
     end
     chat = lock(() -> get(root_state(state).chat_models,pid,nothing),state.lock)
     chat === nothing || attach_process_tasks!(chat)
+    chat !== nothing && prompt_changed && chat_emit(chat, prompts_event(chat))
     if chat !== nothing
         notification = lock(book.lock) do
             record = book.jobs[managed_task_id(worker,String(d["id"]))]
@@ -147,13 +150,17 @@ function managed_process_update!(state,worker,d)
     return nothing
 end
 
+# What an agent asks for, from its MCP process. Answering a password prompt is not
+# among it: only the user does that, in the chat (`answer_prompt!`).
 function process_request(state,pid,args)
+    action = String(get(args,"action",""))
+    action == "answer" && error("only the user answers a password prompt, in the chat")
     state = root_state(state)
     p = get(state.projects[],String(pid),nothing)
     p === nothing && error("this chat no longer exists")
     w = get(state.workers[],p.worker_id,nothing)
     w !== nothing && can(w,"managed_process") || error("update this worker to use managed processes")
-    if get(args,"action","") == "observe"
+    if action == "observe"
         # Worker snapshots already stream on the control channel. A voluntary
         # wait observes them without blocking on a fresh RPC to a sleeping or
         # disconnected worker, so incoming input can release the wait promptly.
@@ -166,13 +173,17 @@ function process_request(state,pid,args)
         return public_process_result(w,snapshot)
     end
     request = Dict{String,Any}(String(k)=>v for (k,v) in args if k in
-        ("action","id","argv","cwd","label","env","offset","max_bytes","epoch"))
-    if get(request,"action","") == "start"
+        ("action","id","argv","cwd","label","env","offset","max_bytes","epoch","destination","options","ssh"))
+    if action in ("start","sudo","ssh")
         book = process_book(state,pid)
         lock(book.lock) do
             get(request,"epoch","") == book.epoch || error("agent session ended; use the current session to start work")
         end
         request["cwd"] = get(request,"cwd",p.worker_path)
+    end
+    if action in ("sudo","ssh")
+        can(w,"password_prompts") || error("update this worker to run sudo and ssh with a password from the chat")
+        delete!(request,"env")
     end
     request["project_id"] = String(pid) # bound by the authenticated channel, never caller-supplied
     response = worker_rpc(state,p.worker_id,"managed_process",request;timeout=20.0)
@@ -296,6 +307,70 @@ function taskbar_slot(session,bar,item,head,t::ManagedProcessTask)
     return node
 end
 
+# ── Password prompts ─────────────────────────────────────────────────────────
+# A sudo or ssh job that waits for a password has the question in its record
+# (BonitoWorker password_prompts.jl). The chat shows one card per open question,
+# built from the job book: every change sends the whole list, and so does a tab's
+# init, so a reload or a reconnect shows exactly the open questions.
+
+prompt_key(worker,id,seq) = string(managed_task_id(worker,id), '#', seq)
+
+function prompt_card(state,record)
+    p = record["prompt"]
+    w = get(state.workers[],record["worker"],nothing)
+    # The command as the worker runs it: for ssh with every option the agent passed.
+    return Dict{String,Any}("key"=>prompt_key(record["worker"],record["id"],p["seq"]),
+        "kind"=>p["kind"], "text"=>p["text"], "job"=>command_line(record["argv"]),
+        "worker"=>w === nothing ? record["worker"] : w.name, "cwd"=>record["cwd"],
+        "host"=>String(get(record,"host","")))   # sudo through a bt_ssh connection
+end
+
+# Only a book already in memory: a job with an open question is in one, because the
+# worker reports its jobs on every connect. A chat that never ran one gets no file.
+prompt_cards(chat::ChatModel) = prompt_cards(chat.state,chat.project_id)
+function prompt_cards(state,pid::AbstractString)
+    state = root_state(state)
+    book = lock(() -> get(state.process_jobs,pid,nothing),state.lock)
+    book === nothing && return Dict{String,Any}[]
+    records = lock(book.lock) do
+        [copy(d) for d in values(book.jobs)
+         if get(d,"prompt",nothing) !== nothing && d["status"] in BonitoWorker.PROCESS_ACTIVE]
+    end
+    sort!(records; by = d -> d["started"])
+    return [prompt_card(state,d) for d in records]
+end
+
+prompts_event(chat::ChatModel) = Dict{String,Any}("type"=>"prompts", "prompts"=>prompt_cards(chat))
+
+"""
+    answer_prompt!(view, key, secret)
+
+Answer the open question `key` names with `secret`, or refuse it (`nothing`). The
+answer goes to the worker, which writes it into sudo or ssh. Nothing keeps it.
+A failure goes back to the tab that answered, on its card.
+"""
+function answer_prompt!(view::ChatModel, key::AbstractString, secret::Union{String,Nothing})
+    m = match(r"^managed:(.+):([A-Za-z0-9_-]+)#(\d+)$", key)
+    m === nothing && return nothing
+    worker, id, seq = String(m.captures[1]), String(m.captures[2]), parse(Int, m.captures[3])
+    state = root_state(view.state)
+    Base.errormonitor(@async try
+        p = state.projects[][view.project_id]
+        p.worker_id == worker || error("that job runs on another worker")
+        request = Dict{String,Any}("action"=>"answer", "project_id"=>String(view.project_id),
+            "id"=>id, "seq"=>seq)
+        secret === nothing ? (request["deny"] = true) : (request["secret"] = secret)
+        response = worker_rpc(state,worker,"managed_process",request;timeout=20.0)
+        managed_process_update!(state,worker,response["result"])
+    catch e
+        e isa InterruptException && rethrow()
+        reply!(view, Dict{String,Any}("type"=>"prompt_error", "key"=>String(key), "error"=>sprint(showerror,e)))
+    end)
+    return nothing
+end
+
+handle_command!(model::ChatModel, ::Any, cmd::PromptAnswerCommand) = answer_prompt!(model, cmd.key, cmd.secret)
+
 # ── The `bt_process` card ────────────────────────────────────────────────────
 # The card says what a call did in its title and summary; opening it shows the
 # job's details and output. The title comes from the call's arguments and the
@@ -349,6 +424,7 @@ reply_summary(list::ProcessJobList) = string(length(list.jobs), length(list.jobs
 function reply_summary(job::ProcessJob)
     parts = [job_state(job)]
     job.wait_reason == "timeout" && push!(parts, "wait timed out")
+    job.wait_reason == "ready" && push!(parts, "connected")
     job.wait_reason == "message" && push!(parts, "woken by a message")
     job.finished === nothing || push!(parts, process_duration(job.finished - job.started))
     return join(parts, " · ")
@@ -392,7 +468,8 @@ job_name(m::ProcessToolMsg) =
 function process_title(m::ProcessToolMsg; max_length::Int = 120)
     m.action == "list" && return "List background commands"
     verbs = (start = "Start", wait = "Wait for", status = "Check", output = "Read output of",
-             interrupt = "Interrupt", terminate = "Terminate", kill = "Force kill")
+             interrupt = "Interrupt", terminate = "Terminate", kill = "Force kill",
+             sudo = "Run as root:", ssh = "Open")
     title = one_line_title(string(get(verbs, Symbol(m.action), m.action), " ", job_name(m)))
     # A command can be a whole script. The body shows all of it.
     return length(title) <= max_length ? title : first(title, max_length - 1) * "…"

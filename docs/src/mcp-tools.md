@@ -98,6 +98,53 @@ Use `bt_julia_eval(background=true)` and its run controls for ordinary Julia
 work. Stopping an agent turn leaves managed background jobs running; use the
 job's controls, or restart/close its chat, to end them.
 
+## `bt_sudo` and `bt_ssh`, passwords typed into the chat
+
+An agent's shell has no terminal, so `sudo` and `ssh` have nowhere to ask for a
+password. These two tools run them as `bt_process` jobs on the worker. Each
+question sudo or ssh asks appears in the chat as a card that shows the command
+and where it runs. The answer goes from the card through the worker to sudo or
+ssh. The agent and its transcript never see it.
+
+```json
+{"id":"install-1","argv":["zypper","--non-interactive","install","ripgrep"],"label":"Install ripgrep"}
+{"id":"deploy-1","destination":"deploy@example.com","options":["Port=2222"]}
+{"id":"restart-1","ssh":"deploy-1","argv":["systemctl","restart","nginx"]}
+```
+
+- **`bt_sudo`** runs `argv` as root and returns when the command ends, or after
+  `seconds` (default 300). sudo gets one password: a wrong one or **Deny** fails
+  the job, and a new attempt needs a new `id`. The command reads no input.
+  sudo never keeps the password for later commands, so every `bt_sudo` asks.
+- **`bt_sudo` with `ssh`** runs the command as root on the host of an open
+  `bt_ssh` connection, in the remote user's home directory. The card names that
+  host. The prompt comes back through the connection, and the answer goes the
+  same way.
+- **`bt_ssh`** opens a master connection and returns once it is ready. Host key
+  confirmations, passwords and key passphrases each get their own card. Later
+  calls log in through the job's `control_path` without asking:
+  `ssh -S <control_path> <destination> <command>`, or
+  `-o ControlPath=<control_path>` for scp and rsync. Ending the job in the
+  taskbar closes the connection.
+
+The cards come from the job's state on the server, so they appear again after a
+reload or a reconnect. They work on Linux and macOS workers.
+
+How far the password is protected differs between the two:
+
+- **sudo on the worker:** the worker only runs a sudo that is owned by root and setuid, so a
+  fake `sudo` placed earlier on the PATH is refused. The password goes to sudo
+  through a socket, which other processes of the same user can't open through
+  `/proc`, unlike a pipe. The worker writes it only when sudo prompts with a
+  random prompt that only sudo and the worker know. On Linux, this holds against
+  an agent working against the user as long as `kernel.yama.ptrace_scope` is at
+  least 1.
+- **ssh, and sudo through it:** ssh runs as the user and reads `~/.ssh/config`,
+  and on the server the remote shell reads `~/.bashrc` before sudo starts. The
+  agent can change both. The password stays out of the agent's context and the
+  transcript, but this doesn't protect it from an agent working against the
+  user. An open connection also gives the agent access to that host.
+
 ## `bt_progress`, progress in the chat and sidebar
 
 ```

@@ -3115,6 +3115,23 @@ const ChatStyles = Bonito.Styles(
         "background" => "var(--bw-accent)", "color" => "#fff",
         "font-size" => "13px", "font-weight" => "700", "line-height" => "1",
         "margin-top" => "1px"),
+    # Password prompt (bt_sudo, bt_ssh): the command it is for, then the question.
+    CSS(".bt-prompt-job",
+        "display" => "block",
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-sm)",
+        "white-space" => "pre-wrap", "overflow-wrap" => "anywhere",
+        "background" => "var(--bw-bg)", "border-radius" => "var(--bw-radius-sm)",
+        "padding" => "var(--bw-space-2)"),
+    CSS(".bt-prompt-text",
+        "margin" => "0",
+        "font-family" => "ui-monospace, monospace", "font-size" => "var(--bw-font-size-sm)",
+        "white-space" => "pre-wrap", "overflow-wrap" => "anywhere"),
+    CSS(".bt-prompt-where, .bt-prompt-error",
+        "font-size" => "var(--bw-font-size-sm)", "overflow-wrap" => "anywhere",
+        "white-space" => "pre-wrap"),
+    CSS(".bt-prompt-card .bt-permission-question", "overflow-wrap" => "anywhere"),
+    CSS(".bt-prompt-where", "color" => "var(--bw-text-muted)"),
+    CSS(".bt-prompt-error", "color" => "var(--bw-error)"),
 
     # ── New-messages pill ────────────────────────────────────────────────────
     # Floats above the input area when followMode is off and new content

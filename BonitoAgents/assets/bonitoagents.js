@@ -1243,6 +1243,8 @@ class BonitoChat {
             case 'permission_done': return this.onPermissionDone(msg);
             case 'question':        return this.onQuestion(msg);
             case 'question_done':   return this.onPermissionDone(msg);
+            case 'prompts':         return this.onPrompts(msg);
+            case 'prompt_error':    return this.onPromptError(msg);
             case 'thought_final':return this.onThoughtFinal(msg);
             case 'thought.body': return this.onThoughtBody(msg);
             case 'tool_update':  return this.onToolUpdate(msg);
@@ -2356,6 +2358,89 @@ class BonitoChat {
 
         this.container.insertBefore(card, this.busyEl || null);
         if (this.followMode) this.queueScrollToBottom();
+    }
+
+    // ── Password prompts (bt_sudo, bt_ssh) ───────────────────────────────
+    // Every open question comes with each change, and on init: the page keeps
+    // exactly those cards. The field is emptied as soon as its answer is sent;
+    // nothing on this page keeps a password.
+    onPrompts(msg) {
+        const open = new Map((msg.prompts || []).map(p => [p.key, p]));
+        for (const card of this.container.querySelectorAll('.bt-prompt-card')) {
+            if (!open.has(card.dataset.permKey)) card.remove();
+        }
+        for (const p of open.values()) {
+            if (this.container.querySelector(
+                    `.bt-prompt-card[data-perm-key="${CSS.escape(p.key)}"]`)) continue;
+            this.container.insertBefore(this.promptCard(p), this.busyEl || null);
+        }
+        if (open.size && this.followMode) this.queueScrollToBottom();
+    }
+
+    promptCard(p) {
+        const el = (tag, cls, text) => {
+            const e = document.createElement(tag);
+            e.className = cls;
+            if (text) e.textContent = text;
+            return e;
+        };
+        const card = el('form', 'bt-permission-card bt-prompt-card');
+        card.dataset.permKey = p.key;
+        card.dataset.promptKind = p.kind;
+        const sudo = p.kind === 'sudo';
+        const host = p.host || p.worker;
+        card.append(el('div', 'bt-permission-question',
+            sudo ? `Password to run as root on ${host}` : `ssh on ${p.worker} asks`));
+        card.append(el('code', 'bt-prompt-job', p.job));
+        if (sudo) card.append(el('div', 'bt-prompt-where',
+            p.host ? `through ssh from ${p.worker}` : `in ${p.cwd}`));
+        if (p.text) card.append(el('pre', 'bt-prompt-text', p.text));
+        let input = null;
+        if (p.kind !== 'confirm') {
+            input = el('input', 'bt-question-text bt-prompt-input');
+            input.type = 'password';
+            input.autocomplete = 'off';
+            // Which password is sudo's to say: openSUSE asks for root's.
+            input.placeholder = sudo ? 'Password' : 'Answer';
+            card.append(input);
+        }
+        const error = el('div', 'bt-prompt-error');
+        error.hidden = true;
+        const actions = el('div', 'bt-permission-actions');
+        const deny = el('button', 'bt-permission-btn bt-perm-reject', 'Deny');
+        deny.type = 'button';
+        const send = el('button', 'bt-permission-btn bt-perm-allow',
+            sudo ? 'Run' : p.kind === 'confirm' ? 'Allow' : 'Send');
+        send.type = 'submit';
+        actions.append(deny, send);
+        card.append(error, actions);
+        const answer = (wire) => {
+            if (card.classList.contains('bt-perm-answered')) return;
+            card.classList.add('bt-perm-answered');
+            error.hidden = true;
+            card.querySelectorAll('button, input').forEach(b => b.disabled = true);
+            this.comm.notify(wire);
+        };
+        card.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const secret = input ? input.value : 'yes';
+            if (input) input.value = '';
+            answer({ type: 'prompt_answer', key: p.key, secret });
+        });
+        deny.addEventListener('click', () => answer({ type: 'prompt_deny', key: p.key }));
+        return card;
+    }
+
+    // The answer didn't reach the job: say why and let the user try again.
+    onPromptError(msg) {
+        const card = this.container.querySelector(
+            `.bt-prompt-card[data-perm-key="${CSS.escape(msg.key || '')}"]`);
+        if (!card) return;
+        card.classList.remove('bt-perm-answered');
+        card.querySelectorAll('button, input').forEach(b => b.disabled = false);
+        const error = card.querySelector('.bt-prompt-error');
+        error.textContent = msg.error || 'The answer did not reach the job';
+        error.hidden = false;
     }
 
     // Julia called `restart_chat_session!` — the ACP subprocess was killed

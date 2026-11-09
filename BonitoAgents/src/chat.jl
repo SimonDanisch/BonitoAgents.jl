@@ -1239,18 +1239,21 @@ struct ProcessJobList             # `action = "list"`, newest first
     jobs::Vector{ProcessJob}
 end
 
-mutable struct ProcessToolMsg <: MCPToolMsg           # bt_process
+mutable struct ProcessToolMsg <: MCPToolMsg           # bt_process, bt_sudo, bt_ssh
     message::Message
     server::String
-    action::String                # "" until the arguments stream in
+    tool::String                  # which of them
+    action::String                # "" until the arguments stream in; "sudo" / "ssh" for those
     job_id::String
     label::String                 # the call's own, then the job's from the result
     argv::Vector{String}
     seconds::Union{Float64,Nothing}                   # how long a wait may block
     reply::Union{ProcessJob,ProcessJobList,Nothing}   # nothing until decoded
 end
-ProcessToolMsg(message::Message, server) =
-    ProcessToolMsg(message, server, "", "", "", String[], nothing, nothing)
+ProcessToolMsg(message::Message, server, tool = "bt_process") =
+    ProcessToolMsg(message, server, String(tool), tool_action(tool), "", "", String[], nothing, nothing)
+# bt_sudo and bt_ssh do one thing each, so their calls name no action.
+tool_action(tool) = tool == "bt_sudo" ? "sudo" : tool == "bt_ssh" ? "ssh" : ""
 
 mutable struct JsonToolMsg <: MCPToolMsg              # answers with one JSON blob
     message::Message
@@ -1286,6 +1289,8 @@ function apply_input!(m::ProcessToolMsg, raw::AbstractDict)
     l isa AbstractString && !isempty(l) && (m.label = String(l))
     argv = get(raw, "argv", nothing)
     argv isa AbstractVector && (m.argv = [String(x) for x in argv if x isa AbstractString])
+    d = get(raw, "destination", nothing)
+    d isa AbstractString && !isempty(d) && isempty(m.label) && (m.label = "ssh " * d)
     s = get(raw, "seconds", nothing)
     s isa Real && (m.seconds = Float64(s))
     return nothing
@@ -1339,6 +1344,8 @@ const MCP_MSG_TYPES = Dict{String,DataType}(
     "bt_julia_wait"          => JuliaWaitToolMsg,
     "bt_show"                => ShowToolMsg,
     "bt_process"             => ProcessToolMsg,
+    "bt_sudo"                => ProcessToolMsg,
+    "bt_ssh"                 => ProcessToolMsg,
     # Every dev tool and `bt_progress` answer through BonitoMCP's `dev_result`.
     "bt_progress"            => JsonToolMsg,
     "bt_dev_inspect"         => JsonToolMsg,
@@ -1408,7 +1415,7 @@ function build_mcp_msg(T::Type{<:MCPToolMsg}, message::Message, server, tool_nam
     message.title = String(tool_name)
     return T(message, String(server))
 end
-function build_mcp_msg(T::Type{<:Union{GenericMCPToolMsg,JsonToolMsg}}, message::Message, server, tool_name)
+function build_mcp_msg(T::Type{<:Union{GenericMCPToolMsg,JsonToolMsg,ProcessToolMsg}}, message::Message, server, tool_name)
     message.title = String(tool_name)
     return T(message, String(server), String(tool_name))
 end
@@ -2189,7 +2196,7 @@ tool_key(::TaskToolMsg)     = "Task"
 # Known MCP tools: the TYPE is the name — no string field needed. Only the
 # unknown-tool fallback carries the wire name as data.
 tool_key(m::Union{GenericMCPToolMsg,JsonToolMsg}) = m.tool_name
-tool_key(::ProcessToolMsg)           = "bt_process"
+tool_key(m::ProcessToolMsg)          = m.tool
 tool_key(::ShowToolMsg)              = "bt_show"
 tool_key(::JuliaEvalToolMsg)         = "bt_julia_eval"
 tool_key(::JuliaContinueToolMsg)     = "bt_julia_continue"
@@ -8848,6 +8855,13 @@ struct QuestionSkipCommand <: ChatCommand
     key::String
 end
 
+# Wire `{type: "prompt_answer", key, secret}` / `{type: "prompt_deny", key}`: the
+# user answered or refused a sudo or ssh password prompt (managed_processes.jl).
+struct PromptAnswerCommand <: ChatCommand
+    key::String
+    secret::Union{String,Nothing}   # nothing: refused
+end
+
 # Wire `{type: "edit_file", id: <tool_id>}` or `{type: "edit_file",
 # path: <file>}` — user clicked a file-path link (tool title, diff header,
 # search hit, a path in an agent message). Opens the file in the plotpane
@@ -8921,6 +8935,14 @@ function parse_chat_command(msg::AbstractDict)::ChatCommand
     elseif type == "question_skip"
         key = String(get(msg, "key", ""))
         return isempty(key) ? UnknownCommand() : QuestionSkipCommand(key)
+    elseif type == "prompt_answer"
+        key = String(get(msg, "key", ""))
+        secret = get(msg, "secret", nothing)
+        (isempty(key) || !(secret isa AbstractString)) && return UnknownCommand()
+        return PromptAnswerCommand(key, String(secret))
+    elseif type == "prompt_deny"
+        key = String(get(msg, "key", ""))
+        return isempty(key) ? UnknownCommand() : PromptAnswerCommand(key, nothing)
     elseif type == "edit_file"
         id   = String(get(msg, "id", ""))
         path = String(get(msg, "path", ""))
@@ -8977,6 +8999,7 @@ function handle_command!(model::ChatModel, ::Session, ::InitCommand)
     emit_queue!(model)
     emit_saved_lenses(model, load_saved_lenses())
     reply!(model, cancel_state(model))
+    reply!(model, prompts_event(model))
     return nothing
 end
 
