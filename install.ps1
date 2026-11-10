@@ -170,6 +170,11 @@ if (($userPath -split ';') -notcontains $BinDir) {
 # Make it usable in THIS session too.
 if (($env:Path -split ';') -notcontains $BinDir) { $env:Path = "$env:Path;$BinDir" }
 
+# ── State dir ─────────────────────────────────────────────────────────────────
+# The launcher points USER_DATA here, and the bundle's startup (AppEnv) refuses
+# to start on Windows when that folder does not exist yet. Existing state is kept.
+New-Item -ItemType Directory -Force -Path (Join-Path $DataHome 'BonitoAgents') | Out-Null
+
 # ── Launch ────────────────────────────────────────────────────────────────────
 if (-not $NoRun) {
     Info "Starting BonitoAgents — the dashboard will open in your browser (Ctrl+C to stop)."
