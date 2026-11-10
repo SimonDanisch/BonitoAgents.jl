@@ -172,7 +172,8 @@ if (($env:Path -split ';') -notcontains $BinDir) { $env:Path = "$env:Path;$BinDi
 
 # ── State dir ─────────────────────────────────────────────────────────────────
 # The launcher points USER_DATA here, and the bundle's startup (AppEnv) refuses
-# to start on Windows when that folder does not exist yet. Existing state is kept.
+# to start on Windows when that folder does not exist yet. Bundles up to v0.2.0
+# have a launcher that doesn't create it. Existing state is kept.
 New-Item -ItemType Directory -Force -Path (Join-Path $DataHome 'BonitoAgents') | Out-Null
 
 # ── Launch ────────────────────────────────────────────────────────────────────
