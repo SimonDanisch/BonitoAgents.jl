@@ -5,7 +5,7 @@ What changed in each BonitoAgents release. The guides are at
 [A Day with BonitoAgents](https://agents.bonito.sh/story.html) shows how the
 pieces fit together.
 
-## Unreleased
+## v0.2.0
 
 v0.1.0 was a good chat for Claude Code on your own machines. This release turns
 BonitoAgents into a self-hosted workspace for **any** coding agent, on **every**
@@ -175,6 +175,10 @@ live.
 
 ### Fixed
 
+- The desktop app starts on macOS and on a fresh Windows install. macOS killed
+  v0.1.0's bundled Julia at launch, and a first Windows install exited before
+  it served anything. CI now installs and starts every bundle, on every
+  platform, before it is released.
 - Queuing a message during a reply no longer leaves the chat permanently busy
   when an agent advertises a separate steering API. Overlapping prompts require
   explicit prompt-queueing support; otherwise messages wait for the current turn.
