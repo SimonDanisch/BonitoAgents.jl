@@ -2543,6 +2543,10 @@ Type `text` into the chat composer and click send, the same path a user takes.
 A chat must be open (see [`new_chat`](@ref) / [`open_chat`](@ref)).
 """
 function send_message(s::TestServer, txt::AbstractString)
+    # Right after a (re)load the composer is in the DOM before its pane shows
+    # (e2e:job_progress sent into it on CI); a user types once it is visible.
+    wait_for(s, "a visible chat composer",
+             "[...document.querySelectorAll('.bt-text-input')].some($VIS)"; timeout = 30)
     set_input(s, ".bt-text-input", String(txt))   # set_input already visibility-filters
     # Click the VISIBLE send button (the active pane's), never a hidden pane's.
     ok = eval_js(s, "(() => { const b=[...document.querySelectorAll('.bt-send-btn')].find($VIS); if(!b)return false; b.click(); return true; })()")
