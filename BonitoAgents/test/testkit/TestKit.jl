@@ -1992,16 +1992,26 @@ shown_password(s::TestServer, name::AbstractString) = String(wait_for(s, "the pa
 "Pick `label` (\"Disable\", \"Make admin\", …) from the ⋯ menu of `name`'s row in the Accounts table."
 function account_action!(s::TestServer, name::AbstractString, label::AbstractString)
     to_settings(s)
-    ok = eval_js(s, accounts_js("""(() => {
+    # Any account change re-renders the whole table, and a new row's menu takes
+    # clicks only once its script has run, about a millisecond after the row is
+    # in the page (e2e:proxy_accounts clicked into that gap on CI). So click
+    # while it is closed: a wired menu opens within the click, so a retry never
+    # closes it again.
+    menu = """(() => {
         const row = sec.querySelector('tr[data-account=' + JSON.stringify($(json(name))) + ']');
-        if (!row) return 'no row';
         // The actions menu, not the group picker (a menu too) in the same row.
-        row.querySelector('.bt-admin-menu-cell .bw-menu-trigger').click();
-        const b = [...row.querySelectorAll('.bw-menu-open .bw-menu-item')].find(x => x.textContent.trim() === $(json(label)));
-        if (!b) return 'no item';
+        return row && row.querySelector('.bt-admin-menu-cell .bw-menu'); })()"""
+    wait_for(s, "$(repr(label)) in $(name)'s ⋯ menu", accounts_js("""(() => {
+        const m = $menu;
+        if (!m) return false;
+        if (!m.classList.contains('bw-menu-open')) m.querySelector('.bw-menu-trigger').click();
+        const b = m.classList.contains('bw-menu-open') &&
+            [...m.querySelectorAll('.bw-menu-item')].find(x => x.textContent.trim() === $(json(label)));
+        if (!b) return false;
         window.confirm = () => true;   // "Remove" asks first
-        b.click(); return true; })()"""))
-    ok === true || error("account_action!: $(ok) for $(repr(label)) on $(name)'s row")
+        b.click(); return true; })()"""); timeout = 30,
+        describe = accounts_js("""(() => { const m = $menu;
+            return m ? [...m.querySelectorAll('.bw-menu-item')].map(x => x.textContent.trim()).join(', ') : 'no row'; })()"""))
     return s
 end
 
