@@ -29,7 +29,7 @@
             selector==".bt-media-enlarge" && TK.real_click(s,P*".bt-media-actions .bw-menu-trigger")
             TK.real_click(s, P * selector)
             @test TK.wait_for(s, "enlarged image decoded", decoded)
-            @test TK.eval_js(s, "(() => {const r=$big.getBoundingClientRect();return r.width>600 && r.height>400 && r.left>=0 && r.top>=0 && r.right<=innerWidth && r.bottom<=innerHeight;})()")
+            @test TK.eval_js(s, "(() => {const r=$big.getBoundingClientRect();return r.width>600 && r.height>400 && r.left>=0 && r.top>=0 && r.right<=visualViewport.width && r.bottom<=visualViewport.height;})()")
             @test TK.eval_js(s, "getComputedStyle($overlay).position==='fixed' && $big.className==='bt-lightbox-media'")
             @test TK.eval_js(s, "$big.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))")
             TK.real_click(s, ".bt-lightbox-media")

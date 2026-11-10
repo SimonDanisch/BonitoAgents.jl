@@ -21,7 +21,7 @@
         const r = b.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) return null;
         if (r.top < 0 || r.bottom > window.innerHeight ||
-            r.left < 0 || r.right > window.innerWidth) return null;
+            r.left < 0 || r.right > visualViewport.width) return null;
         return [r.x + r.width / 2, r.y + r.height / 2];
     })()"""
 
@@ -34,7 +34,7 @@
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) return null;
         if (r.top < 0 || r.bottom > window.innerHeight ||
-            r.left < 0 || r.right > window.innerWidth) return null;
+            r.left < 0 || r.right > visualViewport.width) return null;
         return [r.x + r.width / 2, r.y + r.height / 2];
     })()"""
 

@@ -26,7 +26,7 @@
     TK.emulate_phone(s) do
         @test TK.wait_for(s,"one heading with reachable mobile actions","""(() => {
             const t=$toolbar, share=t.querySelector('.bt-share-options .bw-menu-trigger').getBoundingClientRect(), more=t.querySelector('.bt-media-actions .bw-menu-trigger').getBoundingClientRect();
-            return Math.abs(share.top-more.top)<2 && more.right<=innerWidth && t.scrollWidth<=t.clientWidth+1;
+            return Math.abs(share.top-more.top)<2 && more.right<=visualViewport.width && t.scrollWidth<=t.clientWidth+1;
         })()""";timeout=10)
         TK.screenshot(s,joinpath(tempdir(),"bonitoagents-share-phone.png"))
     end
@@ -59,7 +59,7 @@
         @test TK.wait_for(viewer,"public viewer action works","!!document.querySelector('.bt-lightbox-overlay')";timeout=10)
         TK.click(viewer,".bt-lightbox-media")
         TK.emulate_phone(viewer) do
-            @test TK.eval_js(viewer,"document.querySelector('.bt-file-toolbar').getBoundingClientRect().right<=innerWidth")
+            @test TK.eval_js(viewer,"document.querySelector('.bt-file-toolbar').getBoundingClientRect().right<=visualViewport.width")
             TK.screenshot(viewer,joinpath(tempdir(),"bonitoagents-share-public-phone.png"))
         end
         @test isempty(TK.js_errors(viewer))

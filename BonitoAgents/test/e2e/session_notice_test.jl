@@ -85,7 +85,7 @@
     TK.emulate_phone(s) do
         @test TK.wait_for(s, "notice stays compact on a phone",
             "(() => { const n = $(q(".bt-session-notice")); const r = n.getBoundingClientRect();
-                       return n.checkVisibility() && r.height <= 60 && r.right <= innerWidth &&
+                       return n.checkVisibility() && r.height <= 60 && r.right <= visualViewport.width &&
                               n.scrollWidth <= n.clientWidth + 1; })()"; timeout=10)
         TK.screenshot(s, joinpath(mktempdir(; prefix="bt-notice-"), "phone.png"))
     end

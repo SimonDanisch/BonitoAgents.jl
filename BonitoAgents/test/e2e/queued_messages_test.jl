@@ -53,7 +53,7 @@
             @test TK.eval_js(s, "!$(q(".bt-input-row .bt-queue-delivery")) && !$(q(".bt-queue-jump"))")
             @test TK.eval_js(s, "['.bt-stop-btn','.bt-send-btn'].every(c=>{const r=document.querySelector($(repr(P))+c).getBoundingClientRect();return Math.abs(r.width-r.height)<1;})")
             TK.eval_js(s, "$(q(".bt-send-mode-trigger")).click()")
-            @test TK.eval_js(s, "(() => { const r=$(q(".bt-send-mode-menu")).getBoundingClientRect(); return r.width > 0 && r.left >= 0 && r.right <= innerWidth; })()")
+            @test TK.eval_js(s, "(() => { const r=$(q(".bt-send-mode-menu")).getBoundingClientRect(); return r.width > 0 && r.left >= 0 && r.right <= visualViewport.width; })()")
             @test TK.eval_js(s, "$(allq(".bt-send-mode-option")).every(e => { const r=e.getBoundingClientRect(); return e.contains(document.elementFromPoint(r.x+r.width/2, r.y+r.height/2)); })")
             TK.screenshot(s, joinpath(screenshot_dir, "queue_menu_$(width).png"))
             TK.eval_js(s, "$(q(".bt-send-mode-option[data-send-mode='next']")).click()")
@@ -85,7 +85,7 @@
     @test waitfor("reloaded composer visible", "!!$(q(".bt-text-input"))?.offsetParent && !document.querySelector('[data-bt-settling]')")
     TK.screenshot(s, joinpath(screenshot_dir, "queue_paused.png"))
     TK.emulate_phone(s) do
-        @test waitfor("queue fits phone", "$(q(".bt-message-queue")).getBoundingClientRect().width > 0 && $(q(".bt-message-queue")).getBoundingClientRect().right <= window.innerWidth")
+        @test waitfor("queue fits phone", "$(q(".bt-message-queue")).getBoundingClientRect().width > 0 && $(q(".bt-message-queue")).getBoundingClientRect().right <= visualViewport.width")
         @test TK.eval_js(s, "$(q(".bt-text-input")).getBoundingClientRect().height > 0 && $(q(".bt-text-input")).getBoundingClientRect().bottom <= window.innerHeight")
         @test TK.eval_js(s, "$(q(".bt-input-area")).getBoundingClientRect().height <= 165")
         @test TK.eval_js(s, "(() => { const p=$(q(".bt-new-msg-pill")); return !p?.offsetParent || p.getBoundingClientRect().bottom <= $(q(".bt-input-area")).getBoundingClientRect().top; })()")

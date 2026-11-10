@@ -51,7 +51,7 @@
     @test TK.wait_for(s,"sidebar icon expands job details","$job.open";timeout=10)
     TK.emulate_phone(s) do
         @test TK.wait_for(s,"phone progress fits viewport",
-            "$job.getBoundingClientRect().right<=innerWidth && $job.scrollWidth<=$job.clientWidth+1";timeout=10)
+            "$job.getBoundingClientRect().right<=visualViewport.width && $job.scrollWidth<=$job.clientWidth+1";timeout=10)
         TK.screenshot(s,joinpath(tempdir(),"bonitoagents-job-progress-phone.png"))
     end
     TK.send_message(s,"finish tool progress")

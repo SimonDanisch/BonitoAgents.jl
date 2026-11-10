@@ -57,7 +57,7 @@
             sleep(0.5)
             TK.eval_js(s, """(() => { const t = $TILE, l = t.querySelector('.bt-app-launch').getBoundingClientRect(),
                     name = t.querySelector('.bt-app-title');
-                return [l.width >= 100 && l.right <= innerWidth, name.scrollWidth <= name.clientWidth,
+                return [l.width >= 100 && l.right <= visualViewport.width, name.scrollWidth <= name.clientWidth,
                         getComputedStyle(t.querySelector('.bt-app-details')).display]; })()""")
         end
         @test phone == [true, true, "none"]

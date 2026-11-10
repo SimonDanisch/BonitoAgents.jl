@@ -151,7 +151,7 @@
             wait_modal(server)
             @test TK.eval_js(server, "getComputedStyle(document.querySelector('$modal')).display === 'flex'")
             TK.set_window_size(server, 390, 844)
-            @test TK.wait_for(server, "phone dialog fits", "(() => { const r = document.querySelector('$modal').getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth; })()"; timeout = 15)
+            @test TK.wait_for(server, "phone dialog fits", "(() => { const r = document.querySelector('$modal').getBoundingClientRect(); return r.left >= 0 && r.right <= visualViewport.width; })()"; timeout = 15)
             TK.screenshot(server, "/tmp/bonitoagents-delete-options-mobile.png")
             TK.set_window_size(server, 1280, 820)
             TK.real_click(server, "$modal .bt-delete-session")
