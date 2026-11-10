@@ -12,7 +12,8 @@ home = (
     name = "BonitoAgents",
     text = "A workspace for coding agents and their results.",
     tagline = "Self-hosted and open source. Run Claude Code, Codex and other coding agents " *
-              "on your own computers. Inspect code, plots and live apps beside the conversation.",
+              "on your own computers. Inspect code, plots and live apps beside the conversation, " *
+              "and build your own apps without leaving it.",
     actions = [
         (text = "Get started", link = "getting-started.html", theme = "brand"),
         (text = "Watch the workflow", link = "#watch", theme = "alt"),
@@ -45,13 +46,13 @@ makedocs(
         "Home" => "index.md",
         "A Day with BonitoAgents" => "story.md",
         "Getting Started" => "getting-started.md",
+        "Build Your Own Apps" => "apps.md",
         "Concepts" => "concepts.md",
         "Guide" => [
             "The Chat" => "chat.md",
             "Workers & Machines" => "workers.md",
             "Agent Providers" => "providers.md",
             "Julia Tools & Live Apps" => "mcp-tools.md",
-            "Apps" => "apps.md",
         ],
         "Development" => "development.md",
         "API" => "api.md",

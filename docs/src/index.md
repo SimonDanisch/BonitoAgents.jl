@@ -29,6 +29,15 @@
   <figure class="ba-overview"><img src="assets/how-it-fits.svg" alt="Any ACP agent runs on any of your machines; one dashboard in any browser drives them all and shows what they make" loading="lazy" width="1000" height="470"></figure>
 </section>
 
+<section class="ba-section">
+  <div class="ba-section-heading"><h2>Build your own apps from the chat.</h2><p>Describe it. Try it. Install it.</p></div>
+  <div class="ba-pillars">
+    <article><p class="ba-eyebrow">Built in a chat</p><h3>Describe the app and watch it run.</h3><p>The agent writes a Julia package, runs it in its session and shows the app's views live in the chat. Review the code, ask for changes, and approve loading the app into the running server.</p><a href="apps.html#Build-an-app-from-a-chat">Build an app →</a></article>
+    <article><p class="ba-eyebrow">A page of its own</p><h3>A tile on the dashboard.</h3><p>An installed app gets a page laid out the way the work needs, with a chat to its own agent built in. Its state lives on the server.</p><a href="apps.html#The-To-do-app">See the To-do app →</a></article>
+    <article><p class="ba-eyebrow">Tools for every agent</p><h3>Teach every agent your workflow.</h3><p>App tools are Julia functions with typed parameters. Every chat can call them, whichever agent runs there.</p><a href="apps.html#Writing-an-app">Write an app →</a></article>
+  </div>
+</section>
+
 <section class="ba-section ba-workspace">
   <div><p class="ba-eyebrow">See what changed</p><h2>Review the patch beside the result.</h2><p>Open the source, inspect a diff, and ask about a specific line. Keep the plot or app beside the conversation while you decide what to change next.</p><a href="chat.html#Reviewing-changes">Reviewing changes →</a></div>
   <figure><img src="assets/screenshot-review.png" alt="A code change open in BonitoAgents with a review question attached to the relevant lines" loading="lazy" width="1600" height="900"><figcaption>Code, context and feedback in the same workspace.</figcaption></figure>

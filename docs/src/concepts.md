@@ -23,7 +23,9 @@ web app. It owns:
   path),
 - a **server-side mirror** of project files, populated on demand: the file
   editor always re-fetches from the worker before showing content, so you
-  never edit a stale copy.
+  never edit a stale copy,
+- the **apps**: Julia packages that run inside the server, each with a page,
+  a chat of its own and tools for every agent ([Build Your Own Apps](@ref)).
 
 Browsers can come and go: a tab that disconnects (phone in the pocket, laptop
 lid closed) can reconnect to the same session for a generous window and finds
@@ -102,3 +104,9 @@ the credential disconnects that machine. Agents run with the operating-system
 permissions of the worker process; the chat's permission prompts and the Yolo
 toggle decide how much they may do unattended. A `bt_share` link needs no
 account: the link is the permission, with an optional password on top.
+
+An app runs inside the server process with the server's permissions, so
+install the ones you would trust as any other Julia package. An agent can ask
+to load one (`bt_load_app`), but nothing loads until an admin approves it on
+the chat's card. Its page and its tools are for admins unless the app allows
+more people (`app_allowed`).

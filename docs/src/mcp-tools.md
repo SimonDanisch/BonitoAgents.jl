@@ -504,6 +504,26 @@ tunnel the login gate lets a link's page, its websocket and its assets through
 and nothing else; behind the Caddy login proxy only the pages are open, so an
 app link there needs a logged-in viewer.
 
+## `bt_load_app`, an app into the running server
+
+```
+bt_load_app(path)
+```
+
+Loads the app package in `path` into the running server, without a restart.
+The user approves every load first: the chat shows a card naming the package,
+and the call waits for **Load** or **Deny**, ten minutes at most. Nothing the
+agent does answers that card. Once approved, the server adds the package to
+its Julia environment if it isn't in it yet,
+loads it and starts the apps it registers. Their tiles appear on every open
+dashboard, and chats started from then on get their tools. The reply names the
+apps and their tools, and says when the package lacks the marker that makes the
+server load it again at its next start.
+
+Only an admin's chat may load apps, and only from the server's own machine,
+because the server reads the folder itself. A package loads once per server
+run. See [Install an app](@ref) for which servers can take one this way.
+
 ## `bt_wait`, pausing a turn
 
 ```

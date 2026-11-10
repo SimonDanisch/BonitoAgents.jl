@@ -13,7 +13,7 @@
 
 <p align="center">
   <a href="https://agents.bonito.sh/"><strong>Documentation</strong></a> ·
-  <a href="https://agents.bonito.sh/story.html">A day with BonitoAgents</a> ·
+  <a href="https://agents.bonito.sh/stable/story.html">A day with BonitoAgents</a> ·
   <a href="#quick-start">Install</a> ·
   <a href="CHANGELOG.md">What's new</a>
 </p>
@@ -34,6 +34,12 @@ tables, diffs and live interactive apps. Your code stays in ordinary folders on
 your machines, your transcripts stay on your disk, and the agents run on your
 own subscriptions and keys. There is no BonitoAgents cloud and no account with
 us.
+
+You can grow BonitoAgents itself from a chat. Ask an agent for an app, and it
+writes a Julia package that becomes part of your server: a tile on the
+dashboard, a page with a chat of its own, and tools every agent can call. The
+agent tries the app and shows it to you in the same chat, so you build it
+without an editor or a terminal.
 
 Your projects can be in any language: the agents work on them the way they
 always do. BonitoAgents itself is written in Julia, which also powers the live
@@ -60,8 +66,51 @@ account.
 If one agent runs out of credits, switch providers in the same chat and keep
 going. Leave the final tests running and check progress from your phone.
 
-[Follow the workflow](https://agents.bonito.sh/story.html), from reproducing the
+[Follow the workflow](https://agents.bonito.sh/stable/story.html), from reproducing the
 bug to sharing a working demo.
+
+## Build your own apps, from the chat
+
+An app is an ordinary Julia package that plugs into BonitoAgents in three
+places:
+
+- **A tile on the dashboard and a page of its own.** The page is whatever the
+  app lays out, with a chat to the app's own agent built in.
+- **Tools for every agent.** An app tool is a Julia function with typed
+  parameters. The agents in your chats can call it, whichever agent runs there.
+- **State on the server.** The app runs as long as the server does, whether its
+  page is open or not.
+
+You build one the way you build anything else here, by describing it in a chat:
+
+```text
+Build a BonitoAgents app package called ReleaseChecklist, following
+https://agents.bonito.sh/stable/apps.html. It keeps one checklist per release,
+gives every agent a tool to tick off a step, and shows the list above the
+app's chat. Try it in your Julia session, show me the list here, and load it
+into the server when I say so.
+```
+
+The agent writes the package and runs it in its persistent Julia session. It
+calls the app's tools and returns the app's views, which render live in the
+chat and follow the app's state. Review the code in the change review, ask for
+changes, and look again. When it does what you want, the agent asks to load it
+into the running server with `bt_load_app`, and you approve on a card in the
+chat. The tile appears on the dashboard at once, with no restart and no
+terminal. Nothing loads without that click.
+
+Two apps to start from:
+
+- **To-do** ships with BonitoAgents. It keeps one list for the whole server.
+  Any agent can add and check off items, and **Start chat** opens a chat for an
+  item in the right project folder.
+- **[BonitoCommunity](https://github.com/SimonDanisch/BonitoCommunity.jl)** runs
+  the community work around Makie and Bonito. Every video gets a project with
+  its own chat, whose agent drafts the posts for each platform. You approve them
+  on the app's page, a click publishes them, and the app collects the replies.
+
+The [Apps guide](https://agents.bonito.sh/stable/apps.html) covers the
+interface, trying an app in a chat and [installing it](#install-an-app).
 
 ## Bring any agent, keep your work
 
@@ -116,7 +165,7 @@ copied and downloaded, videos downloaded, on a phone too.
   <img src="docs/src/assets/screenshot-media.png" alt="One chat with the agent's loss plot, a prediction video and a 3D model inline, next to the Jupyter notebook and the metrics table it wrote, open as workspace panels" width="850">
 </p>
 
-## Apps and GUIs, not only text
+## Live results, not only text
 
 - **A live Julia session per project.** `bt_julia_eval` keeps packages,
   variables and compiled code warm between calls, streams stdout while the code
@@ -127,10 +176,6 @@ copied and downloaded, videos downloaded, on a phone too.
   worker. Detach it into a tab or a floating window and it keeps running.
 - **A workspace, not a chat log.** Tabs, splits and floating windows hold the
   chat, the project's files, the change review and detached apps side by side.
-- **Server apps.** An app is a Julia package that lays out its own chat pane
-  and gives every agent new tools. The bundled To-do app keeps one list for the
-  whole server: any agent can add and check off items, and **Start chat** opens
-  a chat for an item in the right project folder.
 
 <p align="center">
   <img src="BonitoAgents/assets/screenshot-workspace.png" alt="A live Bonito app detached from the chat and docked beside it, with the project file open in a tab" width="850">
@@ -225,7 +270,7 @@ Node and the agent adapters (Claude Code's and Codex's) are installed for you,
 in a private Node install. What stays yours is logging in to the agents: for
 Claude Code, run `claude` once and authenticate; for Codex, `codex login`. Kimi
 Code, OpenCode and MiMo run whichever binary the worker's PATH has. See
-[Agent Providers](https://agents.bonito.sh/providers.html).
+[Agent Providers](https://agents.bonito.sh/stable/providers.html).
 
 ### From source
 
@@ -247,29 +292,6 @@ Run the server on an always-on Linux machine with a domain name, using
 ```bash
 bash BonitoAgents/assets/install_server.sh
 ```
-
-### Server plugins
-
-A server package can add a permanent dashboard app without a custom launcher or
-an edit to BonitoAgents. Install it as a direct dependency of the monorepo
-environment, then run the normal installer:
-
-```bash
-julia --project=. -e 'using Pkg; Pkg.add("BonitoCommunity")'
-bash BonitoAgents/assets/install_server.sh
-```
-
-Opt-in packages declare this in their own `Project.toml`:
-
-```toml
-[bonitoagents]
-plugin = true
-```
-
-Their `__init__()` calls `BonitoAgents.register_app!(MyApp)`. On ordinary
-server startup, BonitoAgents loads only direct dependencies with that explicit
-marker. Re-running the normal installer instantiates the same manifest for the
-service user and restarts the server with the plugin.
 
 It asks how people reach the server, its domain and the admin, saves the
 answers before anything can fail (a second run just offers them again;
@@ -331,6 +353,29 @@ Without a login there are two simpler ways to run the server:
   plain HTTP; workers join with the command from **Add worker**, each with its
   own credential that the server checks itself.
 
+### Install an app
+
+An app package installs into the server's Julia environment. In the desktop
+app, and on any server whose environment it can write, an admin's chat does it
+with `bt_load_app`, once you approve it in the chat. A server set up with `install_server.sh` runs as
+its own service user on your checkout, so there you add the package to the
+checkout's environment and run the installer again. The installer installs the
+package for the service user and restarts the server with the app:
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.add(url = "https://github.com/SimonDanisch/BonitoCommunity.jl")'
+bash BonitoAgents/assets/install_server.sh
+```
+
+An app package's `__init__()` calls `BonitoAgents.register_app!(MyApp)`. At
+startup the server loads only the direct dependencies that opt in, with this in
+their `Project.toml`:
+
+```toml
+[bonitoagents]
+plugin = true
+```
+
 ## Tour
 
 Two recorded tours are embedded on the
@@ -386,5 +431,8 @@ julia --project=BonitoAgents -e 'using Pkg; Pkg.test("BonitoAgents"; test_args=[
 - **Agents** run with the operating-system permissions of the worker process.
   The chat's permission prompts and the Yolo toggle decide how much they may do
   unattended.
+- **Apps** run inside the server process, with its permissions. Install the
+  ones you would trust as any other Julia package. An agent's `bt_load_app`
+  loads nothing until an admin approves it on the chat's card.
 - **Shared links** from `bt_share` need no account: the link itself is the
   permission, with an optional password on top.

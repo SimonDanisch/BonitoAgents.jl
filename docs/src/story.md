@@ -106,3 +106,17 @@ Once the tests pass, the patch, benchmark results and working demo are ready
 for review.
 
 [Reviewing changes](@ref) · [Staying in control](@ref)
+
+## Next time, make it an app
+
+Every release you run the same comparison: render the test scenes, time them,
+check the numbers against the last release. Ask the agent to turn that into an
+app. It writes a Julia package with a tile on the dashboard, a page that shows
+the latest numbers, and a tool any chat's agent can call to record a run.
+
+It builds the app in the chat you asked in. It runs the app in its Julia
+session, shows you the app's views live in the conversation, and changes them
+until they fit. Then it asks to load the app into the running server. You
+click **Load** on the card it shows, and the tile is on the dashboard. From then on every agent on every machine can report to it.
+
+[Build Your Own Apps](@ref)
