@@ -170,7 +170,9 @@ end
         @test TK.reload!(b) == :dashboard
         @test TK.eval_js(b, "document.querySelectorAll('.bt-worker-cell').length") == 1
         continue_on(s, pid) = begin
-            TK.eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\"$(pid)\"]').click(); true")
+            # After the reload the sidebar's rows come later than the page: wait
+            # for the chat's row (a bare click hit nothing on CI for v0.2.1).
+            TK.open_chat(s, pid; timeout = 60)
             TK.wait_for(s, "the chat header", "!!document.querySelector('.bt-chatpane[data-pane-pid=\"$(pid)\"] .bw-menu-trigger')";
                         timeout = 60)
             sleep(1.0)
