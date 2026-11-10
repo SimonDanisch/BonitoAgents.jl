@@ -1,6 +1,6 @@
 name = "BonitoAgentsApp"
 uuid = "ada3638d-cc8c-48ff-af65-d13385ab7a5c"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Simon Danisch <sdanisch@gmail.com>"]
 
 [deps]

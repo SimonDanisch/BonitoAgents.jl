@@ -2,8 +2,41 @@
 
 What changed in each BonitoAgents release. The guides are at
 [agents.bonito.sh](https://agents.bonito.sh), and
-[A Day with BonitoAgents](https://agents.bonito.sh/story.html) shows how the
+[A Day with BonitoAgents](https://agents.bonito.sh/stable/story.html) shows how the
 pieces fit together.
+
+## v0.2.1
+
+Build your own apps without leaving the chat. An agent writes the app package,
+shows you its views live in the conversation, and loads it into your running
+server once you approve.
+
+### Added
+
+- `bt_load_app` loads an app package into the running server, from the chat
+  that wrote it, without a restart. Every load waits for an admin to approve it
+  on a card in the chat, and the agent can't answer that card. Its tile then
+  appears on the open dashboards, and chats started from then on get its tools.
+  It works from the server's own machine: in the desktop app, and on any server
+  that can write its Julia environment.
+- The dashboard's Apps section follows the server's apps, so a new app's tile
+  shows up without a reload.
+
+### Changed
+
+- The README and the documentation lead with building your own apps. The Apps
+  guide, now **Build Your Own Apps**, starts with a prompt to paste into a chat.
+- At startup the server runs only the apps of packages marked as plugins, not
+  every app some loaded package registered.
+
+### Fixed
+
+- An app returned into the chat failed with a `MethodError` when it showed
+  changing state, an Observable holding DOM. It renders now, so an agent
+  building an app can show the app's views in the chat.
+- A Windows bundle unpacked by hand starts: its launcher creates the app's data
+  folder, which v0.2.0 left to the installer.
+- The README's links into the documentation pointed at pages that don't exist.
 
 ## v0.2.0
 
