@@ -181,10 +181,11 @@ jsonable(x) = string(x)
 # `remote_eval` / `remote_workers` / `sync_folder` are not dev tools: every
 # chat's MCP may ask them (remote_eval.jl). They share this channel and this
 # allow-list because it is the one request/reply path an MCP process has.
-# `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl).
+# `app_tools` / `app_call` are how every chat's MCP reaches the apps' tools (apps.jl),
+# and `app_load` how an admin's chat loads an app package (plugins.jl).
 const DEV_OPS          = (:inspect, :logs, :memory, :control, :timings, :console, :wait_input,
                           :remote_eval, :remote_workers, :sync_folder, :sync_folder_v2, :share,
-                          :app_tools, :app_call, :managed_process, :chat_messaging)
+                          :app_tools, :app_call, :app_load, :managed_process, :chat_messaging)
 const DEV_SECTIONS     = (:overview, :workers, :worker, :projects, :chats, :evals, :settings, :tabs)
 const DEV_CONTROL_OPS  = (:open_chat, :send_message, :restart_chat, :close_chat,
                           :rescan_worker, :continue_project, :set_title)

@@ -2000,14 +2000,14 @@ class BonitoChat {
         const card = el('form', 'bt-permission-card bt-prompt-card');
         card.dataset.permKey = p.key;
         card.dataset.promptKind = p.kind;
-        const sudo = p.kind === 'sudo';
+        const sudo = p.kind === 'sudo', load = p.kind === 'app_load';
         const host = p.host || p.worker;
-        card.append(el('div', 'bt-permission-question', sudo ? `Password to run as root on ${host}` : `ssh on ${p.worker} asks`));
+        card.append(el('div', 'bt-permission-question', sudo ? `Password to run as root on ${host}` : load ? 'Load this app into the BonitoAgents server?' : `ssh on ${p.worker} asks`));
         card.append(el('code', 'bt-prompt-job', p.job));
         if (sudo) card.append(el('div', 'bt-prompt-where', p.host ? `through ssh from ${p.worker}` : `in ${p.cwd}`));
         if (p.text) card.append(el('pre', 'bt-prompt-text', p.text));
         let input = null;
-        if (p.kind !== 'confirm') {
+        if (p.kind !== 'confirm' && !load) {
             input = el('input', 'bt-question-text bt-prompt-input');
             input.type = 'password';
             input.autocomplete = 'off';
@@ -2019,7 +2019,7 @@ class BonitoChat {
         const actions = el('div', 'bt-permission-actions');
         const deny = el('button', 'bt-permission-btn bt-perm-reject', 'Deny');
         deny.type = 'button';
-        const send = el('button', 'bt-permission-btn bt-perm-allow', sudo ? 'Run' : p.kind === 'confirm' ? 'Allow' : 'Send');
+        const send = el('button', 'bt-permission-btn bt-perm-allow', sudo ? 'Run' : load ? 'Load' : p.kind === 'confirm' ? 'Allow' : 'Send');
         send.type = 'submit';
         actions.append(deny, send);
         card.append(error, actions);

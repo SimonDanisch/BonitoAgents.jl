@@ -325,10 +325,14 @@ function prompt_card(state,record)
         "host"=>String(get(record,"host","")))   # sudo through a bt_ssh connection
 end
 
+# A chat's open questions: its jobs' passwords, and the app loads waiting for a
+# person (plugins.jl). Each kind answers on its own path.
+prompt_cards(chat::ChatModel) = prompt_cards(chat.state,chat.project_id)
+prompt_cards(state,pid::AbstractString) = vcat(process_prompt_cards(state,pid), app_load_cards(state,pid))
+
 # Only a book already in memory: a job with an open question is in one, because the
 # worker reports its jobs on every connect. A chat that never ran one gets no file.
-prompt_cards(chat::ChatModel) = prompt_cards(chat.state,chat.project_id)
-function prompt_cards(state,pid::AbstractString)
+function process_prompt_cards(state,pid::AbstractString)
     state = root_state(state)
     book = lock(() -> get(state.process_jobs,pid,nothing),state.lock)
     book === nothing && return Dict{String,Any}[]
@@ -341,6 +345,14 @@ function prompt_cards(state,pid::AbstractString)
 end
 
 prompts_event(chat::ChatModel) = Dict{String,Any}("type"=>"prompts", "prompts"=>prompt_cards(chat))
+
+"Send a chat's open questions to its tabs, when the chat is open on the server."
+function show_prompts!(state, pid::AbstractString)
+    root = root_state(state)
+    chat = lock(() -> get(root.chat_models, pid, nothing), root.lock)
+    chat === nothing || chat_emit(chat, prompts_event(chat))
+    return nothing
+end
 
 """
     answer_prompt!(view, key, secret)
@@ -369,7 +381,18 @@ function answer_prompt!(view::ChatModel, key::AbstractString, secret::Union{Stri
     return nothing
 end
 
-handle_command!(model::ChatModel, ::Any, cmd::PromptAnswerCommand) = answer_prompt!(model, cmd.key, cmd.secret)
+function handle_command!(model::ChatModel, ::Any, cmd::PromptAnswerCommand)
+    startswith(cmd.key, "app_load:") || return answer_prompt!(model, cmd.key, cmd.secret)
+    # An app load waiting for a person (plugins.jl). `viewer` is the state of the
+    # tab that clicked, so it knows whose click this is.
+    try
+        answer_app_load!(model.viewer, model.project_id, cmd.key, cmd.secret !== nothing)
+    catch e
+        e isa ErrorException || rethrow()
+        reply!(model, Dict{String,Any}("type" => "prompt_error", "key" => cmd.key, "error" => e.msg))
+    end
+    return nothing
+end
 
 # ── The `bt_process` card ────────────────────────────────────────────────────
 # The card says what a call did in its title and summary; opening it shows the

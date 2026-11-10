@@ -1,0 +1,10 @@
+# A BonitoAgents app as small as one gets, for the tests of loading an app into
+# a running server (unit:app_load, e2e:app_load). Without `[bonitoagents]
+# plugin = true` on purpose: every test server would load it at boot otherwise.
+name = "HelloApp"
+uuid = "564b8dfd-92fb-49f9-a20f-8b12c6435fc7"
+version = "0.1.0"
+
+[deps]
+Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
+BonitoAgents = "f4e5b6c7-8901-4a2b-9c3d-4e5f6a7b8c9d"

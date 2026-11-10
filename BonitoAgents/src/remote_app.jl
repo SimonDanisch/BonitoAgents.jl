@@ -654,9 +654,13 @@ function handle_dev_request(state::ServerState, ws, frame::AbstractDict;
     id = get(frame, "dev_id", nothing)
     reply = try
         args = get(frame, "args", Dict{String,Any}())
-        result = dev_request(state, String(get(frame, "op", "")),
-                             args isa AbstractDict ? args : Dict{String,Any}(),
-                             String(project_id))
+        # In the newest world: this task descends from the channel's read loop,
+        # which keeps the methods there were when the chat connected. An app
+        # loaded since (`load_app!`) would be invisible to it, its tools
+        # included, in every chat that was already open.
+        result = Base.invokelatest(dev_request, state, String(get(frame, "op", "")),
+                                   args isa AbstractDict ? args : Dict{String,Any}(),
+                                   String(project_id))
         Dict{String,Any}("op" => "dev_reply", "dev_id" => id, "ok" => true, "result" => result)
     catch e
         e isa InterruptException && rethrow()

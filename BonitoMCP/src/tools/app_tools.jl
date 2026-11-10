@@ -54,3 +54,65 @@ function call_tool(name::AbstractString, args::AbstractDict)
     get(reply, "found", false) === true || return nothing
     return Dict{String,Any}(reply["result"])
 end
+
+# ── bt_load_app: an app package into the running server ─────────────────────
+
+# The server first waits for a person to approve the load on the chat's card (10
+# minutes at most), then loads the package in its own process, which precompiles
+# it and whatever it adds to the server's environment: minutes on a cold depot.
+const APP_LOAD_TIMEOUT_S = 1800.0
+
+function load_app_handler(args::AbstractDict)
+    path = String(strip(String(get(args, "path", ""))))
+    isempty(path) && return tool_error("`path` (the app package's folder) is required")
+    reply = try
+        call_server("app_load"; timeout = APP_LOAD_TIMEOUT_S, path)
+    catch e
+        # No channel, a timeout, or the server's own error (see `call_server`).
+        e isa ErrorException || rethrow()
+        return tool_error(e.msg)
+    end
+    lines = String[]
+    for a in reply["apps"]
+        tools = a["tools"]
+        push!(lines, "Started the app \"$(a["title"])\" ($(a["id"])). Its tile is on the dashboard" *
+                     (isempty(tools) ? "." : ", and chats started from now on have its tools: $(join(tools, ", "))."))
+    end
+    reply["added"] === true &&
+        push!(lines, "Added the package to the server's Julia environment, $(reply["environment"]).")
+    reply["marked"] === true ||
+        push!(lines, "Its Project.toml has no `[bonitoagents] plugin = true`, so the server won't load it " *
+                     "again after a restart. Add those two lines to keep the app.")
+    return tool_text(join(lines, "\n"))
+end
+
+register!(
+    "bt_load_app",
+    """
+    Load a BonitoAgents app package into the running BonitoAgents server, without
+    a restart. The user approves every load: the chat shows them a card naming
+    the package, and the call waits for their answer (10 minutes at most). Call
+    it when the user asked for the app to be loaded. Once loaded, its tile appears
+    on the dashboard, and chats started from then on get its tools; its own chat
+    opens from the tile. `path` is the package's
+    folder (absolute, or relative to the project folder), which the server reads
+    on its own machine: this chat's worker has to run there.
+    The package registers its app type in `__init__`:
+        function __init__()
+            BonitoAgents.register_app!(MyApp)
+        end
+    It is added to the server's Julia environment as a development checkout if
+    it isn't in it yet. With `[bonitoagents] plugin = true` in its Project.toml
+    the server loads it again whenever it starts. A package loads once per
+    server run, so trying changed code needs a server restart. Only an admin's
+    chat may load apps.
+    """,
+    Dict{String,Any}(
+        "type" => "object",
+        "properties" => Dict{String,Any}(
+            "path" => Dict("type" => "string", "description" => "The app package's folder (its Project.toml is in it)"),
+        ),
+        "required" => ["path"],
+    ),
+    load_app_handler,
+)

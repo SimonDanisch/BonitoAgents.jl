@@ -242,12 +242,14 @@ tool_result(result::AbstractDict) = Dict{String,Any}(result)
 # ── the apps a server runs ──────────────────────────────────────────────────
 
 """
-    start_apps!(server, apps) -> server
+    start_apps!(server, apps) -> Vector{AgentApp}
 
-Start the server's apps, each from its type: `A(AppContext(server, dir))`.
-Called once, by the `ServerState` constructor.
+Start apps, each from its type: `A(AppContext(server, dir))`, and return them.
+The `ServerState` constructor starts the server's apps with it, and
+[`load_app!`](@ref) the ones a package loaded later brings.
 """
 function start_apps!(server::ServerState, apps)
+    started = AgentApp[]
     for A in apps
         # A plugin package is loaded while `serve` is already executing. Its
         # app-interface methods therefore live in a newer Julia world age than
@@ -257,9 +259,9 @@ function start_apps!(server::ServerState, apps)
         app = Base.invokelatest(A, AppContext(server, joinpath(server.state_dir, "apps", id)))::AgentApp
         icon = Base.invokelatest(app_icon, app)
         icon === nothing || isfile(icon) || error("the icon of app '$id' is not a file: $icon")
-        server.apps[id] = app
+        push!(started, add_app!(server.apps, id, app))
     end
-    return server
+    return started
 end
 
 # What an <img> shows as the app's logo: its file, or a tile with a letter.
@@ -505,8 +507,7 @@ function visible_tools(server::ServerState, caller::ProjectInfo)
     out = Pair{AgentApp,AppTool}[]
     user = owner_user(server, caller.owner)
     user === nothing && return out
-    for id in sort!(collect(keys(server.apps)))
-        app = server.apps[id]
+    for app in sorted_apps(server.apps)
         app_allowed(app, user) || continue
         for t in app_tools(app)
             in_scope(t.scope, app, caller) && push!(out, app => t)
@@ -556,23 +557,28 @@ end
 """
     apps_section(session, state, current_view, busy) -> DOM | nothing
 
-The dashboard's apps, as a grid of tiles: logo and title, with the details on
-hover. A click opens the app's chat. Before the chat exists a dialog asks first
-which worker it runs its agent on; after, the click just opens it. Opening
-reports into `busy`, the window's progress card.
+The dashboard's Apps section: a heading and a grid of tiles, logo and title,
+with the details on hover. A click opens the app's chat. Before the chat exists
+a dialog asks first which worker it runs its agent on; after, the click just
+opens it. Opening reports into `busy`, the window's progress card. It follows
+the server's apps, so an app a chat loads (`load_app!`) appears without a reload.
 """
 function apps_section(session::Bonito.Session, state::ServerState,
                       current_view::Union{Observable{String},Nothing}, busy::Observable)
     current_view === nothing && return nothing
     # The server's own view (no user, tests' standalone dashboards) is an admin's.
     allowed(app) = state.user === nothing || app_allowed(app, state.user)
-    apps = [state.apps[id] for id in sort!(collect(keys(state.apps))) if allowed(state.apps[id])]
-    isempty(apps) && return nothing
-    tiles = [app_tile(session, state, app, current_view, busy) for app in apps]
-    # The dialogs outside the grid: a tile's hover state must not reach them.
-    return DOM.div(AppsStyles,
-                   DOM.div(first.(tiles); class = "bt-apps"),
-                   last.(tiles))
+    # The block itself is static: the dashboard caps the width of its direct
+    # children, which a reactive child (Bonito's fragment) would escape.
+    return DOM.div(AppsStyles, map(session, state.apps.changed) do _
+        apps = filter(allowed, sorted_apps(state.apps))
+        isempty(apps) && return DOM.div()
+        tiles = [app_tile(session, state, app, current_view, busy) for app in apps]
+        # The dialogs outside the grid: a tile's hover state must not reach them.
+        DOM.div(DOM.div(DOM.h2("Apps"); class = "bt-section"),
+                DOM.div(first.(tiles); class = "bt-apps"),
+                last.(tiles))
+    end; class = "bt-dash-apps")
 end
 
 # One app's tile and its setup dialog.

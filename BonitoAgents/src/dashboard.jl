@@ -2380,7 +2380,6 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
             onclick = js"event => $(current_view).notify($(SETTINGS_VIEW))")
 
     apps = page_phase(() -> apps_section(session, state, current_view, busy), :apps)
-    apps_header = apps === nothing ? nothing : DOM.div(DOM.h2("Apps"); class = "bt-section")
 
     # Layout — DOM only; the App() wrapper + global assets (DashboardStyles,
     # ConnectionIndicator) live in the caller (unified_app or dashboard_app).
@@ -2403,8 +2402,7 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
         stats_strip,
         error_block,
 
-        # The server's apps (apps.jl): one row each, opening the app's chat.
-        apps_header,
+        # The server's apps (apps.jl): a tile each, opening the app's chat.
         apps,
 
         DOM.div(DOM.h2("Workers"); class = "bt-section"),
