@@ -182,6 +182,10 @@ live.
   limit. One chat sent 10,294 auto-continues in 2.5 hours before this fix,
   because the failure arrived as a normal turn end and the compaction step
   counted as work.
+- A Claude chat no longer stays busy after Claude compacts it on its own.
+  claude-agent-acp 0.101 compacts a chat that has been idle for 54 minutes, and
+  nothing marks where that compaction ends, so the chat showed as working until
+  you force-stopped it. A compaction now never counts as the agent working.
 - Stop stops. A background run or task that ends after you pressed Stop (or
   restarted the chat) no longer starts a new turn with its note; the note waits
   in the queue and goes to the agent with your next message.

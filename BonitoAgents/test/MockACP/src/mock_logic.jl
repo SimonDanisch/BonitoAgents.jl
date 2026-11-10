@@ -466,13 +466,17 @@ end
 # its auto-wake announcement after end_turn). Supports the shapes the
 # between-turn wire actually carries (fixtures/bg_subagent_wire.jsonl):
 # untagged text, tagged sub_text/sub_tool, and the usage that ends the agent's
-# own turn.
+# own turn. `recorded` replays any captured update as it was.
 function emit_post_event(ev::AbstractDict)
     et = String(get(ev, "type", ""))
     if et == "text"
         agent_chunk(String(ev["text"]))
     elseif et == "usage"
         emit_usage(ev)
+    elseif et == "recorded"
+        # A captured frame's update, verbatim (TestKit's `recorded`).
+        u = ev["update"]
+        upd(String(u["sessionUpdate"]), Dict{String,Any}(k => v for (k, v) in u if k != "sessionUpdate"))
     elseif et == "sub_text"
         upd("agent_message_chunk", Dict{String,Any}(
             "content" => Dict("type" => "text", "text" => String(ev["text"])),

@@ -128,6 +128,15 @@ post_turn(events::Vector; delay_ms = 300) =
     Dict{String,Any}("type" => "post_turn", "events" => events,
                      "delay_ms" => Float64(delay_ms))
 
+"""
+    recorded(update) -> Dict
+
+A `post_turn` event that emits one `session/update` exactly as a real agent sent
+it: `update` is the frame's `params.update`, from a captured wire such as
+AgentClientProtocol/test/fixtures/claude_idle_compaction_wire.jsonl.
+"""
+recorded(update::AbstractDict) = Dict{String,Any}("type" => "recorded", "update" => update)
+
 # Scripted `session/load` replay: `REPLAY_FN[]` maps a session id to the event
 # list (user/text/thought/tool) the mock re-streams as the resumed session's
 # history — how the real agent replays its jsonl. Default: no replay, which is

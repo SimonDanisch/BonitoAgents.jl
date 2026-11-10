@@ -660,6 +660,19 @@ end
             @test isempty(ACP.open_turns(conn))
             got()
 
+            # Nor is a compaction the agent runs on its own: nothing would end that
+            # turn (fixtures/claude_idle_compaction_wire.jsonl, idle_compaction_test.jl).
+            compact(status) = Dict{String,Any}("sessionUpdate" => "tool_call_update",
+                "toolCallId" => "c-1", "status" => status,
+                "_meta" => Dict("claudeCode" => Dict("toolName" => "compact")))
+            ACP.dispatch_message(conn, plain(merge(compact("in_progress"), Dict(
+                "sessionUpdate" => "tool_call", "title" => "Compact conversation", "kind" => "think"))))
+            ACP.dispatch_message(conn, plain(compact("completed")))
+            @test isempty(ACP.open_turns(conn))
+            g = got()                                  # delivered, with no TurnStarted ahead
+            @test length(g) == 2 && g[1] isa ACP.ToolCallNotif && g[2] isa ACP.ToolCallUpdateNotif &&
+                  all(u -> u.tool_name == ACP.CONTEXT_COMPACTION_TOOL, g)
+
             # Work with no turn open: a turn of its own, announced ahead of it.
             ACP.dispatch_message(conn, plain(chunk("reporting back")))
             own = only(ACP.open_turns(conn))
@@ -1332,3 +1345,4 @@ end
 # "A8 cancel is a no-op when idle" above: idle must stay a no-op, but
 # unregistered-and-working must not).
 include(joinpath(@__DIR__, "orphan_cancel_test.jl"))
+include(joinpath(@__DIR__, "idle_compaction_test.jl"))

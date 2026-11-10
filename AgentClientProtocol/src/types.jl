@@ -225,6 +225,13 @@ and only work starts a turn of the agent's own (`AgentTurn`): a fresh session
 emits `available_commands_update` right after `session/new`, and a chat that has
 done nothing must not look busy for it.
 
+A context compaction (`CONTEXT_COMPACTION_TOOL`) is housekeeping, not work. On
+its own it is a whole cycle with no end on the wire: claude-agent-acp 0.101
+compacts an idle session by itself, and that cycle has no result tagged with an
+origin (captured in test/fixtures/claude_idle_compaction_wire.jsonl). A turn it
+opened would stay open until the next prompt's answer or a forced close. Work
+after a compaction still opens a turn.
+
 `SubagentUpdate` is work, but reaches this only in tests — on the wire it is
 addressed to its owner before liveness is ever consulted.
 """
@@ -232,8 +239,8 @@ is_agent_work(::SessionUpdate) = false
 is_agent_work(::AgentMessageChunk) = true
 is_agent_work(::AgentThoughtChunk) = true
 is_agent_work(::PlanUpdate) = true
-is_agent_work(::ToolCallNotif) = true
-is_agent_work(::ToolCallUpdateNotif) = true
+is_agent_work(u::ToolCallNotif) = u.tool_name != CONTEXT_COMPACTION_TOOL
+is_agent_work(u::ToolCallUpdateNotif) = u.tool_name != CONTEXT_COMPACTION_TOOL
 is_agent_work(::SubagentUpdate) = true
 
 # ── Autonomous cycles ────────────────────────────────────────────────────────
@@ -717,7 +724,8 @@ function parse_claude_meta(params::AbstractDict; title_names::Bool = false)
         cc = get(meta, "claudeCode", nothing)
         if cc isa AbstractDict
             v = get(cc, "toolName", "")
-            v isa AbstractString && (name = String(v))
+            # claude-agent-acp names its compaction `compact` (see CONTEXT_COMPACTION_TOOL).
+            v isa AbstractString && (name = v == "compact" ? CONTEXT_COMPACTION_TOOL : String(v))
         end
     end
     isempty(name) && (name = codex_tool_name(params))
@@ -752,6 +760,12 @@ captured in `test/fixtures/codex_*compaction.jsonl`). It runs before a turn
 whenever the context is nearly full, so it says nothing about whether the agent
 did anything. Without a name it is indistinguishable from real tool work, and a
 Codex turn that failed at the compaction step looked like a turn that worked.
+
+claude-agent-acp reports one the same way, titled "Compact conversation", and
+names it `compact` in `_meta.claudeCode.toolName` on every frame (0.101.0,
+captured in `test/fixtures/claude_idle_compaction_wire.jsonl`). Besides the ones
+inside a turn, that adapter compacts an idle session on its own, with no prompt
+open.
 """
 const CONTEXT_COMPACTION_TOOL = "ContextCompaction"
 
