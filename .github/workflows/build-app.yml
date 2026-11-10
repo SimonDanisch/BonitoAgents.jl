@@ -155,6 +155,9 @@ jobs:
           $env:BONITOAGENTS_TARBALL = (Get-ChildItem build\*.tar.gz | Select-Object -First 1).FullName
           $env:BONITOAGENTS_NORUN = '1'
           .\install.ps1
+          # install.ps1 creates the (still empty) state folder for older bundles;
+          # this bundle has to create it itself, as when it is unpacked by hand.
+          Remove-Item (Join-Path $env:LOCALAPPDATA 'BonitoAgents')
           $prefix = Join-Path $env:LOCALAPPDATA 'BonitoAgents-app'
           $workers = Join-Path $env:LOCALAPPDATA 'BonitoAgents\state\workers.json'
           $out = Join-Path $env:RUNNER_TEMP 'smoke.out.log'
