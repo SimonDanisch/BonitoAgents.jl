@@ -626,12 +626,15 @@ Bonito.url(::StubAssetServer, a::Bonito.BinaryAsset) = "[binary:$(a.mime):$(leng
 Bonito.url(::StubAssetServer, a::Bonito.Asset) =
     isempty(a.online_path) ? "[asset:$(Bonito.mediatype(a))]" : a.online_path
 # es6 modules interpolated in inline `js""` scripts reference the import key and
-# never inline (mirrors `NoServer`; `render_asset`/`session_dom` aren't hit on
-# this path, so the other asset-server verbs aren't needed).
+# never inline (mirrors `NoServer`).
 function Bonito.import_in_js(io::IO, session::Bonito.Session, ::StubAssetServer, asset::Bonito.Asset)
     push!(session.imports, asset)
     print(io, "BONITO_IMPORTS['$(Bonito.unique_key(asset))']")
 end
+# An Observable holding DOM (`map(f, session, obs)`, the usual way to render
+# changing state) renders as a subsession, and `session_dom` asks the asset
+# server for its init code. A stub has none.
+Bonito.setup_asset_server(::StubAssetServer) = nothing
 
 # Returns the compact HTML `String` on success, or the `CapturedException` a
 # render-time failure threw (a VALUE — the caller decides how to surface it). The

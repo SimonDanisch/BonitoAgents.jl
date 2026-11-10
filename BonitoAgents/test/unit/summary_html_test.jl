@@ -49,6 +49,17 @@
         @test occursin("SUMMARK_BOOM", sprint(showerror, r))
     end
 
+    @testset "an Observable holding DOM renders" begin
+        # Regression: a subsession asked the stub asset server for init code it
+        # had no method for, so an app showing changing state (the Apps guide's
+        # NotesList) failed in the chat with a MethodError.
+        app = Bonito.App(s -> Bonito.DOM.div(
+            map(x -> Bonito.DOM.p(x), s, Bonito.Observable("OBSMARK_live"))))
+        r = RP.summary_html(app)
+        @test r isa String
+        @test occursin("OBSMARK_live", r)
+    end
+
     @testset "plain DOM value renders compactly" begin
         r = RP.summary_html(Bonito.App(() -> Bonito.DOM.div("PLAINMARK_z")))
         @test r isa String
