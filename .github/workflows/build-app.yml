@@ -116,7 +116,7 @@ jobs:
       # Install the bundle the way users do (install.sh into a fresh HOME, so a
       # path baked in at build time can't hide behind the build tree) and start
       # it: the dashboard has to answer and this machine's worker to register.
-      # Windows installs through install.ps1 and isn't covered here.
+      # Windows does the same through install.ps1 in the next step.
       - name: Smoke test the installed bundle
         if: matrix.os != 'windows'
         run: |
@@ -141,6 +141,44 @@ jobs:
           fi
           echo "dashboard up, worker registered"
           pkill -f '[B]onitoAgentsApp' || true
+
+      # The same check on Windows: install.ps1 into a fresh user profile (Julia's
+      # homedir() is USERPROFILE, the app's data root is under LOCALAPPDATA).
+      - name: Smoke test the installed bundle (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:USERPROFILE = Join-Path $env:RUNNER_TEMP 'smoke-home'
+          $env:LOCALAPPDATA = Join-Path $env:USERPROFILE 'AppData\Local'
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA | Out-Null
+          $env:BONITOAGENTS_TARBALL = (Get-ChildItem build\*.tar.gz | Select-Object -First 1).FullName
+          $env:BONITOAGENTS_NORUN = '1'
+          .\install.ps1
+          $prefix = Join-Path $env:LOCALAPPDATA 'BonitoAgents-app'
+          $workers = Join-Path $env:LOCALAPPDATA 'BonitoAgents\state\workers.json'
+          $out = Join-Path $env:RUNNER_TEMP 'smoke.out.log'
+          $err = Join-Path $env:RUNNER_TEMP 'smoke.err.log'
+          $app = Start-Process -FilePath (Join-Path $env:LOCALAPPDATA 'BonitoAgents-bin\bonito-agents.cmd') `
+                   -ArgumentList '--no-window', '--port=8099' -NoNewWindow -PassThru `
+                   -RedirectStandardOutput $out -RedirectStandardError $err
+          function Fail($msg) {
+            Write-Host "::error::$msg"
+            foreach ($f in $out, $err) { if (Test-Path $f) { Get-Content $f } }
+            exit 1
+          }
+          curl.exe -sf -o NUL --retry 300 --retry-connrefused --retry-delay 2 --max-time 600 http://127.0.0.1:8099/
+          if ($LASTEXITCODE -ne 0) { Fail "the installed bundle didn't serve its dashboard" }
+          function Registered { (Test-Path $workers) -and (Select-String -Quiet -Path $workers -Pattern '"hostname"') }
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not (Registered) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          if (-not (Registered)) { Fail "the installed bundle's worker never registered" }
+          Write-Host "dashboard up, worker registered"
+          # End the app, its worker and anything else the installed bundle runs.
+          taskkill.exe /T /F /PID $app.Id | Out-Null
+          Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix) } |
+            ForEach-Object { taskkill.exe /T /F /PID $_.ProcessId | Out-Null }
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
