@@ -1084,13 +1084,20 @@ mutable struct TaskToolMsg <: ToolMsg
     # shared chat lock, like the rest of the message's mutable state.
     phase::BgPhase
     watch::BgWatch
+    # The subagent's id from its launch ack (`TaskCall.agent_id`): what a
+    # SendMessage that runs it again names (`revive_subagent!`). "" until then.
+    agent_id::String
+    # How many messages the chat had when this run of the subagent started (its
+    # launch, or the SendMessage that revived it): the turn whose prompt holds
+    # its answer for it (`holds_answer`).
+    since_store::Int
 end
 
 TaskToolMsg(message::Message; description = "", is_background = false,
-            task_name = nothing) =
+            task_name = nothing, agent_id = "", output_file = "") =
     TaskToolMsg(message, description, is_background, task_name,
-                TaskActivityEntry[], Dict{String,Int}(), 0, time(), false, "", 0,
-                nothing, Executing(), BgWatch())
+                TaskActivityEntry[], Dict{String,Int}(), 0, time(), false, String(output_file), 0,
+                nothing, Executing(), BgWatch(), String(agent_id), 0)
 
 # MCP tool calls (`mcp__<server>__<tool>`). One TYPE per BonitoMCP tool, so all
 # behavior dispatches on the type — the raw `tool_name` is consulted in exactly
@@ -1426,6 +1433,20 @@ end
 # tool's name.
 restored_tool_msg(kind::AbstractString, name::AbstractString, message::Message) =
     restored_tool_msg(mcp_msg_type(name), kind, name, message)
+# A subagent comes back as one, with what its launch result said, so a
+# SendMessage after the restart can put it back in the bar (`revive_subagent!`).
+function restored_tool_msg(kind::AbstractString, name::AbstractString, message::Message,
+                           chat_dir::AbstractString)
+    name == "Task" || return restored_tool_msg(kind, name, message)    # a TaskToolMsg's `tool_key`
+    stored = load_tool_file(chat_dir, message.id)
+    stored === nothing && return TaskToolMsg(message)
+    input = get(stored, "rawInput", Dict{String,Any}())
+    resp = get(stored, "toolResponse", Dict{String,Any}())
+    return TaskToolMsg(message; description = String(get(input, "description", "")),
+                       is_background = get(input, "run_in_background", false) === true,
+                       agent_id = String(get(resp, "agentId", "")),
+                       output_file = String(get(resp, "outputFile", "")))
+end
 restored_tool_msg(::Type{<:MCPToolMsg}, kind, name, message) =
     builtin_msg_type(kind, name)(message)
 function restored_tool_msg(T::Type{<:Union{ProcessToolMsg,JsonToolMsg}}, kind, name, message)
@@ -1675,6 +1696,47 @@ function interrupt_background_tasks!(chat::ChatModel; reason::String = "agent_se
     return nothing
 end
 
+"""
+    revive_subagent!(chat, agent_id)
+
+A SendMessage ran the background subagent `agent_id` again: its card goes back
+into the bar until this run ends. The run writes on in the same transcript, after
+the end of the runs before it, so the watch follows it from the transcript's end.
+"""
+revive_subagent!(::Nothing, ::AbstractString) = nothing
+function revive_subagent!(chat::ChatModel, agent_id::AbstractString)
+    s = shared(chat)
+    revived = lock(s.lock) do
+        i = findlast(t -> t isa TaskToolMsg && t.agent_id == agent_id, s.msgs_store)
+        i === nothing && return :unknown
+        t = s.msgs_store[i]::TaskToolMsg
+        # A run that still works goes on: the SendMessage reached it while it
+        # worked. One that ended can still be in the bar, waiting for the
+        # agent's report on it: the new run takes its slot.
+        in_taskbar(t) && t.phase isa Executing && return nothing
+        isempty(t.bg_output_path) && return :no_transcript
+        t.message.chat === nothing && (t.message.chat = s)
+        stop_watch!(t)
+        t.phase = Executing()
+        t.watch = BgWatch()
+        t.bg_offset = -1
+        t.since_store = length(s.msgs_store)
+        t.feed_summarized = false
+        t.message.status = "in_progress"
+        t.message.finished_at = nothing
+        return t
+    end
+    if revived isa TaskToolMsg
+        chat_emit(chat, Dict{String,Any}("type" => "tool_update", "id" => tool_id(revived),
+            "status" => "in_progress", "summary" => revived.message.summary,
+            "background" => true, "taskbar" => true))
+        push!(chat_taskbar(chat), revived)
+    elseif revived !== nothing
+        @warn "a SendMessage ran a background agent again that the bar cannot follow" project_id = chat.project_id agent_id why = revived
+    end
+    return nothing
+end
+
 # ── Telling the agent what became of its background work ─────────────────────
 # Claude tells the agent when a background task finishes, fails or is stopped (a
 # task notification), but not when it ends any other way: a subagent an
@@ -1862,6 +1924,14 @@ function watch_output!(m::BackgroundMsg)
         @warn "background task: its worker runs a build without watch_file; it stays in the bar until it is stopped or the worker updates" worker = worker.name id = tool_id(m)
         return nothing
     end
+    # A revived subagent is followed from its transcript's end (`revive_subagent!`).
+    # A worker from before that reads it from the start, where the end of the
+    # previous run would end the watch at once.
+    if m.bg_offset < 0 && !can(worker, "watch_file_end")
+        w.ended_on = objectid(link)
+        @warn "background task: its worker runs a build that cannot follow a revived agent; it stays in the bar until it is stopped or the worker updates" worker = worker.name id = tool_id(m)
+        return nothing
+    end
     w.active = true
     Base.errormonitor(@async follow_output!(m, chat, wid, objectid(link)))
     return nothing
@@ -1877,6 +1947,8 @@ function follow_output!(m::BackgroundMsg, chat::ChatModel, wid::AbstractString, 
         m.task_bar === nothing && return close(ch)
         for frame in ch
             msg = decode_control(frame)
+            # Where a watch from the end began: a watch opened again goes on there.
+            haskey(msg, "start") && (m.bg_offset = Int(msg["start"]))
             haskey(msg, "chunk") && output_arrived!(m, chat, String(msg["chunk"]), Int(msg["offset"]))
             if get(msg, "done", false) === true
                 m.bg_offset = Int(get(msg, "offset", m.bg_offset))
@@ -4682,10 +4754,13 @@ build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.BashCall) =
                 command = tc.command, description = tc.description,
                 is_background = tc.run_in_background)
 
-build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall) =
-    TaskToolMsg(tool_message(tc, chat);
-                description = tc.description, is_background = tc.run_in_background,
-                task_name = tc.task_name)
+function build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.TaskCall)
+    m = TaskToolMsg(tool_message(tc, chat);
+                    description = tc.description, is_background = tc.run_in_background,
+                    task_name = tc.task_name)
+    m.since_store = lock(() -> length(shared(chat).msgs_store), shared(chat).lock)
+    return m
+end
 
 function build_tool_msg(chat::ChatModel, tc::AgentClientProtocol.MCPCall)
     T = mcp_msg_type(tc.tool_name)
@@ -4984,6 +5059,7 @@ function update_from_snap!(b::TaskToolMsg, snap)
         b.bg_output_path = snap.output_file
         b.bg_offset      = 0
     end
+    isempty(b.agent_id) && (b.agent_id = snap.agent_id)
     return nothing
 end
 # Streamed tool input: the typed argument fields were parsed at build time,
@@ -5007,7 +5083,10 @@ function update_from_snap!(b::JuliaEvalCall, snap)
     return nothing
 end
 function update_from_snap!(b::BuiltinToolMsg, snap)
-    snap isa AgentClientProtocol.GenericTool && apply_input!(b, snap.raw_input)
+    snap isa AgentClientProtocol.GenericTool || return nothing
+    apply_input!(b, snap.raw_input)
+    # A SendMessage that ran a finished or stopped background subagent again.
+    isempty(snap.resumed_agent) || revive_subagent!(tool_chat(b), snap.resumed_agent)
     return nothing
 end
 
@@ -6399,11 +6478,20 @@ was_cancelled(o::TurnOutcome) = o.stop_reason == "cancelled"
 said_something(chat::ChatModel, o::TurnOutcome) =
     lock(() -> length(shared(chat).msgs_store), shared(chat).lock) > o.nstore0
 
+# Whether claude-agent-acp holds the answer to the turn that began with the
+# store at `nstore0`: it does while a background subagent the turn started or
+# revived runs (acp-agent.js `turnAwaitingSubagents`), and answers once it ends
+# or the next prompt arrives.
+holds_answer(chat::ChatModel, nstore0::Int) =
+    any(t -> t isa TaskToolMsg && t.phase isa Executing && t.since_store >= nstore0,
+        chat_taskbar(chat).items[])
+
 # Wait a turn out and then run the end-of-turn chores.
 #
 # Nothing is drained here — the main consumer renders the agent's messages. This
-# waits for the agent to stop talking (its own stopReason), then for the renderer
-# to catch up to that point, then tidies up after both.
+# waits for the agent to stop talking (its own stopReason, or the end of its
+# reply when the answer is held), then for the renderer to catch up to that
+# point, then tidies up after both.
 #
 # The chores are in a `finally` because they have to run for a turn that broke as
 # much as for one that ended: a chat whose spinner never stops and whose
@@ -6421,11 +6509,20 @@ function finish_turn!(chat::ChatModel, turn;
     failure = ""
     connection_lost = false
     recovered = false
+    # The agent's reply is over and its answer held (`holds_answer`): the turn
+    # ends at the reply, and its stop reason comes with the answer, later.
+    held = false
     try
+        # The reply ends first, and everything up to its end is rendered before
+        # we ask whether the answer is held: the subagent it waits on is in the
+        # bar by then.
+        AgentClientProtocol.wait_replied(turn)
+        wait_rendered!(chat, turn.reply)
+        held = !AgentClientProtocol.isover(turn) && holds_answer(chat, nstore0)
         # The span settling (end_turn / cancelled) says the agent is done
         # talking. It does NOT say we are done showing it — that is the barrier
         # in the `finally`, and both are needed, in that order.
-        result = AgentClientProtocol.wait_turn!(turn)
+        result = held ? nothing : AgentClientProtocol.wait_turn!(turn)
         if result isa AbstractDict
             stop_reason = String(get(result, "stopReason", ""))
             # Codex ends a FAILED turn (out of credits, …) as a plain `end_turn`
@@ -6458,8 +6555,8 @@ function finish_turn!(chat::ChatModel, turn;
         # The barrier: every chore below reads the store, so everything this turn
         # said has to be IN it. We wait on the turn's OWN end marker rather than
         # injecting one, so nothing that arrives after it is swept into this
-        # turn's last bubble.
-        wait_rendered!(chat, turn.flush)
+        # turn's last bubble. A held turn ends where its reply did.
+        wait_rendered!(chat, held ? turn.reply : turn.flush)
         # A successful response without a remaining failure is positive recovery,
         # including after a quota reset. Stop and failed turns prove no recovery.
         # A newer turn may already be running after a steering handoff.
@@ -6490,7 +6587,8 @@ function finish_turn!(chat::ChatModel, turn;
         # A steering handoff can have its successor already on the wire.
         # The older span must not dismiss the successor's questions or nudge it.
         if isempty(AgentClientProtocol.open_turns(chat))
-            sweep_pending_asks!(chat)
+            # A held answer's subagent can still ask through it.
+            held || sweep_pending_asks!(chat)
             report_silent_turn!(chat, outcome)
             continue_yolo!(chat, outcome)
         end
@@ -7412,7 +7510,8 @@ replayed_tool_msg(tc::AgentClientProtocol.BashCall) =
 replayed_tool_msg(tc::AgentClientProtocol.TaskCall) =
     TaskToolMsg(tool_message(tc, nothing; finished = true);
                 description = tc.description, is_background = tc.run_in_background,
-                task_name = tc.task_name)               # replayed = history, never in the bar
+                task_name = tc.task_name,                # replayed = history, never in the bar…
+                agent_id = tc.agent_id, output_file = tc.output_file)   # …until a SendMessage revives it
 function replayed_tool_msg(tc::AgentClientProtocol.MCPCall)
     T = mcp_msg_type(tc.tool_name)
     m = build_mcp_msg(T, tool_message(tc, nothing; finished = true), tc.server, tc.tool_name)

@@ -1346,3 +1346,4 @@ end
 # unregistered-and-working must not).
 include(joinpath(@__DIR__, "orphan_cancel_test.jl"))
 include(joinpath(@__DIR__, "idle_compaction_test.jl"))
+include(joinpath(@__DIR__, "bg_subagent_hold_test.jl"))

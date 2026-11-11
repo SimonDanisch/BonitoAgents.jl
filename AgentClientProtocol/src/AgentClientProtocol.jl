@@ -18,7 +18,7 @@ export Client, MCPServer, ImageAttachment, prompt!, wait_turn!, cancel!, set_con
 export Transport, WorkerTransport
 export Handler, DiscardHandler
 export ConnectionClosed
-export Turn, PromptTurn, AgentTurn, TurnStarted, open_turns, isover, wait_over
+export Turn, PromptTurn, AgentTurn, TurnStarted, open_turns, isover, wait_over, isreplied, wait_replied
 public wait_closed
 export SessionUpdate, AgentMessageChunk, UserMessageChunk, AgentThoughtChunk
 export ToolCallNotif, ToolCallUpdateNotif, PlanUpdate, UnknownUpdate

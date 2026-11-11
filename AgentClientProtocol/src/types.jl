@@ -336,14 +336,30 @@ A `session/prompt` of ours. Over at the agent's answer (`response` takes the
 stop reason or the error) or when the connection dies. Its `flush` goes on the
 main stream at the answer's frame, so steering cannot merge the next prompt's
 text into this one's bubble.
+
+The agent's reply to it can be over before the answer: claude-agent-acp holds the
+answer while a background subagent that the prompt started or revived runs, and
+answers when the subagent is done or the next prompt arrives. `replied` is closed
+where the reply ends (the result of its cycle, or the answer if that comes first),
+and `reply` goes on the main stream there. A replied prompt is no longer an open
+turn: what the agent does after it is a cycle of its own (`AgentTurn`).
 """
 struct PromptTurn <: Turn
     id::Int
     response::Channel{Any}
     flush::StreamFlush
     over::Channel{Nothing}
+    reply::StreamFlush
+    replied::Channel{Nothing}
 end
-PromptTurn(id::Int) = PromptTurn(id, Channel{Any}(1), StreamFlush(), Channel{Nothing}(0))
+PromptTurn(id::Int) = PromptTurn(id, Channel{Any}(1), StreamFlush(), Channel{Nothing}(0),
+                                 StreamFlush(), Channel{Nothing}(0))
+
+"Whether the agent's reply to `t` is over (its answer may still be held)."
+isreplied(t::PromptTurn) = !isopen(t.replied)
+
+"Block until the agent's reply to `t` is over: its result, its answer, or teardown."
+wait_replied(t::PromptTurn) = (wait_closed(t.replied); nothing)
 
 """
 A cycle the agent started itself (needs `Connection(...; agent_turns = true)`).

@@ -11,6 +11,8 @@
 #          {done:true, offset}         the writer closed the file
 #          {done:true, offset, marker} the first of `markers` to appear (a server
 #                                      from before `markers` sends one `marker`)
+#          {start}                     where a marker watch with a negative
+#                                      `offset` began: the file's end then
 #
 # The watch ends with `done`, or when the server closes the channel.
 #
@@ -210,6 +212,13 @@ function watch_until_marker(ch, path::AbstractString, offset::Int, markers::Vect
     # two reads is found.
     overlap = maximum(ncodeunits, markers)
     from = max(0, offset - overlap)
+    # A subagent run again writes on after the end of its earlier runs, so its
+    # watch begins at the file's end, where nothing of this run can be split;
+    # the server keeps where, for a watch it opens again later.
+    if offset < 0
+        from = filesize(path)
+        send_watch(ch, Dict("start" => from))
+    end
     watch_changes(path, stop) do
         bytes = read_from(path, from; max_bytes = typemax(Int))
         found = first_marker(String(copy(bytes)), markers)

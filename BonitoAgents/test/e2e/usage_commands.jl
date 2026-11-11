@@ -18,9 +18,10 @@ const CMDS = [(name = "compact", description = "Compact the chat history"),
               (name = "review", description = "Review a pull request", hint = "[pr]"),
               (name = "code-review", description = "Review the current diff")]
 
-agent_script(_prompt) = [TK.usage(21784, 200000; cost = 0.42),
-                         TK.commands(CMDS),
-                         TK.text("done.")]
+# The usage with a cost comes at the reply's result, after the reply.
+agent_script(_prompt) = [TK.commands(CMDS),
+                         TK.text("done."),
+                         TK.usage(21784, 200000; cost = 0.42)]
 
 # Pane-scoped helpers (the shared soak server keeps other panes mounted).
 const PANE = "document.querySelector('.bt-chatpane[aria-hidden=false]')"

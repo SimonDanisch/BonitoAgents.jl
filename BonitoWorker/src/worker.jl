@@ -229,7 +229,8 @@ function hello(w::Worker)
         # The requests this worker knows beyond the original set: the server
         # sends a request only to a worker that lists it, so an older one is
         # skipped instead of waited on (it ignores an unknown request unanswered).
-        "capabilities"  => ["kill_processes", "watch_file", "managed_process", "sync_paths", "password_prompts"],
+        "capabilities"  => ["kill_processes", "watch_file", "watch_file_end", "managed_process", "sync_paths",
+                            "password_prompts"],
     )
 end
 

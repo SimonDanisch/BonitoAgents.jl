@@ -216,7 +216,12 @@ mutable struct GenericTool <: ToolCall
     stream::MessageStream{ToolCall}
     name::String                       # actual tool name from `_meta.claudeCode.toolName`
     raw_input::Dict{String,Any}
+    # The background subagent this call ran again, named in its result
+    # (`resumed_agent_id`): "" for every other call.
+    resumed_agent::String
 end
+GenericTool(id, kind, title, status, content, stream, name, raw_input) =
+    GenericTool(id, kind, title, status, content, stream, name, raw_input, "")
 
 mutable struct BashCall <: ToolCall
     id::String
@@ -259,7 +264,15 @@ mutable struct TaskCall <: ToolCall
     # file (fd-close) exactly like a background bash's output file. "" until the
     # async-launch update arrives.
     output_file::String
+    # The subagent's id (`agentId` of the same launch result): what a later
+    # SendMessage names when it runs the subagent again. "" until the launch ack.
+    agent_id::String
 end
+# Without the launch result's fields, as tests and the initial call build it.
+TaskCall(id, kind, title, status, content, stream, description, prompt, run_in_background,
+         task_name, output_file) =
+    TaskCall(id, kind, title, status, content, stream, description, prompt, run_in_background,
+             task_name, output_file, "")
 
 mutable struct MCPCall <: ToolCall
     id::String
@@ -430,20 +443,42 @@ for sdk_name in (:Task, :Agent)
             get(n.raw_input, "run_in_background", false) === true,
             _opt_str(get(n.raw_input, "name", nothing)),
             something(async_output_file(n.raw), ""),   # usually "" on the initial call
+            something(async_agent_id(n.raw), ""),
         )
     end
 end
 
-# The async subagent's transcript file, dug out of a tool_call(_update)'s
-# `_meta.claudeCode.toolResponse.outputFile` (present on the `async_launched`
-# result). `nothing` when absent (non-async tools, or before the launch ack).
-function async_output_file(raw)
+# What Claude Code says a call did, in a tool_call(_update)'s
+# `_meta.claudeCode.toolResponse` (its structured tool result). `nothing` before
+# the result, and for agents that send none.
+function claude_tool_response(raw)
     raw isa AbstractDict || return nothing
     meta = get(raw, "_meta", nothing); meta isa AbstractDict || return nothing
     cc = get(meta, "claudeCode", nothing); cc isa AbstractDict || return nothing
-    tr = get(cc, "toolResponse", nothing); tr isa AbstractDict || return nothing
-    of = get(tr, "outputFile", nothing)
-    (of isa AbstractString && !isempty(of)) ? String(of) : nothing
+    tr = get(cc, "toolResponse", nothing)
+    return tr isa AbstractDict ? tr : nothing
+end
+
+# A non-empty string field of the tool response, or `nothing`.
+function tool_response_string(raw, key::AbstractString)
+    tr = claude_tool_response(raw)
+    tr === nothing && return nothing
+    v = get(tr, key, nothing)
+    return (v isa AbstractString && !isempty(v)) ? String(v) : nothing
+end
+
+# The async subagent's transcript file and its id, from the `async_launched`
+# result. `nothing` when absent (non-async tools, or before the launch ack).
+async_output_file(raw) = tool_response_string(raw, "outputFile")
+async_agent_id(raw) = tool_response_string(raw, "agentId")
+
+# The background subagent a successful call ran again: Claude Code names it in
+# the result of a SendMessage to a subagent that had finished or was stopped
+# (`resumedAgentId`), as claude-agent-acp reads it (`resumedNativeSubagentId`).
+function resumed_agent_id(raw)
+    tr = claude_tool_response(raw)
+    (tr === nothing || get(tr, "success", false) !== true) && return nothing
+    return tool_response_string(raw, "resumedAgentId")
 end
 
 # MCP tool names land here as `mcp__<server>__<tool>` (see the BonitoMCP
@@ -468,7 +503,7 @@ function build_tool_call(::Val{name}, n::ToolCallNotif) where {name}
     return GenericTool(
         n.tool_call_id, n.kind, n.title, n.status,
         Vector{ToolContent}(n.content), MessageStream{ToolCall}(),
-        s, n.raw_input,
+        s, n.raw_input, "",
     )
 end
 
@@ -497,7 +532,7 @@ function build_tool_call(::Val{Symbol("")}, n::ToolCallNotif)
     return GenericTool(
         n.tool_call_id, n.kind, n.title, n.status,
         Vector{ToolContent}(n.content), MessageStream{ToolCall}(),
-        "", n.raw_input,
+        "", n.raw_input, "",
     )
 end
 
@@ -515,7 +550,7 @@ GenericTool(id::AbstractString, kind::AbstractString, title::AbstractString,
             stream::MessageStream = MessageStream{ToolCall}()) =
     GenericTool(String(id), String(kind), String(title), String(status),
                 Vector{ToolContent}(content), stream,
-                "", Dict{String,Any}())
+                "", Dict{String,Any}(), "")
 
 # ── Subagent activity ────────────────────────────────────────────────────────
 # One subagent event, distilled from a `SubagentUpdate` for the subagent that
@@ -756,17 +791,33 @@ function parse_update!(out, st, u::ToolCallUpdateNotif)   # routed by id; never 
         parsed = parse_json_object(args_text)
         parsed === nothing || merge_late_input!(tc, parsed)
     end
-    # Async subagent: the `async_launched` update carries the transcript
-    # `outputFile` in `_meta.claudeCode.toolResponse` — the only deterministic
-    # completion signal (the tool_call itself is `completed` at launch). Capture
-    # it onto the TaskCall so the snapshot below hands it downstream BEFORE the
-    # launch-ack `completed` closes the tool.
-    if tc isa TaskCall && isempty(tc.output_file)
-        of = async_output_file(u.raw)
-        of === nothing || (tc.output_file = of)
-    end
+    # What the call's result says it did, captured so the snapshot below hands
+    # it downstream BEFORE the result's `completed` closes the tool.
+    response_arrived!(tc, u.raw)
     put!(tc.stream, tc)
     is_terminal(tc.status) && (close(tc); delete!(st.tools, tc.id))
+    return nothing
+end
+
+# Async subagent: the `async_launched` update carries the transcript `outputFile`
+# and the subagent's id in `_meta.claudeCode.toolResponse`. The file is the only
+# deterministic completion signal (the tool_call itself is `completed` at launch).
+response_arrived!(::ToolCall, raw) = nothing
+function response_arrived!(tc::TaskCall, raw)
+    if isempty(tc.output_file)
+        of = async_output_file(raw)
+        of === nothing || (tc.output_file = of)
+    end
+    if isempty(tc.agent_id)
+        id = async_agent_id(raw)
+        id === nothing || (tc.agent_id = id)
+    end
+    return nothing
+end
+# A SendMessage that ran a finished or stopped background subagent again.
+function response_arrived!(tc::GenericTool, raw)
+    id = resumed_agent_id(raw)
+    id === nothing || (tc.resumed_agent = id)
     return nothing
 end
 

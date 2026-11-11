@@ -189,6 +189,11 @@ jobs:
         # Also a path [source] of BonitoAgents; its test deps are HTTP and stdlibs.
         run: julia --project=BonitoAgents WorkerLink/test/runtests.jl
 
+      - name: AgentClientProtocol tests (captured agent wires)
+        # A path [source] too, with HTTP, JSON and stdlibs as test deps. Replays
+        # the wires of real agents (test/fixtures), e.g. a held answer.
+        run: julia --project=BonitoAgents AgentClientProtocol/test/runtests.jl
+
   # ── E2E suite — sharded across parallel jobs ──────────────────────────────
   e2e:
     name: 'E2E ${{ matrix.shard }}/8'

@@ -119,6 +119,25 @@ done(msgs) = any(m -> get(m, "done", false) === true, msgs)
         @test last(watch(header(f); timeout = 5.0))["marker"] == done_mk
     end
 
+    # A subagent that a SendMessage runs again writes on in the same transcript,
+    # after its earlier run's end marker. Its watch (a negative offset) begins at
+    # the file's end, says where, and ends at this run's marker only.
+    @testset "a revived subagent's transcript is followed from its end" begin
+        marker = "\"stop_reason\":\"end_turn\""
+        earlier = "{\"stop_reason\":\"end_turn\"}\n"
+        f = tempname(); write(f, earlier)
+        header = Dict("path" => f, "offset" => -1, "until" => "marker", "markers" => [marker])
+        msgs = watch(header; timeout = 1.0)
+        @test !done(msgs)
+        @test first(msgs)["start"] == ncodeunits(earlier)
+        msgs = watch(header; on_ready = () -> @async(begin
+            sleep(0.3); open(io -> write(io, "{\"stop_reason\":\"tool_use\"}\n"), f, "a")
+            sleep(0.3); open(io -> write(io, "{\"stop_reason\":\"end_turn\"}\n"), f, "a")
+        end))
+        @test done(msgs)
+        @test last(msgs)["marker"] == marker
+    end
+
     @testset "file_writer_pids: the writer while it runs, nobody after" begin
         Sys.islinux() || return
         f = tempname()

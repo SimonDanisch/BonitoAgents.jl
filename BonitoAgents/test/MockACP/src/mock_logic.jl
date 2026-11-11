@@ -93,6 +93,10 @@ STRICT_LOAD::Bool       = false
 TOOL_SEQ::Int           = 1
 const CONFIG_OPTIONS = Ref{Vector{Any}}(Any[])
 const ACTIVE_PROMPTS = Ref(0)
+# The prompt whose answer a `hold` event keeps back, as claude-agent-acp holds the
+# answer while a background subagent the prompt started or revived runs. The next
+# prompt hands it off: `put!` asks the holder to answer, which then clears this.
+const HELD = Ref{Union{Nothing,Channel{Nothing}}}(nothing)
 take_tool_seq!() = (global TOOL_SEQ += 1; TOOL_SEQ - 1)
 
 function _configure!()
@@ -560,6 +564,7 @@ function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
     stop_reason = "end_turn"
     resp_meta = nothing   # the prompt response's `_meta` (`codex_failure`)
     post_blocks = Any[]   # `post_turn` events, emitted AFTER the prompt response
+    holding = nothing     # this prompt's `HELD` channel while a `hold` keeps its answer
     while !eof(sock)
         # Cancel arriving mid-stream (set by the concurrently-running stdin
         # reader in `dispatch_loop`) ends the turn the way real claude does:
@@ -1018,6 +1023,32 @@ function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
             # past end_turn (bg-subagent activity, the auto-wake completion
             # announcement) — see emit_post_event.
             push!(post_blocks, ev)
+        elseif et == "recorded"
+            # A captured frame's update, verbatim (TestKit's `recorded`).
+            u = ev["update"]
+            upd(String(u["sessionUpdate"]), Dict{String,Any}(k => v for (k, v) in u if k != "sessionUpdate"))
+        elseif et == "hold"
+            # The reply is over (the script sent its result first); the answer
+            # waits until `until_file` exists, the script's stand-in for the
+            # subagent ending. The next prompt hands it off instead: the adapter
+            # answers a held prompt with its recorded outcome at once, and what
+            # the script had for after the subagent is dropped.
+            holding = Channel{Nothing}(1)
+            HELD[] = holding
+            until_file = String(ev["until_file"])
+            while !(isready(holding) || isfile(until_file) || cancelled[])
+                sleep(0.05)
+            end
+            if isready(holding)
+                while !eof(sock)
+                    tail = try readline(sock) catch e; e isa Base.IOError || rethrow(); break end
+                    isempty(tail) && continue
+                    String(get(JSON.parse(tail), "type", "")) == "end" && break
+                end
+                break
+            end
+            HELD[] = nothing
+            holding = nothing
         elseif et == "end"
             stop_reason = String(get(ev, "stopReason", "end_turn"))
             break
@@ -1028,6 +1059,7 @@ function run_dispatcher_prompt(prompt_id; prompt_text = LAST_PROMPT[])
     result = Dict{String,Any}("stopReason" => stop_reason)
     resp_meta === nothing || (result["_meta"] = resp_meta)
     resp(prompt_id, result)
+    holding === nothing || (HELD[] = nothing)
     # Between-turn emission: each post_turn block waits its delay, then streams
     # its frames with NO turn open. Async so the dispatcher loop is free to
     # read the next prompt — same concurrency the real agent has.
@@ -1184,6 +1216,15 @@ function dispatch_loop()
             prompt_blocks = get(params, "prompt", Any[])
             LAST_PROMPT[] = join(String(get(b, "text", "")) for b in prompt_blocks
                                   if isa(b, AbstractDict) && get(b, "type", "") == "text")
+            # A held answer goes out before this prompt starts: the adapter hands
+            # it off at this prompt's echo.
+            held = HELD[]
+            if held !== nothing
+                isready(held) || put!(held, nothing)
+                while HELD[] === held
+                    sleep(0.01)
+                end
+            end
             # Run the turn CONCURRENTLY with the stdin reader. The real agent
             # processes `session/cancel` notifications while a turn is in
             # flight; if we ran `handle_prompt` inline here the loop couldn't

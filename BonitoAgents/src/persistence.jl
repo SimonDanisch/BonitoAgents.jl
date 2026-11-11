@@ -147,6 +147,11 @@ function persist_tool_content!(chat_dir::AbstractString, tc::AgentClientProtocol
     # in-RAM raw_input is gone.
     ri = raw_input_of(tc)
     ri === nothing || isempty(ri) || (d["rawInput"] = ri)
+    # What the call's result said, for the card rebuilt after a restart: a
+    # background subagent's id and transcript, which a SendMessage that runs it
+    # again names (`revive_subagent!`).
+    resp = tool_response_of(tc)
+    resp === nothing || (d["toolResponse"] = resp)
     open(path, "w") do io
         JSON.print(io, d)
     end
@@ -159,10 +164,18 @@ raw_input_of(tc::AgentClientProtocol.MCPCall)     = tc.raw_input
 # BashCall extracts its typed fields at parse time and drops the dict —
 # reconstruct the bits history reload needs (the description drives the
 # pill title; the command feeds the tooltip).
+raw_input_of(tc::AgentClientProtocol.TaskCall) = Dict{String,Any}(
+    "description" => tc.description, "prompt" => tc.prompt,
+    "run_in_background" => tc.run_in_background)
 raw_input_of(tc::AgentClientProtocol.BashCall) = Dict{String,Any}(
     "command" => tc.command,
     "run_in_background" => tc.run_in_background,
     (tc.description === nothing ? () : ("description" => tc.description,))...)
+
+tool_response_of(::AgentClientProtocol.ToolCall) = nothing
+tool_response_of(tc::AgentClientProtocol.TaskCall) =
+    isempty(tc.agent_id) ? nothing :
+    Dict{String,Any}("agentId" => tc.agent_id, "outputFile" => tc.output_file)
 
 # The arguments recorded with the tool snapshot, for consumers running
 # after a history reload (the ToolMsg's in-RAM fields are gone).
@@ -574,7 +587,8 @@ function load_history(session::ChatSession)::Vector{ChatMsg}
             # cards that only draw their result (bt_process, the JSON tools).
             push!(msgs, restored_tool_msg(string(kind), string(name),
                 Message(string(id), string(kind), string(name), tool_title,
-                        string(status), summary, time(), time(), nothing)))
+                        string(status), summary, time(), time(), nothing),
+                dirname(session.path)))
         elseif category == "plan"
             entries = PlanEntry[]
             for line in split(body, '\n')

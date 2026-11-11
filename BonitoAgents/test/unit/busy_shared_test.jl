@@ -23,6 +23,7 @@
     const ACP = BT.AgentClientProtocol
     span = ACP.PromptTurn(1)
     put!(span.response, Dict{String,Any}("stopReason" => "end_turn"))
+    close(span.replied)                  # as the connection does at the answer
     BT.while_busy(tab) do
         # Claimed through the TAB, but the flag and the spinner are the parent's.
         @test parent.turn_in_flight[] == true

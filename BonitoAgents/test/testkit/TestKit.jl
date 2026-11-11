@@ -131,11 +131,93 @@ post_turn(events::Vector; delay_ms = 300) =
 """
     recorded(update) -> Dict
 
-A `post_turn` event that emits one `session/update` exactly as a real agent sent
-it: `update` is the frame's `params.update`, from a captured wire such as
-AgentClientProtocol/test/fixtures/claude_idle_compaction_wire.jsonl.
+An event, in a turn or a `post_turn`, that emits one `session/update` exactly as
+a real agent sent it: `update` is the frame's `params.update`, from a captured
+wire such as AgentClientProtocol/test/fixtures/claude_idle_compaction_wire.jsonl.
 """
 recorded(update::AbstractDict) = Dict{String,Any}("type" => "recorded", "update" => update)
+
+"""
+    hold(until_file) -> Dict
+
+Keep the prompt's answer back until `until_file` exists, or until the next prompt
+arrives, which gets the answer out first. claude-agent-acp holds the answer while
+a background subagent that the prompt started or revived runs
+(AgentClientProtocol/test/fixtures/claude_bg_subagent_hold_wire.jsonl). Put the
+reply's result (`reply_result`) before it, and what the agent says once the
+subagent ended after it.
+"""
+hold(until_file::AbstractString) = Dict{String,Any}("type" => "hold", "until_file" => String(until_file))
+
+"""
+    reply_result(; origin = "human") -> Dict
+
+The `usage_update` claude-agent-acp sends at a cycle's result: with the session's
+cost, tagged with the cycle's origin (`human` for the reply to a prompt,
+`task-notification` for the agent's report on finished background work).
+"""
+reply_result(; origin::AbstractString = "human") = usage(40000, 1000000; cost = 0.25, origin)
+
+"""
+    bg_agent_launch(id, agent_id, output_file; description, prompt) -> Vector
+
+The frames claude-agent-acp 0.101 sends when the agent starts a subagent in the
+background with its Agent tool, as captured (claude_bg_subagent_hold_wire.jsonl):
+the call, its streamed arguments, the launch result naming the subagent and its
+transcript, and the `completed` that comes with the launch.
+"""
+function bg_agent_launch(id::AbstractString, agent_id::AbstractString, output_file::AbstractString;
+                         description::AbstractString = "helper",
+                         prompt::AbstractString = "Work in the background, then reply done.")
+    meta = Dict{String,Any}("claudeCode" => Dict{String,Any}("toolName" => "Agent"))
+    input = Dict{String,Any}("description" => description, "prompt" => prompt,
+                             "subagent_type" => "general-purpose", "run_in_background" => true)
+    launched = "Async agent launched successfully.\nagentId: $(agent_id)\noutput_file: $(output_file)"
+    return [
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call", "toolCallId" => id, "_meta" => meta,
+            "name" => "Agent", "rawInput" => Dict{String,Any}(), "status" => "pending",
+            "title" => "Task", "kind" => "think", "content" => Any[])),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+            "_meta" => meta, "rawInput" => input, "title" => description)),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+            "_meta" => Dict{String,Any}("claudeCode" => Dict{String,Any}("toolName" => "Agent",
+                "toolResponse" => Dict{String,Any}("isAsync" => true, "status" => "async_launched",
+                    "agentId" => agent_id, "description" => description, "prompt" => prompt,
+                    "outputFile" => output_file, "canReadOutputFile" => true, "canContinueAgent" => true))))),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+            "_meta" => meta, "status" => "completed",
+            "content" => [Dict{String,Any}("type" => "content",
+                "content" => Dict{String,Any}("type" => "text", "text" => launched))])),
+    ]
+end
+
+"""
+    send_message_resume(id, agent_id; message) -> Vector
+
+The frames of a SendMessage call that runs the finished or stopped subagent
+`agent_id` again, as captured: the call, its arguments, the result naming the
+resumed subagent (`resumedAgentId`), and its `completed`.
+"""
+function send_message_resume(id::AbstractString, agent_id::AbstractString;
+                             message::AbstractString = "Go on with the next step.")
+    meta = Dict{String,Any}("claudeCode" => Dict{String,Any}("toolName" => "SendMessage"))
+    result = Dict{String,Any}("success" => true, "message" => "Resuming agent $(first(agent_id, 7))",
+                              "resumedAgentId" => agent_id, "revivedAgentId" => agent_id)
+    return [
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call", "toolCallId" => id, "_meta" => meta,
+            "name" => "SendMessage", "rawInput" => Dict{String,Any}(), "status" => "pending",
+            "title" => "SendMessage", "kind" => "other", "content" => Any[])),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id, "_meta" => meta,
+            "rawInput" => Dict{String,Any}("to" => agent_id, "summary" => "more work", "message" => message))),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id,
+            "_meta" => Dict{String,Any}("claudeCode" => Dict{String,Any}("toolName" => "SendMessage",
+                "toolResponse" => result)))),
+        recorded(Dict{String,Any}("sessionUpdate" => "tool_call_update", "toolCallId" => id, "_meta" => meta,
+            "status" => "completed",
+            "content" => [Dict{String,Any}("type" => "content",
+                "content" => Dict{String,Any}("type" => "text", "text" => JSON.json(result)))])),
+    ]
+end
 
 # Scripted `session/load` replay: `REPLAY_FN[]` maps a session id to the event
 # list (user/text/thought/tool) the mock re-streams as the resumed session's

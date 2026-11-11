@@ -5,6 +5,17 @@ What changed in each BonitoAgents release. The guides are at
 [A Day with BonitoAgents](https://agents.bonito.sh/stable/story.html) shows how the
 pieces fit together.
 
+## Unreleased
+
+### Fixed
+
+- A chat is free again once Claude's reply is over, also while a background
+  agent it started runs. Claude's adapter holds the prompt open until that agent
+  ends, so the chat looked busy and messages queued "for when done" waited for
+  the background agent, sometimes for an hour.
+- A background agent that Claude runs again with SendMessage is back in the task
+  bar until it ends, also one from before a server restart.
+
 ## v0.2.1
 
 Build your own apps without leaving the chat. An agent writes the app package,

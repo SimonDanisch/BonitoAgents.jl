@@ -226,10 +226,18 @@ end
 """
     open_turns(conn) -> Vector{Turn}
 
-The turns open right now: our prompts the agent has not answered, and the
-agent's own turn if one runs. Empty means the agent is not working.
+The turns open right now: our prompts the agent is still replying to, and the
+agent's own turn if one runs. Empty means the agent is not working. A prompt
+whose reply is over but whose answer the agent holds (`isreplied`) is not open.
 """
 open_turns(conn::Connection) = lock(conn.lock) do
+    turns = Turn[p for p in conn.active_prompts if !isreplied(p)]
+    conn.agent_turn === nothing || push!(turns, conn.agent_turn)
+    turns
+end
+
+# Every turn the connection still has to end, replied prompts included.
+all_turns(conn::Connection) = lock(conn.lock) do
     turns = Turn[conn.active_prompts...]
     conn.agent_turn === nothing || push!(turns, conn.agent_turn)
     turns
@@ -297,7 +305,7 @@ function dispatcher_loop(conn::Connection)
                 close(ch)
             end
             empty!(conn.capture)
-            turns = open_turns(conn)
+            turns = all_turns(conn)
             empty!(conn.active_prompts)
             conn.agent_turn = nothing
             for (_, ch) in conn.pending
@@ -311,6 +319,7 @@ function dispatcher_loop(conn::Connection)
         # is over", so a turn that just evaporated on teardown would leave them
         # waiting on a marker nobody will ever send.
         for t in stranded
+            reply_over!(conn, t)
             deliver_main!(conn, t.flush)
             end_turn!(t)
         end
@@ -721,6 +730,7 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
             # A non-cancelled answer means the agent's own turn is done; a
             # `cancelled` one can arrive while it still runs.
             haskey(msg, "result") && !cancelled && end_agent_turn!(conn)
+            reply_over!(conn, ended)
             deliver_main!(conn, StreamFlush(ended.flush.done, cancelled))
         end
         if ch !== nothing
@@ -741,20 +751,22 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
 end
 
 # One main-thread frame: open an agent turn ahead of it, deliver it (always,
-# cancel or not), end the turn behind it.
+# cancel or not), end what its result ends behind it.
 function main_thread!(conn::Connection, update::SessionUpdate)
     open_agent_turn!(conn, update)
     deliver_main!(conn, update)
-    agent_turn_ends!(conn, update)
+    cycle_ended!(conn, update)
     return nothing
 end
 
 # A work frame while no turn is open: the agent started a cycle of its own.
-# Only for an agent that marks where those end (`agent_turns`).
+# Only for an agent that marks where those end (`agent_turns`). A prompt whose
+# reply is over is no turn: what the agent does after it, while the answer is
+# held, is its own cycle (the report on a background subagent that finished).
 function open_agent_turn!(conn::Connection, update::SessionUpdate)
     (conn.agent_turns && is_agent_work(update)) || return nothing
     turn = lock(conn.lock) do
-        (isempty(conn.active_prompts) && conn.agent_turn === nothing) || return nothing
+        (all(isreplied, conn.active_prompts) && conn.agent_turn === nothing) || return nothing
         conn.agent_turn = AgentTurn()
     end
     turn === nothing && return nothing
@@ -764,12 +776,42 @@ function open_agent_turn!(conn::Connection, update::SessionUpdate)
     return nothing
 end
 
-# The result of the agent's own cycle carries its origin; that is its end. The
-# same tag on a result inside a prompt of ours (a cycle folded into our turn)
-# ends nothing: no turn of the agent's is open then.
-agent_turn_ends!(conn::Connection, u::UsageUpdateNotif) =
-    is_autonomous_origin(u.origin_kind) ? end_agent_turn!(conn) : nothing
-agent_turn_ends!(::Connection, ::SessionUpdate) = nothing
+# Where a cycle ends. claude-agent-acp sends a `usage_update` with the session's
+# cost at each cycle's result and at no other time, tagged with the cycle's
+# origin (`agent_turns`):
+#
+#   * an autonomous origin: the agent's own cycle is over, and with it its turn.
+#     The same tag on a result inside a prompt of ours (a cycle folded into our
+#     turn) ends nothing: no turn of the agent's is open then.
+#   * any other origin (`human`, none): the reply to our oldest prompt still
+#     being replied to is over. The adapter answers it now, or holds the answer
+#     while a background subagent the prompt started or revived runs
+#     (test/fixtures/claude_bg_subagent_hold_wire.jsonl). With no such prompt,
+#     the cycle went on after a replied prompt (a message steered into a held
+#     answer), and is the agent's own.
+function cycle_ended!(conn::Connection, u::UsageUpdateNotif)
+    if is_autonomous_origin(u.origin_kind)
+        end_agent_turn!(conn)
+    elseif conn.agent_turns && u.cost_amount !== nothing
+        replying = lock(conn.lock) do
+            i = findfirst(p -> !isreplied(p), conn.active_prompts)
+            i === nothing ? nothing : conn.active_prompts[i]
+        end
+        replying === nothing ? end_agent_turn!(conn) : reply_over!(conn, replying)
+    end
+    return nothing
+end
+cycle_ended!(::Connection, ::SessionUpdate) = nothing
+
+# The reply to `p` is over: mark where on the main stream, then say so. Once;
+# only the dispatcher calls it.
+function reply_over!(conn::Connection, p::PromptTurn)
+    isopen(p.replied) || return nothing
+    deliver_main!(conn, p.reply)
+    close(p.replied)
+    return nothing
+end
+reply_over!(::Connection, ::AgentTurn) = nothing
 
 function end_agent_turn!(conn::Connection)
     turn = lock(conn.lock) do
