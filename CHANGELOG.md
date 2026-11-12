@@ -12,6 +12,9 @@ pieces fit together.
 - A `bt_process` wait shows its job while it waits: the command, where it runs
   and its output, which updates as the job writes. The card used to say
   "(loading…)" until the wait returned, for up to an hour.
+- A background command's ending is no longer sent to the agent again when its
+  own `bt_process` wait or status call already returned it. That note came
+  after the turn and started a new turn just to repeat it.
 - An app's chat that was continued on another worker is found by its key
   (`app_chat(server, app, key)` takes the newest), so an app's links to it
   follow the move.

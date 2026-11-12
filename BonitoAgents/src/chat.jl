@@ -100,11 +100,11 @@ RunBook() = RunBook(Dict{String,ChatRun}(), Dict{Tuple{String,Float64},ChatRun}(
 # What happened to the chat's background tasks that the agent was not told: the
 # lines of the next note (`note_background!`).
 mutable struct BgNotes
-    const lines::Vector{String}
+    const lines::Vector{Any}       # each a String, or what `note_line` says when the note goes out
     const lock::ReentrantLock
     notifier::Union{Task,Nothing}
 end
-BgNotes() = BgNotes(String[], ReentrantLock(), nothing)
+BgNotes() = BgNotes(Any[], ReentrantLock(), nothing)
 
 # `state.chat_models[project_id]`; every browser tab viewing the project gets
 # a per-session view via `Base.copy(::ChatModel)`. The shared bits — message
@@ -1753,15 +1753,19 @@ bg_note_name(m::TaskToolMsg) =
 bg_note_name(m::BashToolMsg) =
     "Background command \"$(something(m.description, first(m.command, 80)))\""
 
-function note_background!(chat::ChatModel, line::AbstractString)
+function note_background!(chat::ChatModel, line)
     notes = shared(chat).bg_notes
     lock(notes.lock) do
-        push!(notes.lines, String(line))
+        # The same ending can be announced twice before the note goes out; say it once.
+        line isa AbstractString ? push!(notes.lines, String(line)) : (line in notes.lines || push!(notes.lines, line))
         notes.notifier === nothing &&
             (notes.notifier = Base.errormonitor(@async deliver_bg_notes!(shared(chat))))
     end
     return nothing
 end
+
+# What a line of a note says when the note goes out; `nothing` once it is no news.
+note_line(line::String) = line
 
 function deliver_bg_notes!(chat::ChatModel)
     notes = chat.bg_notes
@@ -1779,8 +1783,10 @@ function deliver_bg_notes!(chat::ChatModel)
                 notes.notifier = nothing
                 taken
             end
-            isempty(lines) && return nothing
-            note = UserMsg(chat, join(lines, "\n"))
+            # A line can be news no more by now (`note_line`): a note of nothing is not sent.
+            said = filter!(!isnothing, Any[note_line(l) for l in lines])
+            isempty(said) && return nothing
+            note = UserMsg(chat, join(said, "\n"))
             note.auto = true
             send_message!(chat, note)
             return nothing

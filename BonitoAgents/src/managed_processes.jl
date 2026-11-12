@@ -135,18 +135,51 @@ function managed_process_update!(state,worker,d)
     chat === nothing || refresh_job_cards!(chat, String(d["id"]))
     chat !== nothing && prompt_changed && chat_emit(chat, prompts_event(chat))
     if chat !== nothing
-        notification = lock(book.lock) do
-            record = book.jobs[managed_task_id(worker,String(d["id"]))]
-            get(record,"notify_pending",false) || return nothing
-            record["notify_pending"] = false
-            save_process_book!(book)
-            "Managed process $(record["id"]) ($(record["label"])) $(record["status"]), " *
-                "exit=$(record["exitcode"]). Use bt_process status/output to inspect its result."
-        end
-        notification === nothing || note_background!(chat,notification)
+        key = managed_task_id(worker,String(d["id"]))
+        lock(() -> get(book.jobs[key],"notify_pending",false), book.lock) &&
+            note_background!(chat, JobEndingNote(root_state(state), pid, key))
     end
     if retired
         Base.errormonitor(@async close_process_epoch!(state,pid,worker,String(d["epoch"])))
+    end
+    return nothing
+end
+
+# A job's ending, for the agent's next note, unless the agent learns it first from
+# a call of its own (`saw_ending!`): a wait that the ending released, a status.
+# Said anyway, the note only repeated what the agent knew, and started a turn to
+# do it, long after the wait (2026-11-12).
+struct JobEndingNote
+    state::ServerState
+    project_id::String
+    key::String
+end
+
+function note_line(n::JobEndingNote)
+    book = process_book(n.state, n.project_id)
+    return lock(book.lock) do
+        record = get(book.jobs, n.key, nothing)
+        (record === nothing || !get(record, "notify_pending", false)) && return nothing
+        record["notify_pending"] = false
+        save_process_book!(book)
+        "Managed process $(record["id"]) ($(record["label"])) $(record["status"]), " *
+            "exit=$(record["exitcode"]). Use bt_process status/output to inspect its result."
+    end
+end
+
+# The agent got back how jobs ended, in the result of a call of its own.
+function saw_ending!(book::ProcessBook, worker::AbstractString, result::AbstractDict)
+    jobs = haskey(result, "jobs") ? result["jobs"] : (result,)
+    lock(book.lock) do
+        seen = false
+        for j in jobs
+            j["status"] in BonitoWorker.PROCESS_ACTIVE && continue
+            record = get(book.jobs, managed_task_id(worker, String(j["id"])), nothing)
+            (record === nothing || !get(record, "notify_pending", false)) && continue
+            record["notify_pending"] = false
+            seen = true
+        end
+        seen && save_process_book!(book)
     end
     return nothing
 end
@@ -171,6 +204,7 @@ function process_request(state,pid,args)
             d === nothing && error("no managed process with that id in this chat")
             merge(copy(d),Dict("connected"=>isopen(w)))
         end
+        saw_ending!(book,p.worker_id,snapshot)
         return public_process_result(w,snapshot)
     end
     request = Dict{String,Any}(String(k)=>v for (k,v) in args if k in
@@ -192,6 +226,8 @@ function process_request(state,pid,args)
     if result isa AbstractDict && haskey(result,"id") && get(request,"action","") != "output"
         managed_process_update!(state,p.worker_id,result)
     end
+    result isa AbstractDict && (haskey(result,"id") || haskey(result,"jobs")) &&
+        saw_ending!(process_book(state,pid),p.worker_id,result)
     return public_process_result(w,result)
 end
 

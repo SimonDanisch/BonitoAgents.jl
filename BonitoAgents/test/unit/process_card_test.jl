@@ -176,6 +176,38 @@
         @test BT.render_tool_content(state, waiting, reply(job()), p.id).status == "succeeded"
     end
 
+    # A wait that a job's ending released has told the agent. The note about the
+    # ending still went out, after the turn, repeating it and starting a turn of
+    # its own (2026-11-12). An ending the agent did not see is still said.
+    @testset "an ending the agent saw is not noted again" begin
+        w = BT.WorkerInfo("w1", "Desk", nothing, "h", "/home/u", "julia", String[], root, :online, BT.now())
+        push!(w.capabilities, "managed_process")
+        state.workers[]["w1"] = w
+        lock(() -> (state.chat_models[p.id] = model), state.lock)
+        notes = BT.shared(model).bg_notes
+        notes.notifier = Task(() -> nothing)     # the note is checked here, not sent to an agent
+        epoch = BT.managed_process_epoch(state, p.id)
+        update(id, status, revision) = BT.managed_process_update!(state, "w1", merge(
+            job(id = id, status = status, exitcode = status == "running" ? nothing : 0,
+                finished = status == "running" ? nothing : 1002.5),
+            Dict{String,Any}("project_id" => p.id, "revision" => revision, "epoch" => epoch)))
+        said() = filter!(!isnothing, Any[BT.note_line(l) for l in notes.lines])
+
+        update("seen", "running", 1); update("seen", "succeeded", 2); update("seen", "succeeded", 2)
+        @test count(l -> l isa BT.JobEndingNote, notes.lines) == 1          # one ending, said once
+        # The agent's wait polls the job; this poll returns its end.
+        seen = BT.process_request(state, p.id, Dict{String,Any}("action" => "observe", "id" => "seen"))
+        @test seen["status"] == "succeeded"
+        @test isempty(said())
+
+        update("missed", "running", 1); update("missed", "failed", 2)
+        @test only(said()) == "Managed process missed (Build docs) failed, exit=0. " *
+                             "Use bt_process status/output to inspect its result."
+        @test isempty(said())                                              # and only once
+        empty!(notes.lines)
+        notes.notifier = nothing
+    end
+
     @testset "every agent's name for the tool reaches the card" begin
         @test BT.mcp_msg_type("bt_process") === BT.ProcessToolMsg
         @test BT.resolve_mcp_tool("mcp__btworker__bt_process") == ("btworker", "bt_process")
