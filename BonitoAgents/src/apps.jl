@@ -292,14 +292,15 @@ function chat_app(model::ChatModel)
 end
 
 """
-    app_chat(server, app) -> ProjectInfo | nothing
+    app_chat(server, app, key = "") -> ProjectInfo | nothing
 
-The app's chat: the newest one marked with its id and no key ("Continue on"
-leaves the original behind), or `nothing` before it was first opened.
+The app's chat with `key` ("" for the app's own chat, else the key it was
+started with, see [`start_chat!`](@ref)): the newest one, since "Continue on"
+leaves the original behind. `nothing` before there is one.
 """
-function app_chat(server::ServerState, app::AgentApp)
+function app_chat(server::ServerState, app::AgentApp, key::AbstractString = "")
     id = app_id(app)
-    chats = lock(() -> [p for p in values(server.projects[]) if p.app == id && isempty(p.app_key)], server.lock)
+    chats = lock(() -> [p for p in values(server.projects[]) if p.app == id && p.app_key == key], server.lock)
     return isempty(chats) ? nothing : argmax(p -> p.created, chats)
 end
 
@@ -473,14 +474,17 @@ end
 
 """
     chat_file_url(view, path) -> String
+    chat_file_url(server, chat::ProjectInfo, path) -> String
 
 The URL a browser loads file `path` from, on the worker the chat `view` shows
-runs on: for a pane that shows files, e.g. as `media_element(url, mime, is_video)`.
+runs on, or the worker `chat` runs on: for a pane that shows files, e.g. as
+`media_element(url, mime, is_video)`. A pane showing another chat's files (an
+app's chat showing those of the chats it started) takes the second form.
 """
-function chat_file_url(view::ChatModel, path::AbstractString)
-    p = view.state.projects[][view.project_id]
-    return worker_file_url(view.state, p.worker_id, String(path))
-end
+chat_file_url(view::ChatModel, path::AbstractString) =
+    chat_file_url(view.state, view.state.projects[][view.project_id], path)
+chat_file_url(server::ServerState, chat::ProjectInfo, path::AbstractString) =
+    worker_file_url(server, chat.worker_id, String(path))
 
 """
     show_chat!(view, pid)

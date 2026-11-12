@@ -157,6 +157,14 @@
         other.app = "notes"; other.app_key = "draft/7"
         # the newest chat without a key is the app's chat, however new a keyed one is
         @test BT.app_chat(server, app).id == "c3"
+        # a keyed chat by its key; "Continue on" leaves the original behind, the newest wins
+        @test BT.app_chat(server, app, "item/1").id == "c4"
+        @test BT.app_chat(server, app, "item/2") === nothing
+        moved = BT.add_project!(server, BT.ProjectInfo("c6", "item", "w2", mktempdir(), "/home/v/p/item-1", now(UTC) + Second(3)))
+        moved.app = "notes"; moved.app_key = "item/1"
+        @test BT.app_chat(server, app, "item/1").id == "c6"
+        @test startswith(BT.chat_file_url(server, moved, "/home/v/p/item-1/a.png"),
+                         "/worker-file/w2?path=" * BT.HTTP.escapeuri("/home/v/p/item-1/a.png") * "&")
         # scopes: the app's chat, and the keyed chats by prefix
         @test BT.in_scope(BT.AppChat(), app, own) && !BT.in_scope(BT.AppChat(), app, item)
         @test BT.in_scope(BT.AppKeyedChats("item/"), app, item)
