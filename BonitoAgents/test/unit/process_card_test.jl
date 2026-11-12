@@ -138,6 +138,44 @@
         @test !(render(other, Any[TC("some *prose*")]) isa BT.CodeView)
     end
 
+    # A wait blocks for up to an hour, and its card said "(loading…)" the whole
+    # time (2026-11-12). It shows the job as the chat's book has it, and every
+    # update of the job redraws it, until the call returns.
+    @testset "a call still running shows its job and follows it" begin
+        events = Dict{String,Any}[]
+        BT.Bonito.on(d -> d["type"] == "tool_update" && push!(events, copy(d)), model.comm)
+        lock(() -> (state.chat_models[p.id] = model), state.lock)   # a live chat, as the server keeps it
+        update(; kw...) = BT.managed_process_update!(state, "w1", merge(
+            job(status = "running", exitcode = nothing, signal = nothing, finished = nothing,
+                output = "copying\n", output_bytes = 8),
+            Dict{String,Any}("project_id" => p.id, "revision" => 1, "epoch" => BT.managed_process_epoch(state, p.id)),
+            Dict{String,Any}(string(k) => v for (k, v) in kw)))
+        waiting = BT.send!(model, card("in_progress"; action = "wait", id = "build-1", seconds = 1500))
+        waiting.message.chat = model
+        @test BT.process_summary(waiting, Any[]) == "up to 25 min"
+        @test !BT.renders_from_input(waiting)                  # no such job yet
+
+        update()
+        shown = BT.render_tool_content(state, waiting, Any[], p.id)
+        @test shown isa BT.ProcessJob && shown.status == "running" && shown.output == "copying\n"
+        @test shown.argv == ["make", "--jobs=4", "my_target"]
+        @test BT.renders_from_input(waiting)
+        @test any(e -> e["id"] == "t1" && get(e, "refresh_body", false) === true, events)
+
+        empty!(events)
+        update(revision = 2, output = "copying\ndone\n", output_bytes = 13)
+        @test BT.render_tool_content(state, waiting, Any[], p.id).output == "copying\ndone\n"
+        @test count(e -> e["id"] == "t1", events) == 1
+
+        # Answered, the card is its result: later updates of the job leave it alone.
+        BT.adopt_reply!(waiting, reply(job()))
+        waiting.message.status = "completed"
+        empty!(events)
+        update(revision = 3, output_bytes = 14)
+        @test !any(e -> e["id"] == "t1", events)
+        @test BT.render_tool_content(state, waiting, reply(job()), p.id).status == "succeeded"
+    end
+
     @testset "every agent's name for the tool reaches the card" begin
         @test BT.mcp_msg_type("bt_process") === BT.ProcessToolMsg
         @test BT.resolve_mcp_tool("mcp__btworker__bt_process") == ("btworker", "bt_process")

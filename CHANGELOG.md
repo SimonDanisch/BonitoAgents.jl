@@ -5,6 +5,17 @@ What changed in each BonitoAgents release. The guides are at
 [A Day with BonitoAgents](https://agents.bonito.sh/stable/story.html) shows how the
 pieces fit together.
 
+## Unreleased
+
+### Fixed
+
+- A `bt_process` wait shows its job while it waits: the command, where it runs
+  and its output, which updates as the job writes. The card used to say
+  "(loading…)" until the wait returned, for up to an hour.
+- An app's chat that was continued on another worker is found by its key
+  (`app_chat(server, app, key)` takes the newest), so an app's links to it
+  follow the move.
+
 ## v0.2.2
 
 ### Fixed

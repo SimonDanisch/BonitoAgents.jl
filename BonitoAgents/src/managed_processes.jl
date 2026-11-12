@@ -132,6 +132,7 @@ function managed_process_update!(state,worker,d)
     end
     chat = lock(() -> get(root_state(state).chat_models,pid,nothing),state.lock)
     chat === nothing || attach_process_tasks!(chat)
+    chat === nothing || refresh_job_cards!(chat, String(d["id"]))
     chat !== nothing && prompt_changed && chat_emit(chat, prompts_event(chat))
     if chat !== nothing
         notification = lock(book.lock) do
@@ -430,7 +431,8 @@ command_line(argv) = join(Base.shell_escape.(argv), ' ')
 function process_duration(seconds::Real)
     seconds < 60 && return string(round(seconds; digits = 1), " s")
     minutes = floor(Int, seconds / 60)
-    minutes < 60 && return string(minutes, " min ", round(Int, seconds - 60 * minutes), " s")
+    rest = round(Int, seconds - 60 * minutes)
+    minutes < 60 && return rest == 0 ? string(minutes, " min") : string(minutes, " min ", rest, " s")
     return string(minutes ÷ 60, " h ", minutes % 60, " min")
 end
 
@@ -462,20 +464,49 @@ function process_summary(m::ProcessToolMsg, content)
     return content_summary_default(content)
 end
 
-# A call that names only an id has no label until its result: a wait can block for
-# minutes. The chat's book already knows the job.
-function known_job_label(m::ProcessToolMsg)
+# A call that names only an id has no result to show until it returns, and a wait
+# can block for minutes. The chat's book already knows the job: its label for the
+# title, and the job itself for the body while the call runs.
+function book_record(m::ProcessToolMsg)
     chat = tool_chat(m)
-    (chat === nothing || isempty(m.job_id)) && return ""
+    (chat === nothing || isempty(m.job_id)) && return nothing
     state = root_state(chat.state)
     project = get(state.projects[], chat.project_id, nothing)
     book = lock(() -> get(state.process_jobs, chat.project_id, nothing), state.lock)
-    (project === nothing || book === nothing) && return ""
+    (project === nothing || book === nothing) && return nothing
     key = managed_task_id(project.worker_id, m.job_id)
     return lock(book.lock) do
         record = get(book.jobs, key, nothing)
-        record === nothing ? "" : String(record["label"])
+        record === nothing ? nothing : copy(record)
     end
+end
+
+known_job_label(m::ProcessToolMsg) = (r = book_record(m); r === nothing ? "" : String(r["label"]))
+
+# The job as the book has it now, named by its worker's name as a result names it.
+function book_job(m::ProcessToolMsg)
+    record = book_record(m)
+    record === nothing && return nothing
+    w = get(root_state(tool_chat(m).state).workers[], String(record["worker"]), nothing)
+    w === nothing || (record["worker"] = w.name)
+    return ProcessJob(record)
+end
+
+renders_from_input(m::ProcessToolMsg) = book_record(m) !== nothing
+# The body is the job until the result arrives, then the result: redraw it then.
+tool_body_snapshot(::ProcessToolMsg, content) = isempty(content)
+
+# Each update of a job redraws the open cards of the calls still running on it.
+function refresh_job_cards!(chat::ChatModel, job_id::AbstractString)
+    s = shared(chat)
+    ids = lock(s.lock) do
+        [tool_id(m) for m in s.msgs_store if m isa ProcessToolMsg && m.job_id == job_id &&
+             !(tool_status(m) in ("completed", "failed"))]
+    end
+    for id in ids
+        chat_emit(chat, Dict{String,Any}("type" => "tool_update", "id" => id, "refresh_body" => true))
+    end
+    return nothing
 end
 
 # A job's name for a person: its label; else its command (without a label the
@@ -584,6 +615,8 @@ end
 
 # Anything that is not a job goes out as it came: never through markdown.
 function render_tool_content(state::ServerState, m::ProcessToolMsg, content, project_id::AbstractString)
+    # No result yet: the job as it is now (`renders_from_input`).
+    isempty(content) && return something(book_job(m), DOM.div("(loading…)"; class = "bt-tool-empty bt-tool-loading"))
     reply = process_reply(content)
     reply === nothing || return reply
     text = reply_text(content)
