@@ -5,7 +5,7 @@ What changed in each BonitoAgents release. The guides are at
 [A Day with BonitoAgents](https://agents.bonito.sh/stable/story.html) shows how the
 pieces fit together.
 
-## Unreleased
+## v0.2.2
 
 ### Fixed
 
