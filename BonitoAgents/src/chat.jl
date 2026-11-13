@@ -1255,10 +1255,11 @@ mutable struct ProcessToolMsg <: MCPToolMsg           # bt_process, bt_sudo, bt_
     label::String                 # the call's own, then the job's from the result
     argv::Vector{String}
     seconds::Union{Float64,Nothing}                   # how long a wait may block
+    worker::String                # the worker the call names; "" ⇒ its job's, else the chat's
     reply::Union{ProcessJob,ProcessJobList,Nothing}   # nothing until decoded
 end
 ProcessToolMsg(message::Message, server, tool = "bt_process") =
-    ProcessToolMsg(message, server, String(tool), tool_action(tool), "", "", String[], nothing, nothing)
+    ProcessToolMsg(message, server, String(tool), tool_action(tool), "", "", String[], nothing, "", nothing)
 # bt_sudo and bt_ssh do one thing each, so their calls name no action.
 tool_action(tool) = tool == "bt_sudo" ? "sudo" : tool == "bt_ssh" ? "ssh" : ""
 
@@ -1300,6 +1301,8 @@ function apply_input!(m::ProcessToolMsg, raw::AbstractDict)
     d isa AbstractString && !isempty(d) && isempty(m.label) && (m.label = "ssh " * d)
     s = get(raw, "seconds", nothing)
     s isa Real && (m.seconds = Float64(s))
+    w = get(raw, "worker", nothing)
+    w isa AbstractString && !isempty(strip(w)) && (m.worker = String(strip(w)))
     return nothing
 end
 apply_input!(m::JuliaEvalCall, raw::AbstractDict) = apply_eval_input!(m, raw)
@@ -2419,9 +2422,22 @@ executed_preview(m::JuliaWaitToolMsg) =
     "wait for " * (isempty(m.runs) ? "every open run" : join(m.runs, ", ")) *
     (m.until == "any" ? " (the first to finish)" : "")
 
+# A command on ANOTHER worker wears that worker's name as a badge, as an eval there does.
+worker_badge!(d::Dict, ::MCPToolMsg) = d
+function worker_badge!(d::Dict, m::ProcessToolMsg)
+    isempty(m.worker) && return d
+    chat = tool_chat(m)
+    state = chat === nothing ? nothing : root_state(chat.state)
+    p = state === nothing ? nothing : get(state.projects[], chat.project_id, nothing)
+    p !== nothing && any(w -> w.worker_id == p.worker_id, workers_named(state, m.worker)) && return d
+    d["worker"] = m.worker
+    return d
+end
+
 # Both (1) and (2), for the header build AND every later snap.
 function mcp_input_extras!(d::Dict, m::MCPToolMsg)
     eval_extras!(d, m)
+    worker_badge!(d, m)
     jump_extras!(d, m)
     ex = executed_preview(m)
     ex === nothing || (d["command"] = ex)

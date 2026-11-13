@@ -98,14 +98,17 @@ function detach_process_tasks!(chat)
     return nothing
 end
 
-function managed_process_update!(state,worker,d)
+# A job of a chat as a worker reports it. A chat's jobs run on its own worker, or on
+# another it started them on: the answer to that start (`requested`) brings the
+# job into the book, and its reports count from then on.
+function managed_process_update!(state,worker,d; requested::Bool = false)
     pid = String(d["project_id"])
     p = get(state.projects[],pid,nothing)
     p === nothing && return nothing
-    p.worker_id == worker || return nothing
     book = process_book(state,pid)
+    key = managed_task_id(worker,String(d["id"]))
+    requested || p.worker_id == worker || lock(() -> haskey(book.jobs,key), book.lock) || return nothing
     retired, prompt_changed = lock(book.lock) do
-        key = managed_task_id(worker,String(d["id"]))
         previous = get(book.jobs,key,nothing)
         previous !== nothing && (d["revision"],d["output_bytes"]) <
             (previous["revision"],previous["output_bytes"]) && return (false, false)
@@ -135,7 +138,6 @@ function managed_process_update!(state,worker,d)
     chat === nothing || refresh_job_cards!(chat, String(d["id"]))
     chat !== nothing && prompt_changed && chat_emit(chat, prompts_event(chat))
     if chat !== nothing
-        key = managed_task_id(worker,String(d["id"]))
         lock(() -> get(book.jobs[key],"notify_pending",false), book.lock) &&
             note_background!(chat, JobEndingNote(root_state(state), pid, key))
     end
@@ -184,6 +186,41 @@ function saw_ending!(book::ProcessBook, worker::AbstractString, result::Abstract
     return nothing
 end
 
+# The worker that runs this chat's job `id`, for a call that names no worker: the
+# chat's own, unless only another worker has a job of that id. `nothing` when
+# several other workers do.
+function job_holder(p::ProjectInfo, book::ProcessBook, id::AbstractString)
+    holders = lock(book.lock) do
+        unique!([String(d["worker"]) for d in values(book.jobs) if d["id"] == id])
+    end
+    (isempty(holders) || p.worker_id in holders) && return p.worker_id
+    return length(holders) == 1 ? only(holders) : nothing
+end
+
+# The worker a call of the agent's means: the one it names, else the one its job
+# runs on (a sudo through a bt_ssh connection runs where that connection is),
+# else the chat's own. Any other worker than the chat's own needs the chat's
+# "Remote julia" switch: a command there can do what Julia there can.
+function job_worker(state::ServerState, p::ProjectInfo, book::ProcessBook, args::AbstractDict)
+    action = String(get(args, "action", ""))
+    named = String(strip(String(get(args, "worker", ""))))
+    wid = if !isempty(named)
+        find_worker(state, named).worker_id
+    elseif action in ("start", "ssh", "list")
+        p.worker_id
+    else
+        id = action == "sudo" ? String(get(args, "ssh", "")) : String(get(args, "id", ""))
+        holder = job_holder(p, book, id)
+        holder === nothing && error("several workers run a job '$id' of this chat; name one with worker")
+        holder
+    end
+    wid == p.worker_id || remote_eval_project(state, p.id, "Running commands")
+    w = get(state.workers[], wid, nothing)
+    w === nothing && error("this chat's worker is no longer known to the server")
+    can(w, "managed_process") || error("update worker '$(w.name)' to use managed processes")
+    return w
+end
+
 # What an agent asks for, from its MCP process. Answering a password prompt is not
 # among it: only the user does that, in the chat (`answer_prompt!`).
 function process_request(state,pid,args)
@@ -192,42 +229,65 @@ function process_request(state,pid,args)
     state = root_state(state)
     p = get(state.projects[],String(pid),nothing)
     p === nothing && error("this chat no longer exists")
-    w = get(state.workers[],p.worker_id,nothing)
-    w !== nothing && can(w,"managed_process") || error("update this worker to use managed processes")
+    book = process_book(state,p.id)
+    w = job_worker(state,p,book,args)
     if action == "observe"
         # Worker snapshots already stream on the control channel. A voluntary
         # wait observes them without blocking on a fresh RPC to a sleeping or
         # disconnected worker, so incoming input can release the wait promptly.
-        book = process_book(state,pid)
         snapshot = lock(book.lock) do
-            d = get(book.jobs,managed_task_id(p.worker_id,String(get(args,"id",""))),nothing)
+            d = get(book.jobs,managed_task_id(w.worker_id,String(get(args,"id",""))),nothing)
             d === nothing && error("no managed process with that id in this chat")
             merge(copy(d),Dict("connected"=>isopen(w)))
         end
-        saw_ending!(book,p.worker_id,snapshot)
+        saw_ending!(book,w.worker_id,snapshot)
         return public_process_result(w,snapshot)
     end
     request = Dict{String,Any}(String(k)=>v for (k,v) in args if k in
         ("action","id","argv","cwd","label","env","offset","max_bytes","epoch","destination","options","ssh"))
     if action in ("start","sudo","ssh")
-        book = process_book(state,pid)
         lock(book.lock) do
             get(request,"epoch","") == book.epoch || error("agent session ended; use the current session to start work")
         end
-        request["cwd"] = get(request,"cwd",p.worker_path)
+        haskey(request,"cwd") || (request["cwd"] = default_job_folder(p,w))
     end
+    result = worker_process_request(state,p,w,request)
+    # A list names every worker's jobs: those of other workers as the book has them.
+    if action == "list" && isempty(strip(String(get(args,"worker",""))))
+        others = lock(book.lock) do
+            [copy(d) for d in values(book.jobs) if d["worker"] != p.worker_id]
+        end
+        for d in others
+            other = get(state.workers[],String(d["worker"]),nothing)
+            other === nothing && continue
+            d["connected"] = isopen(other)
+            push!(result["jobs"],public_process_result(other,d))
+        end
+    end
+    return result
+end
+
+# Where a job runs when the call names no folder: the chat's folder on its own
+# worker, the home folder on another.
+default_job_folder(p::ProjectInfo, w::WorkerInfo) =
+    w.worker_id == p.worker_id ? p.worker_path :
+    isempty(w.home) ? error("worker '$(w.name)' reported no home folder; pass cwd") : w.home
+
+# A request for chat `p`'s jobs on worker `w`, from the agent or from the user.
+function worker_process_request(state::ServerState, p::ProjectInfo, w::WorkerInfo, request::AbstractDict)
+    action = String(get(request,"action",""))
     if action in ("sudo","ssh")
-        can(w,"password_prompts") || error("update this worker to run sudo and ssh with a password from the chat")
+        can(w,"password_prompts") || error("update worker '$(w.name)' to run sudo and ssh with a password from the chat")
         delete!(request,"env")
     end
-    request["project_id"] = String(pid) # bound by the authenticated channel, never caller-supplied
-    response = worker_rpc(state,p.worker_id,"managed_process",request;timeout=20.0)
+    request["project_id"] = p.id # bound by the authenticated channel, never caller-supplied
+    response = worker_rpc(state,w.worker_id,"managed_process",request;timeout=20.0)
     result = response["result"]
-    if result isa AbstractDict && haskey(result,"id") && get(request,"action","") != "output"
-        managed_process_update!(state,p.worker_id,result)
+    if result isa AbstractDict && haskey(result,"id") && action != "output"
+        managed_process_update!(state,w.worker_id,result; requested = true)
     end
     result isa AbstractDict && (haskey(result,"id") || haskey(result,"jobs")) &&
-        saw_ending!(process_book(state,pid),p.worker_id,result)
+        saw_ending!(process_book(state,p.id),w.worker_id,result)
     return public_process_result(w,result)
 end
 
@@ -292,9 +352,12 @@ function managed_process_control!(model,id)
     end
     action in ("interrupt","terminate","kill") || error("unknown managed process control")
     Base.errormonitor(@async try
-        p = model.state.projects[][model.project_id]
-        p.worker_id == worker || error("job is on another worker")
-        process_request(model.state,model.project_id,Dict("action"=>action,"id"=>job))
+        # The user's stop, so it needs no switch: it reaches the job wherever it runs.
+        state = root_state(model.state)
+        p = state.projects[][model.project_id]
+        w = get(state.workers[],worker,nothing)
+        w === nothing && error("the worker of this job is no longer known to the server")
+        worker_process_request(state,p,w,Dict{String,Any}("action"=>action,"id"=>job))
     catch e
         e isa InterruptException && rethrow()
         book = process_book(model.state,model.project_id)
@@ -404,8 +467,10 @@ function answer_prompt!(view::ChatModel, key::AbstractString, secret::Union{Stri
     worker, id, seq = String(m.captures[1]), String(m.captures[2]), parse(Int, m.captures[3])
     state = root_state(view.state)
     Base.errormonitor(@async try
-        p = state.projects[][view.project_id]
-        p.worker_id == worker || error("that job runs on another worker")
+        # The chat's job, on its own worker or on another one it runs commands on.
+        book = process_book(state, view.project_id)
+        lock(() -> haskey(book.jobs, managed_task_id(worker, id)), book.lock) ||
+            error("this chat has no job '$id' on that worker")
         request = Dict{String,Any}("action"=>"answer", "project_id"=>String(view.project_id),
             "id"=>id, "seq"=>seq)
         secret === nothing ? (request["deny"] = true) : (request["secret"] = secret)
@@ -510,7 +575,12 @@ function book_record(m::ProcessToolMsg)
     project = get(state.projects[], chat.project_id, nothing)
     book = lock(() -> get(state.process_jobs, chat.project_id, nothing), state.lock)
     (project === nothing || book === nothing) && return nothing
-    key = managed_task_id(project.worker_id, m.job_id)
+    # The worker the server sent the call to (`job_worker`).
+    named = isempty(m.worker) ? nothing : workers_named(state, m.worker)
+    worker = named === nothing ? job_holder(project, book, m.job_id) :
+             length(named) == 1 ? only(named).worker_id : nothing
+    worker === nothing && return nothing
+    key = managed_task_id(worker, m.job_id)
     return lock(book.lock) do
         record = get(book.jobs, key, nothing)
         record === nothing ? nothing : copy(record)

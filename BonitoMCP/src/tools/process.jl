@@ -37,12 +37,17 @@ job_request(args::AbstractDict) = merge(
     Dict{String,Any}(String(k)=>v for (k,v) in args if !startswith(String(k),"_")),
     Dict{String,Any}("epoch"=>get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
 
+names_worker(args::AbstractDict) = !isempty(strip(String(get(args,"worker",""))))
+
 function process_handler(args::AbstractDict)
     action = String(get(args,"action","list"))
     request = job_request(args)
     if action == "start"
-        request["env"] = merge(Dict("PATH"=>get(ENV,"PATH","")),
-            BonitoProgress.progress_context(), get(args,"env",Dict{String,String}()),
+        # This process's PATH and progress address are this machine's. Another
+        # worker is another machine: its job gets that worker's own environment.
+        here = names_worker(args) ? Dict{String,String}() :
+            merge(Dict("PATH"=>get(ENV,"PATH","")), BonitoProgress.progress_context())
+        request["env"] = merge(here, get(args,"env",Dict{String,String}()),
             Dict("BONITOAGENTS_PROCESS_ID"=>String(get(args,"id",""))))
     end
     action == "wait" || return dev_call("managed_process"; (Symbol(k)=>v for (k,v) in request)...)
@@ -70,6 +75,9 @@ end
 sudo_handler(args::AbstractDict) = prompting_job_handler(args,"sudo")
 ssh_ready(d) = get(d,"ready",false) === true ? "ready" : job_ended(d)
 ssh_handler(args::AbstractDict) = prompting_job_handler(args,"ssh"; done = ssh_ready)
+
+const WORKER_ARG = Dict("type"=>"string","description"=>
+    "Another worker of the fleet to run on (its name or id), instead of this chat's. Needs the chat's Remote julia switch.")
 
 register!("bt_process", """
 Launch and control worker-owned background commands, with output and taskbar
@@ -99,6 +107,11 @@ Agent turns and MCP reconnects do not end jobs. Closing or restarting the chat
 requests cleanup; a worker restart stops leftover jobs and reports them lost.
 For ordinary Julia work use bt_julia_eval(background=true) and its run controls.
 bt_progress reports measured work and does not itself supervise processes.
+
+worker runs the command on another worker of the fleet (its name or id, as for
+bt_julia_eval), by default in that worker's home folder. It needs this chat's
+Remote julia switch. Later calls on the job need only its id; list shows the
+jobs on every worker.
 """,Dict{String,Any}("type"=>"object","properties"=>Dict{String,Any}(
     "action"=>Dict("type"=>"string","enum"=>["start","list","status","output","wait","interrupt","terminate","kill"]),
     "id"=>Dict("type"=>"string","description"=>"Stable unique id per job attempt, using letters, digits, - or _. Required except list."),
@@ -107,7 +120,8 @@ bt_progress reports measured work and does not itself supervise processes.
     "env"=>Dict("type"=>"object","additionalProperties"=>Dict("type"=>"string")),
     "seconds"=>Dict("type"=>"number","exclusiveMinimum"=>0,"maximum"=>3600),
     "offset"=>Dict("type"=>"integer","minimum"=>0),
-    "max_bytes"=>Dict("type"=>"integer","minimum"=>1,"maximum"=>65536)),"required"=>["action"]),
+    "max_bytes"=>Dict("type"=>"integer","minimum"=>1,"maximum"=>65536),
+    "worker"=>WORKER_ARG),"required"=>["action"]),
     process_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
 
 register!("bt_sudo", """
@@ -125,6 +139,10 @@ ssh is the id of an open bt_ssh connection of this chat: the command then runs a
 root on that host, in the remote user's home directory (cwd is ignored there).
 Example: {id:"restart-1", ssh:"server-1", argv:["systemctl","restart","nginx"]}.
 
+worker runs it as root on another worker of the fleet (its name or id), by
+default in that worker's home folder; the chat asks for that machine's password.
+It needs this chat's Remote julia switch.
+
 The command runs as a bt_process job, in the taskbar, and reads no input. sudo
 gets one password: a wrong one fails the job, so start a new id to try again, and
 a refusal fails it too. Returns the job once it ends, or after seconds (default
@@ -136,6 +154,7 @@ same id after that.
     "argv"=>Dict("type"=>"array","items"=>Dict("type"=>"string")),
     "cwd"=>Dict("type"=>"string"),"label"=>Dict("type"=>"string"),
     "ssh"=>Dict("type"=>"string","description"=>"Run on the host of this bt_ssh connection id instead of the worker."),
+    "worker"=>WORKER_ARG,
     "seconds"=>Dict("type"=>"number","exclusiveMinimum"=>0,"maximum"=>3600)),"required"=>["id","argv"]),
     sudo_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))
 
@@ -155,10 +174,15 @@ and rsync log in without asking: `ssh -S <control_path> <destination> <command>`
 `scp -o ControlPath=<control_path> ...`, `rsync -e "ssh -S <control_path>" ...`.
 The connection stays open as a bt_process job, in the taskbar; end it with
 bt_process terminate on the same id.
+
+worker opens the connection from another worker of the fleet (its name or id).
+Its control_path is then on that worker: use it from there, with bt_process or
+bt_sudo on the same worker. It needs this chat's Remote julia switch.
 """,Dict{String,Any}("type"=>"object","properties"=>Dict{String,Any}(
     "id"=>Dict("type"=>"string","description"=>"Stable unique id for this attempt: letters, digits, - or _."),
     "destination"=>Dict("type"=>"string"),
     "options"=>Dict("type"=>"array","items"=>Dict("type"=>"string")),
     "label"=>Dict("type"=>"string"),
+    "worker"=>WORKER_ARG,
     "seconds"=>Dict("type"=>"number","exclusiveMinimum"=>0,"maximum"=>3600)),"required"=>["id","destination"]),
     ssh_handler;available=()->!isempty(get(ENV,"BONITOAGENTS_PROCESS_EPOCH","")))

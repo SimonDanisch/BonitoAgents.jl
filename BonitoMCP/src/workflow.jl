@@ -77,6 +77,8 @@ When sudo needs a password, use `bt_sudo(id=..., argv=[...])`, and on a server
 passphrase or a host key confirmation, use `bt_ssh(id=..., destination=...)`.
 The chat asks the user every time and hands the answer to sudo or ssh, never to
 you: don't open a password dialog, and don't ask for a password in a message.
+`worker="<name>"` runs any of the three on another worker of the fleet; it needs
+this chat's Remote julia switch. Later calls on that job need only its id.
 Wait with `bt_wait(seconds=..., reason=...)`, optionally with an `until` shell
 condition, rather than starting sleep/poll watcher tasks. Incoming messages can
 wake a wait; read them and then continue the original work as appropriate.

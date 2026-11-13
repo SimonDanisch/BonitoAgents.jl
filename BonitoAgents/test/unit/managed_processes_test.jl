@@ -195,3 +195,63 @@ end
     @test epoch in restored.retired && current in restored.retired
     @test restored.epoch != current
 end
+
+# A chat's commands on another worker (2026-11-13): which worker a call means, the
+# switch it needs there, and which reports of that worker's jobs the chat keeps.
+@testitem "unit:remote_jobs" tags=[:unit] begin
+    using BonitoAgents
+    const BT = BonitoAgents
+    state = BT.ServerState(;state_dir=mktempdir(),working_dir=mktempdir())
+    p = BT.ProjectInfo("remote-jobs","remote-jobs","wa",mktempdir(),"/a/project",BT.now(BT.UTC))
+    state.projects[][p.id] = p
+    BT.save_projects!(state)
+    for (id,name,home) in (("wa","A","/home/a"),("wb","B","/home/b"),("wc","C",""))
+        w = BT.WorkerInfo(id,name,nothing,"h",home,"julia",String[],"/root",:online,BT.now())
+        push!(w.capabilities,"managed_process")
+        state.workers[][id] = w
+    end
+    book = BT.process_book(state,p.id)
+    worker(args...) = BT.job_worker(state,p,book,Dict{String,Any}(args...)).worker_id
+    frame(worker,id) = Dict{String,Any}("project_id"=>p.id,"id"=>id,"epoch"=>book.epoch,
+        "status"=>"running","revision"=>1,"output_bytes"=>0,"output"=>"","started"=>time(),
+        "label"=>id,"pid"=>7,"argv"=>["sleep","300"],"cwd"=>"/home/b","exitcode"=>nothing)
+
+    @test worker("action"=>"start") == "wa"
+    @test worker("action"=>"start","worker"=>"A") == "wa"           # its own worker needs no switch
+    err = try worker("action"=>"start","worker"=>"b"); "" catch e; sprint(showerror,e) end
+    @test occursin("Running commands on another worker is switched OFF",err)
+    p.remote_eval = true
+    @test worker("action"=>"start","worker"=>"b") == "wb"
+    @test BT.default_job_folder(p,state.workers[]["wa"]) == "/a/project"
+    @test BT.default_job_folder(p,state.workers[]["wb"]) == "/home/b"
+    @test_throws ErrorException BT.default_job_folder(p,state.workers[]["wc"])
+
+    # B's reports count once the chat started the job there, not before.
+    BT.managed_process_update!(state,"wb",frame("wb","job"))
+    @test !haskey(book.jobs,BT.managed_task_id("wb","job"))
+    BT.managed_process_update!(state,"wb",frame("wb","job"); requested = true)
+    @test haskey(book.jobs,BT.managed_task_id("wb","job"))
+    later = merge(frame("wb","job"),Dict{String,Any}("revision"=>2,"status"=>"succeeded","exitcode"=>0))
+    BT.managed_process_update!(state,"wb",later)
+    @test book.jobs[BT.managed_task_id("wb","job")]["status"] == "succeeded"
+
+    # A later call names the job only.
+    @test worker("action"=>"status","id"=>"job") == "wb"
+    @test worker("action"=>"status","id"=>"unknown") == "wa"
+    BT.managed_process_update!(state,"wa",frame("wa","job"))
+    @test worker("action"=>"status","id"=>"job") == "wa"              # the chat's own first
+    BT.managed_process_update!(state,"wb",frame("wb","twice"); requested = true)
+    BT.managed_process_update!(state,"wc",frame("wc","twice"); requested = true)
+    @test_throws ErrorException worker("action"=>"status","id"=>"twice")
+    @test worker("action"=>"status","id"=>"twice","worker"=>"C") == "wc"
+    # A sudo through a bt_ssh connection runs where the connection is.
+    BT.managed_process_update!(state,"wb",frame("wb","master"); requested = true)
+    @test worker("action"=>"sudo","ssh"=>"master") == "wb"
+
+    # With the switch off again, the jobs on B are out of the agent's reach.
+    p.remote_eval = false
+    @test_throws ErrorException worker("action"=>"status","id"=>"master")
+    # The agent never answers a password prompt, on any worker.
+    @test_throws ErrorException BT.process_request(state,p.id,
+        Dict{String,Any}("action"=>"answer","id"=>"master","worker"=>"B","seq"=>1,"secret"=>"guess"))
+end

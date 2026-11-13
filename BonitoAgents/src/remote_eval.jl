@@ -75,34 +75,50 @@ function set_remote_eval!(state::ServerState, project_id::AbstractString, on::Bo
     return p
 end
 
-"""
-    resolve_worker(state, ref) -> WorkerInfo
+# The workers `ref` names: by id or display name, else by name in any case.
+function workers_named(state::ServerState, ref::AbstractString)
+    workers = collect(values(state.workers[]))
+    hits = filter(w -> w.worker_id == ref || w.name == ref, workers)
+    return isempty(hits) ? filter(w -> lowercase(w.name) == lowercase(ref), workers) : hits
+end
 
-The online worker called `ref` (its display name, case-insensitively, or its id).
 """
-function resolve_worker(state::ServerState, ref::AbstractString)
+    find_worker(state, ref) -> WorkerInfo
+
+The worker called `ref` (its display name, case-insensitively, or its id),
+online or not.
+"""
+function find_worker(state::ServerState, ref::AbstractString)
     r = String(strip(ref))
     isempty(r) && error("no worker named")
-    workers = collect(values(state.workers[]))
-    hits = filter(w -> w.worker_id == r || w.name == r, workers)
-    isempty(hits) && (hits = filter(w -> lowercase(w.name) == lowercase(r), workers))
+    hits = workers_named(state, r)
     if isempty(hits)
-        online = sort([w.name for w in workers if isopen(w)])
+        online = sort([w.name for w in values(state.workers[]) if isopen(w)])
         error("no worker named '$(r)' — online workers: " *
               (isempty(online) ? "(none)" : join(online, ", ")))
     end
     length(hits) > 1 &&
         error("several workers are named '$(r)' — use a worker id instead: " *
               join((w.worker_id for w in hits), ", "))
-    w = only(hits)
+    return only(hits)
+end
+
+"""
+    resolve_worker(state, ref) -> WorkerInfo
+
+The online worker called `ref` (its display name, case-insensitively, or its id).
+"""
+function resolve_worker(state::ServerState, ref::AbstractString)
+    w = find_worker(state, ref)
     isopen(w) || error("worker '$(w.name)' is offline")
     return w
 end
 
 # The chat behind a control channel, provided its switch is on. The messages
-# are written for the AGENT, which relays them to the user.
-function remote_eval_project(state::ServerState, caller::AbstractString)
-    isempty(caller) && error("running Julia on another worker needs a chat (this control channel carries no project id)")
+# are written for the AGENT, which relays them to the user. `what` is what was
+# asked for: the switch also covers commands on another worker (managed_processes.jl).
+function remote_eval_project(state::ServerState, caller::AbstractString, what::AbstractString = "Running Julia")
+    isempty(caller) && error("$(lowercasefirst(what)) on another worker needs a chat (this control channel carries no project id)")
     p = get(state.projects[], caller, nothing)
     p === nothing && error("unknown chat '$(caller)'")
     if !p.remote_eval
@@ -114,7 +130,7 @@ function remote_eval_project(state::ServerState, caller::AbstractString)
         # this chat") sent everyone looking at the right switch on the wrong
         # chat. The id makes that mismatch visible in the transcript itself.
         @warn "remote julia refused" caller = caller project = p.name worker_path = p.worker_path
-        error("Running Julia on another worker is switched OFF for chat '$(caller)' " *
+        error("$what on another worker is switched OFF for chat '$(caller)' " *
               "($(p.name)). Turn it on in THAT chat's ⋯ menu → 'Remote julia' — if its " *
               "header already reads on, you are looking at a different chat on the same " *
               "folder, and this is the one that needs it. Ask rather than retrying.")

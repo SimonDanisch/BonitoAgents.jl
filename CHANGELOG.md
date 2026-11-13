@@ -7,6 +7,14 @@ pieces fit together.
 
 ## Unreleased
 
+### Added
+
+- `bt_process`, `bt_sudo` and `bt_ssh` take `worker = "<name>"` to run on another
+  worker of the fleet, with the chat's Remote julia switch. The job is in the
+  chat's taskbar and the user can stop it. Later calls find it by its id alone. A
+  sudo there asks for the password on a card that names that worker, and the
+  password goes from the chat to that worker's sudo, never to the agent.
+
 ### Fixed
 
 - A `bt_process` wait shows its job while it waits: the command, where it runs
