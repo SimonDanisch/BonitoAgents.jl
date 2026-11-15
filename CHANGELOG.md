@@ -26,6 +26,9 @@ pieces fit together.
 - An app's chat that was continued on another worker is found by its key
   (`app_chat(server, app, key)` takes the newest), so an app's links to it
   follow the move.
+- Two new chats open in two tabs no longer close each other over and over. The
+  cap on live agents now counts only chats whose agent still runs, and never
+  closes an empty chat that a tab shows.
 
 ## v0.2.2
 

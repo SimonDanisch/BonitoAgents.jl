@@ -6951,6 +6951,15 @@ end
 # instantly and show history from disk.
 const BIND_CAP = 8
 
+# The chats some tab shows. A tab whose socket dropped still counts while the
+# server serves it: its view opens a closed chat again just the same.
+function shown_chats(state::ServerState)
+    tabs = root_state(state).tabs
+    return lock(tabs.lock) do
+        Set{String}(r.view[] for r in values(tabs.open) if r.view !== nothing)
+    end
+end
+
 # Record that `pid`'s agent just bound (MRU) and keep at most BIND_CAP agents
 # alive: when we exceed it, fully CLOSE the oldest IDLE session (`stop_session!`
 # reaps its agent + drops the model). With lazy ACP a re-open rebuilds the chat
@@ -6958,6 +6967,7 @@ const BIND_CAP = 8
 # ChatModel/agent avoids reusing one agent's `ws` Ref across generations.
 function note_bound!(state::ServerState, pid::AbstractString)
     isempty(pid) && return nothing
+    shown = shown_chats(state)
     victim_pid = lock(state.lock) do
         # If the chat was closed (removed from chat_models) before this bind's
         # note_bound! landed — a turn buffered past close that still lazily
@@ -6966,7 +6976,12 @@ function note_bound!(state::ServerState, pid::AbstractString)
         # nothing ever filters out again (the leak_cycle bound_lru leak).
         haskey(state.chat_models, pid) || return ""
         lru = state.bound_lru
-        filter!(!=(pid), lru)
+        # Only live agents count. A chat whose agent ended (its worker went
+        # away, its session failed) keeps its model but runs no process; such
+        # entries filled the cap on a long-running server, and the cap then
+        # closed the live chats (11-15).
+        filter!(id -> id != pid && haskey(state.chat_models, id) &&
+                      isopen(state.chat_models[id].agent), lru)
         push!(lru, pid)                       # most-recently-bound last
         length(lru) <= BIND_CAP && return ""
         # Prefer a chat with NO conversation in it. Since 58a88d2 a brand-new
@@ -6975,16 +6990,16 @@ function note_bound!(state::ServerState, pid::AbstractString)
         # typically the one you are actually working in. An unmessaged chat has
         # nothing to lose: it rebinds on its next turn and the user sees nothing.
         # Falls through to oldest-first when every candidate has history.
-        for pass in (:unmessaged, :any), i in eachindex(lru)
-            cand = lru[i]
+        for pass in (:unmessaged, :any), cand in lru
             cand == pid && continue           # never evict the one we just bound
-            m = get(state.chat_models, cand, nothing)
-            m === nothing && (deleteat!(lru, i); return "")   # stale entry
-            if pass === :unmessaged
-                sm = shared(m)
-                lock(() -> any(x -> x isa UserMsg, sm.msgs_store), sm.lock) && continue
-            end
-            shared(m).busy_active[] && continue               # don't cut a chat off mid-turn
+            sm = shared(state.chat_models[cand])
+            empty = lock(() -> !any(x -> x isa UserMsg, sm.msgs_store), sm.lock)
+            pass === :unmessaged && !empty && continue
+            # An empty chat on screen opens again at once and binds on open, so
+            # closing it frees nothing: it closes the next one instead. Two empty
+            # chats in two tabs closed each other every 1.6 s (11-15).
+            empty && cand in shown && continue
+            sm.busy_active[] && continue      # don't cut a chat off mid-turn
             return cand
         end
         return ""                             # everyone's busy — let it ride once
