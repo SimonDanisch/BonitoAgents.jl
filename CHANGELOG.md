@@ -24,6 +24,11 @@ pieces fit together.
 
 ### Fixed
 
+- An eval shows its result with the methods it loaded or defined itself.
+  `using WGLMakie; scatter(1:10)` in one call failed with "method too new to be
+  called from this world context" instead of showing the plot, and a type defined
+  with its `show` in the same call printed as `Foo()`. The same held for an
+  error's message.
 - A `bt_process` wait shows its job while it waits: the command, where it runs
   and its output, which updates as the job writes. The card used to say
   "(loading…)" until the wait returned, for up to an hour.

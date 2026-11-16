@@ -89,8 +89,14 @@ end
 
 # One worker call: REPL-eval the code, then format the result value. A user
 # error thrown by the eval propagates to the caller's try/catch (→ format_error).
+#
+# The formatting runs in the NEWEST world. Each statement of `repl_eval` sees
+# the methods the statements before it defined, but this function keeps the
+# world it was called in: the value of `struct Foo end; show(io::IO, ::Foo) =
+# ...; Foo()` printed as `Foo()`, and `using WGLMakie; scatter(1:10)` failed to
+# show at all ("method too new to be called from this world context").
 eval_and_format(code::AbstractString, out_dir::AbstractString, max_bytes::Int, full_output::Bool) =
-    format_value(repl_eval(code), out_dir, max_bytes, full_output)
+    Base.invokelatest(format_value, repl_eval(code), out_dir, max_bytes, full_output)
 
 # On-disk cap for rich-output files (PNG/SVG written by try_save_rich).
 # This is SEPARATE from `max_bytes` (the per-block RESPONSE cap, 10KB default):

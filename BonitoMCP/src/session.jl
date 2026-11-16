@@ -560,8 +560,10 @@ function execute(s::JuliaSession, code::AbstractString;
             try
                 Main.BonitoMCPHelper.eval_and_format($code_str, $out_dir, $max_bytes, $full_output)
             catch __mcp_err__
-                Main.BonitoMCPHelper.format_error(__mcp_err__, catch_backtrace(),
-                                                   $max_bytes, $full_output)
+                # Newest world: the error's type and `showerror` may come from
+                # the eval itself (see `eval_and_format`).
+                Base.invokelatest(Main.BonitoMCPHelper.format_error, __mcp_err__,
+                                  catch_backtrace(), $max_bytes, $full_output)
             finally
                 Main.BonitoMCPHelper.EVAL_TASK[] = nothing
             end
