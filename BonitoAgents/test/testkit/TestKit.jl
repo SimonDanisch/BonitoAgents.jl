@@ -1348,10 +1348,23 @@ function capture_console!(ctx::ECT.TestContext)
     run(ctx.app, """(() => {
         const wc = electron.BrowserWindow.fromId($(ctx.window.id)).webContents;
         const log = global.__btConsole = [];
+        const gpuLost = global.__btGpuLost = global.__btGpuLost || [];
         // One parameter: Electron warns when a listener takes the older
         // positional arguments; everything is on the event.
         wc.on('console-message', (e) => {
             if (e.level !== 'warning' && e.level !== 'error') return;
+            // Chromium's report that the GPU process lost a WebGL context. It
+            // prints this only for such a loss (webgl_rendering_context_base.cc:
+            // displayed for kRealLostContext alone), never for anything a page
+            // does. Without a GPU (CI) the GPU process exits under load ("GPU
+            // process exited unexpectedly: exit_code=512") and every live
+            // context reports it; e2e:composer_wobble failed on one (2026-11-16).
+            // Whether the page recovers is e2e:file_view's to check. Kept apart
+            // and logged by `check_console!`, not counted against the page.
+            if (e.message === 'WebGL: CONTEXT_LOST_WEBGL: loseContext: context lost') {
+                gpuLost.push({page: wc.getURL(), time: Date.now()});
+                return;
+            }
             // The GPU process's notes on the machine's graphics driver, not the
             // page's: without a GPU (CI) every WebGL frame is read back for the
             // software compositor, and Chromium says so ("GPU stall due to
@@ -1431,6 +1444,9 @@ function check_console!()
     entries = Any[]
     for ctx in open
         append!(entries, console_entries(ctx; take = true))
+        lost = run(ctx.app, "(global.__btGpuLost || []).splice(0)")
+        lost === nothing || isempty(lost) ||
+            @info "the browser's GPU process lost WebGL contexts (not counted as page warnings)" n = length(lost) pages = unique(String[l["page"] for l in lost])
     end
     lock(CONSOLE.lock) do
         prepend!(entries, CONSOLE.unchecked)
@@ -2279,8 +2295,8 @@ end
 
 "Go to the dashboard by clicking the Home entry in the sidebar."
 function to_dashboard(s::TestServer)
-    eval_js(s, """(() => { const h = [...document.querySelectorAll('.bt-side-item')]
-        .find(e => (e.innerText||'').trim().startsWith('Home')); if (h) h.click(); return true; })()""")
+    # By its view, as `to_settings`: Home is an icon without text.
+    eval_js(s, "document.querySelector('.bt-side-item[data-project-id=\"\"]')?.click(); true")
     sleep(0.6)
     return s
 end

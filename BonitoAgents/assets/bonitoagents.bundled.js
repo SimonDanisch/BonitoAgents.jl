@@ -2058,7 +2058,6 @@ class BonitoChat {
     onSessionReset() {
         this.setCancelling(false);
         this.thinkingEl?.classList.remove('bt-thinking-active');
-        this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
         this.cancelPendingScroll();
         for (const node of this.nodeById.values()){
@@ -3535,7 +3534,8 @@ class BonitoChat {
                 return;
             }
             const t = e.target;
-            if (t && (t.isContentEditable || t.closest && t.closest('.monaco-editor'))) return;
+            const field = t && t.closest && t.closest('input, textarea, select');
+            if (t && (t.isContentEditable || field && field !== this.textInput || t.closest && t.closest('.monaco-editor'))) return;
             e.preventDefault();
             this.cancel();
         };
@@ -4080,7 +4080,7 @@ function markdownWorkerPath(anchor) {
     } else if (url.protocol === 'file:') {
         path = decodePath(url.pathname);
     } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-        if (url.origin !== window.location.origin) return null;
+        if (/^https?:/i.test(raw)) return null;
         path = decodePath(url.pathname);
     } else {
         return null;
@@ -4094,7 +4094,13 @@ function linkifyPaths(rootEl) {
     rootEl.querySelectorAll('a[href]').forEach((el)=>{
         if (el.classList.contains('bt-path-link')) return;
         const path = markdownWorkerPath(el);
-        if (!path) return;
+        if (!path) {
+            if (/^https?:/i.test(el.getAttribute('href') || '')) {
+                el.target = '_blank';
+                el.rel = 'noopener noreferrer';
+            }
+            return;
+        }
         el.classList.add('bt-path-link');
         el.dataset.path = path;
     });

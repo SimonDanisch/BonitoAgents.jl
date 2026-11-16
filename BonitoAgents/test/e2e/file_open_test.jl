@@ -3,7 +3,7 @@
 @testitem "e2e:file_open" setup = [SharedServer] tags = [:e2e] begin
     const TestKit = SharedServer.TestKit
     include(joinpath(@__DIR__, "file_open.jl"))
-    server = TestKit.dev_server(agent = agent_script)
+    server = TestKit.dev_server()
     try
         TestKit.open_browser(server)
         run_suite(server)

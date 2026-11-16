@@ -110,11 +110,12 @@ end
 # The worker a chat lives on, as the two strings its icon shows: the short tag
 # for the badge and the full name for the tooltip. A worker the server has no
 # record of (a stale id) is named by that id rather than by a guess.
-function worker_label(workers::AbstractDict, p::ProjectInfo)
-    w = get(workers, p.worker_id, nothing)
-    w === nothing && return (derive_initials(p.worker_id), String(p.worker_id))
+function worker_label(workers::AbstractDict, worker_id::AbstractString)
+    w = get(workers, worker_id, nothing)
+    w === nothing && return (derive_initials(worker_id), String(worker_id))
     return (worker_initials(w), w.name)
 end
+worker_label(workers::AbstractDict, p::ProjectInfo) = worker_label(workers, p.worker_id)
 worker_label(state::ServerState, p::ProjectInfo) = worker_label(state.workers[], p)
 
 function project_icon(state::ServerState, p::ProjectInfo; size_px::Int = 32)
@@ -122,32 +123,16 @@ function project_icon(state::ServerState, p::ProjectInfo; size_px::Int = 32)
     return project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; size_px = size_px, color = worker_color(state, p.worker_id))
 end
 
-# A single sidebar row: icon + label + identifying data-attribute. NO
-# Observables interpolated in here — the click handler and the
-# active-highlight class swap are delegated from the outer `<aside>`,
-# so this DOM can be recycled by the structural `map(state.projects)`
-# below without churning any tracked Observable IDs.
-function sidebar_entry(label::AbstractString, icon::Bonito.Node,
-                        target_value::AbstractString, title::AbstractString;
-                        active::Bool = false, closeable::Bool = false,
-                        extra_class::AbstractString = "")
-    # Only the static Home and Settings entries use this form; chat rows are `SidebarChat`,
-    # which own a `status` Observable and render it as the icon's glow class.
-    kids = Any[icon, DOM.span(label; class = "bt-side-name")]
-    # A ✕ to close (stop) an active chat. Plain markup — the delegated
-    # handler on the aside reads `.bt-side-close` and routes to close_trigger
-    # rather than current_view, so no per-entry Observable is interpolated
-    # into the recyclable body.
-    closeable && push!(kids, DOM.span("✕"; class = "bt-side-close", title = "Close chat"))
-    cls = "bt-side-item" * (active ? " bt-side-active" : "")
-    isempty(extra_class) || (cls = cls * " " * String(extra_class))
-    DOM.div(kids;
-        class = cls,
-        title = title,
-        # `data-project-id` is the view the entry opens: "" for Home (the
-        # dashboard), `SETTINGS_VIEW`, or a project id. The delegated click
-        # handler reads this to know which view to switch to.
-        dataProjectId = target_value)
+# Home or Settings: an icon in the sidebar's top row, named by its `aria-label`
+# and tooltip. A `.bt-side-item` like a chat row, so the aside's one click
+# handler opens it and the active highlight follows it, with no Observable in
+# here. `data-project-id` is the view it opens: "" for Home (the dashboard) or
+# `SETTINGS_VIEW`.
+function sidebar_nav(file::AbstractString, label::AbstractString, view::AbstractString,
+                     tooltip::AbstractString; active::Bool)
+    icon = DOM.img(src = bonito_asset("icons", file), alt = "", draggable = "false")
+    return DOM.div(icon; class = "bt-side-item bt-side-nav" * (active ? " bt-side-active" : ""),
+                   title = tooltip, role = "button", var"aria-label" = label, dataProjectId = view)
 end
 
 # ── One sidebar chat row, built ONCE and kept ────────────────────────────────
@@ -404,6 +389,129 @@ const SIDEBAR_GROUP_RANK = Dict(:app => 0, :active => 1, :other => 2)
 sidebar_rank(group::Symbol, ended::Float64, p::ProjectInfo) =
     (SIDEBAR_GROUP_RANK[group], -ended, lowercase(p.name))
 
+# ── Search ───────────────────────────────────────────────────────────────────
+# The sidebar's search box finds chats by their title or folder: the open chats
+# first, in the sidebar's order, then every other one, the most recently used
+# first: closed chats, chats never used, and the sessions the workers' scans
+# found that no chat resumes yet (what the dashboard lists per worker). It reads
+# only what is persisted (projects.json, discovered.json, the turn times), so it
+# finds the same chats under the same titles after a restart.
+
+# One chat the search found: a chat of this server, or a session on a worker.
+struct SearchHit
+    pid        :: String    # the chat; "" for a found session
+    title      :: String
+    folder     :: String    # the folder's name
+    worker_id  :: String
+    path       :: String    # the folder on the worker
+    session_id :: String    # a found session's id; "" for a chat
+    provider   :: String    # the agent a found session belongs to; "" if unknown
+    when       :: Float64   # last used, unix time; 0.0 if unknown
+end
+SearchHit(p::ProjectInfo, when::Float64) =
+    SearchHit(p.id, p.title[], p.name, p.worker_id, p.worker_path, "", "", when)
+SearchHit(h::SearchHit, when::Float64) =
+    SearchHit(h.pid, h.title, h.folder, h.worker_id, h.path, h.session_id, h.provider, when)
+
+# Every word of `q` is in the title or the folder's name, in any case.
+function search_match(q::AbstractString, h::SearchHit)
+    hay = lowercase(h.title * " " * h.folder)
+    return all(w -> occursin(w, hay), split(lowercase(q)))
+end
+
+# A session a worker's scan found, as a hit: its first prompt is its title, as
+# on the dashboard. `nothing` for what is no chat (a subagent, a scan error, a
+# folder without a session).
+function SearchHit(worker_id::AbstractString, r::AbstractDict)
+    (haskey(r, "error") || get(r, "kind", "session") == "subagent") && return nothing
+    sid = get(r, "session_id", nothing)
+    (sid isa AbstractString && !isempty(sid)) || return nothing
+    path = String(get(r, "path", ""))
+    preview, provider, used = get(r, "first_prompt", nothing), get(r, "provider", nothing), get(r, "last_used", 0.0)
+    return SearchHit("", session_preview_title(preview isa AbstractString ? preview : ""), basename(path),
+                     String(worker_id), path, String(sid), provider isa AbstractString ? String(provider) : "",
+                     used isa Number ? Float64(used) : 0.0)
+end
+
+"""
+    sidebar_search(state, q; limit = 30) -> (open, other, more)
+
+The chats whose title or folder has every word of `q`. `open`: those in the
+sidebar, in its order. `other`: the rest the user may see, the most recently
+used first, at most `limit` of them; `more` counts the ones past that. A session
+some chat resumes is found as that chat; a session on a worker that is offline
+is left out, since nothing can open it now.
+"""
+function sidebar_search(state::ServerState, q::AbstractString; limit::Int = 30)
+    projects = state.projects[]
+    ended = lock(() -> copy(state.turns_ended), state.lock)
+    open = open_chat_projects(state, projects)
+    status = Dict(p.id => chat_status(state, p) for p in open)
+    sort!(open; by = p -> sidebar_rank(sidebar_group(p, status[p.id]), get(ended, p.id, 0.0), p))
+    open_hits = filter(h -> search_match(q, h), [SearchHit(p, get(ended, p.id, 0.0)) for p in open])
+    open_ids = Set(p.id for p in open)
+    other = SearchHit[]
+    resumed = Set{String}()
+    for p in values(projects)
+        p.resume_session_id === nothing || push!(resumed, p.resume_session_id)
+        (p.id in open_ids || !visible(state, p)) && continue
+        h = SearchHit(p, 0.0)
+        search_match(q, h) && push!(other, SearchHit(h, max(get(ended, p.id, 0.0), last_active(state, p))))
+    end
+    workers = state.workers[]
+    for (wid, sessions) in state.discovered[]
+        w = get(workers, wid, nothing)
+        (w === nothing || !isopen(w) || !visible(state, w)) && continue
+        for r in sessions
+            h = SearchHit(wid, r)
+            (h === nothing || h.session_id in resumed) && continue
+            search_match(q, h) && push!(other, h)
+        end
+    end
+    sort!(other; by = h -> -h.when)
+    return (open = open_hits, other = first(other, limit), more = max(0, length(other) - limit))
+end
+
+# A hit as a row. A chat's row is a `.bt-side-item` like the sidebar's own, so
+# the sidebar's click handler opens it; a found session's carries what opening
+# it needs (`import_chat!`).
+function search_hit_dom(state::ServerState, workers::AbstractDict, h::SearchHit)
+    tag, wname = worker_label(workers, h.worker_id)
+    color = worker_color(workers, h.worker_id)
+    p = isempty(h.pid) ? nothing : get(state.projects[], h.pid, nothing)
+    icon = p === nothing ?
+        project_icon_for(h.session_id, h.folder, rstrip(normalize_worker_path(h.path), '/'), tag, wname; color) :
+        project_icon_for(p.id, p.name, folder_hue_key(p), tag, wname; image = chat_icon_image(state, p), color)
+    # The machine is the icon's badge (and in the tooltip): the line has room for
+    # the folder and when it was last used.
+    about = join(filter(!isempty, [h.title == h.folder ? "" : h.folder,
+                                   h.when > 0 ? relative_time_label(h.when) : ""]), " · ")
+    text = DOM.div(DOM.span(h.title; class = "bt-side-name"), DOM.span(about; class = "bt-side-about");
+                   class = "bt-side-text")
+    tip = "$(h.title) · folder: $(h.path) · $(wname)"
+    p === nothing && return DOM.div(DOM.div(icon; class = "bt-side-icon-wrap"), text;
+        class = "bt-side-hit bt-side-session", title = tip, dataWorkerId = h.worker_id,
+        dataSessionPath = js_path(h.path), dataSessionId = h.session_id, dataProvider = h.provider,
+        # The title it was found by, for the chat it becomes ("" for the fallback).
+        dataSessionTitle = h.title == session_preview_title("") ? "" : h.title)
+    return DOM.div(DOM.div(icon; class = "bt-side-icon-wrap"), text;
+        class = "bt-side-item bt-side-hit", title = tip, dataProjectId = h.pid)
+end
+
+# The search's results for `q`: its two sections, or a line saying there is none.
+function search_results_dom(state::ServerState, workers::AbstractDict, q::AbstractString)
+    found = sidebar_search(state, q)
+    isempty(found.open) && isempty(found.other) &&
+        return DOM.div("No chat matches “$(strip(q))”."; class = "bt-side-empty")
+    rows = Any[]
+    isempty(found.open) || push!(rows, DOM.div("Open"; class = "bt-side-group"),
+                                 (search_hit_dom(state, workers, h) for h in found.open)...)
+    isempty(found.other) || push!(rows, DOM.div("Not open"; class = "bt-side-group"),
+                                  (search_hit_dom(state, workers, h) for h in found.other)...)
+    found.more > 0 && push!(rows, DOM.div("$(found.more) more: add a word to narrow it down."; class = "bt-side-empty"))
+    return DOM.div(rows...; class = "bt-side-results-list")
+end
+
 # Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
 # a route saved by one server process must not navigate a fresh one. Lazy
 # (Ref filled on first use) — a `const x = uuid4()` would be baked into the
@@ -428,15 +536,6 @@ so it does not rebuild rows or re-register `current_view` in row subsessions.
 function project_sidebar(session::Bonito.Session, state::ServerState,
                           current_view::Observable{String},
                           pane::Union{Nothing,PlotPane} = nothing)
-    # Home and Settings aren't projects — they're nav. Each renders as a
-    # borderless 32px slot so it reads as navigation instead of competing with
-    # the colored project tiles below.
-    nav_icon(file, alt) = DOM.div(
-        DOM.img(src = bonito_asset("icons", file), alt = alt, draggable = "false",
-                style = Styles("width" => "18px", "height" => "18px",
-                               "display" => "block", "pointer-events" => "none"));
-        class = "bt-side-nav-icon")
-
     # Closing an active chat from the sidebar: tear its session down and, if it
     # was the one on screen, fall back to the dashboard. Interpolated once on
     # the aside's onload (below), never into the recyclable body.
@@ -546,15 +645,50 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                               class = "bt-side-empty") : DOM.span(; class = "bt-hidden")
     end
 
-    body = DOM.div(
-        sidebar_entry("Home", nav_icon("home.svg", "Home"), "", "Dashboard";
-                      active = current_view[] == "", extra_class = "bt-side-nav"),
-        sidebar_entry("Settings", nav_icon("settings.svg", "Settings"), SETTINGS_VIEW,
-                      "Settings: defaults, agent instructions, accounts";
-                      active = current_view[] == SETTINGS_VIEW, extra_class = "bt-side-nav"),
-        KeyedList(entries_obs; key = c -> c.pid),
-        empty_note;
-        class = "bt-side-list")
+    # The search (see `sidebar_search`). While it has words, its results stand
+    # in for the chat rows, which stay as they are underneath (file trees and
+    # all) and come back when it is cleared: by Escape, the box's ✕, or opening
+    # a result.
+    query = Observable("")
+    searching = map(q -> !isempty(strip(q)), session, query)
+    results = map(session, query, state.projects, state.discovered, state.workers, state.chat_signal) do q, _, _, workers, _
+        isempty(strip(q)) ? DOM.span(; class = "bt-hidden") : search_results_dom(state, workers, q)
+    end
+    search_box = DOM.input(; type = "search", class = "bt-side-search", placeholder = "Search chats",
+        value = query, spellcheck = "false", autocomplete = "off",
+        oninput = js"event => $(query).notify(event.target.value)",
+        onkeydown = js"""event => {
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            $(query).notify('');
+            event.target.blur();
+        }""")
+    # Opening a found session makes it a chat, as its Resume on the dashboard
+    # does. One at a time: a double click must not make two chats.
+    open_session = Observable(Dict{String,Any}())
+    opening = Ref(false)
+    on(session, open_session) do d
+        (isempty(d) || opening[]) && return
+        opening[] = true
+        @async try
+            provider = String(d["provider"])
+            p = import_chat!(state, String(d["worker"]), String(d["path"]);
+                             resume_session_id = String(d["session_id"]),
+                             provider = isempty(provider) ? nothing : provider,
+                             title = String(d["title"]))
+            current_view[] = p.id
+        catch e
+            bt = catch_backtrace()
+            @warn "sidebar: opening a found session failed" session = d["session_id"] exception = (e, bt)
+            pane === nothing || busy_fail!(pane.progress, "Couldn't open the chat", error_detail(e, bt))
+        finally
+            opening[] = false
+        end
+    end
+
+    chats = DOM.div(KeyedList(entries_obs; key = c -> c.pid), empty_note;
+        class = map(s -> s ? "bt-side-chats bt-side-searching" : "bt-side-chats", session, searching))
+    body = DOM.div(chats, DOM.div(results; class = "bt-side-results"); class = "bt-side-list")
 
 
     # VSCode-style collapse toggle: shrinks the sidebar to an icons-only rail
@@ -579,9 +713,18 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
             const collapsed = aside.classList.toggle('bt-collapsed');
             ($(STORAGE_JS)).set('bt-sidebar-collapsed', collapsed ? '1' : '0');
         }""")
-    header = DOM.div(collapse_btn; class = "bt-side-header")
+    # The top row: Home and Settings as icons, the toggle at the end. Below it
+    # the search, right above what it searches.
+    nav = DOM.div(
+        sidebar_nav("home.svg", "Home", "", "Home: workers and recent chats";
+                    active = current_view[] == ""),
+        sidebar_nav("settings.svg", "Settings", SETTINGS_VIEW, "Settings: defaults, agent instructions, accounts";
+                    active = current_view[] == SETTINGS_VIEW);
+        class = "bt-side-navs")
+    header = DOM.div(nav, collapse_btn; class = "bt-side-header")
+    search_row = DOM.div(search_box; class = "bt-side-search-row")
 
-    aside = DOM.aside(header, body; class = "bt-sidebar", dataBootId = server_boot_id())
+    aside = DOM.aside(header, search_row, body; class = "bt-sidebar", dataBootId = server_boot_id())
 
     # Delegated click handler: one listener on the aside. A click on a
     # `.bt-side-close` ✕ routes to `close_trigger`; anything else on a
@@ -617,6 +760,17 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
                 e.stopPropagation();
                 const item = close.closest('.bt-side-item');
                 if (item) $(close_trigger).notify(item.dataset.projectId || '');
+                return;
+            }
+            // A search result: the search is done. A found session becomes a
+            // chat on the server first; a chat opens like any row below.
+            const hit = e.target.closest('.bt-side-hit');
+            if (hit) $(query).notify('');
+            if (hit && hit.dataset.sessionId) {
+                $(open_session).notify({worker: hit.dataset.workerId, path: hit.dataset.sessionPath,
+                                        session_id: hit.dataset.sessionId, provider: hit.dataset.provider || '',
+                                        title: hit.dataset.sessionTitle || ''});
+                el.classList.remove('bt-side-open');
                 return;
             }
             const item = e.target.closest('.bt-side-item');
@@ -719,11 +873,49 @@ const SidebarStyles = Bonito.Styles(
         CSS(".bt-sidebar:not(.bt-collapsed)", "width" => "var(--bt-side-w, 320px)")),
     CSS(".bt-side-list",
         "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
-    # Header rail: holds the VSCode-style sidebar toggle. Right-aligned when
-    # expanded, centered when collapsed.
+    # The top row: Home and Settings as icons, the VSCode-style sidebar toggle at
+    # the end. In the icon rail they stack, the toggle first.
     CSS(".bt-side-header",
-        "display" => "flex", "align-items" => "center", "justify-content" => "flex-end",
-        "padding" => "0 8px 2px", "flex-shrink" => "0"),
+        "display" => "flex", "align-items" => "center", "justify-content" => "space-between",
+        "gap" => "6px", "padding" => "0 8px 4px", "flex-shrink" => "0"),
+    CSS(".bt-side-navs", "display" => "flex", "align-items" => "center", "gap" => "2px"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-header",
+        "flex-direction" => "column-reverse", "justify-content" => "center", "padding" => "0 0 6px"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-navs", "flex-direction" => "column"),
+    # Home / Settings: a square button around a muted glyph, which turns the
+    # accent colour when its page is the one shown. The SVGs ship with white
+    # strokes, recoloured by a CSS filter (invert+sepia+rotate, close to
+    # --bw-text-muted and --bw-accent), so there is no per-colour SVG variant.
+    CSS(".bt-side-item.bt-side-nav",
+        "width" => "32px", "height" => "32px", "padding" => "0", "box-sizing" => "border-box",
+        "justify-content" => "center", "border-left" => "none", "border-radius" => "var(--bw-radius-sm)"),
+    CSS(".bt-side-nav img",
+        "width" => "18px", "height" => "18px", "display" => "block", "pointer-events" => "none",
+        "filter" => "invert(48%) sepia(13%) saturate(540%) hue-rotate(176deg) brightness(92%) contrast(86%)"),
+    CSS(".bt-side-nav.bt-side-active img",
+        "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
+    # The search, right above what it searches. Not in the icon rail: no room to type.
+    CSS(".bt-side-search-row", "display" => "flex", "padding" => "0 8px 6px", "flex-shrink" => "0"),
+    CSS(".bt-side-search",
+        "flex" => "1 1 auto", "min-width" => "0", "box-sizing" => "border-box",
+        "padding" => "4px 8px", "font-size" => "var(--bw-font-size-sm)",
+        "border" => "1px solid var(--bw-border)", "border-radius" => "var(--bw-radius-sm)",
+        "background" => "var(--bw-bg)", "color" => "var(--bw-text)", "outline" => "none"),
+    CSS(".bt-side-search:focus", "border-color" => "var(--bw-accent)"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-search-row", "display" => "none"),
+    # The chat rows, or while searching, the results in their place.
+    CSS(".bt-side-chats, .bt-side-results-list",
+        "display" => "flex", "flex-direction" => "column", "gap" => "2px"),
+    CSS(".bt-sidebar:not(.bt-collapsed) .bt-side-chats.bt-side-searching", "display" => "none"),
+    CSS(".bt-sidebar.bt-collapsed .bt-side-results", "display" => "none"),
+    # A result: its title over its folder, machine and when it was last used.
+    CSS(".bt-side-hit", "display" => "flex", "align-items" => "center", "gap" => "8px",
+        "padding" => "6px 10px", "cursor" => "pointer", "border-left" => "3px solid transparent"),
+    CSS(".bt-side-hit:hover", "background" => "var(--bw-bg-subtle)"),
+    CSS(".bt-side-text", "display" => "flex", "flex-direction" => "column", "min-width" => "0", "flex" => "1 1 auto"),
+    CSS(".bt-side-about",
+        "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)",
+        "white-space" => "nowrap", "overflow" => "hidden", "text-overflow" => "ellipsis"),
     CSS(".bt-side-collapse",
         "display" => "inline-flex", "align-items" => "center", "justify-content" => "center",
         "width" => "28px", "height" => "28px", "padding" => "0",
@@ -758,7 +950,6 @@ const SidebarStyles = Bonito.Styles(
         "font-size" => "0", "padding" => "0", "height" => "1px",
         "margin" => "6px 12px", "background" => "var(--bw-border)"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-empty", "display" => "none"),
-    CSS(".bt-sidebar.bt-collapsed .bt-side-header", "justify-content" => "center", "padding" => "0 0 6px"),
     CSS(".bt-side-item",
         # Vertically center the label against the icon — reads as a normal
         # inline `[icon] text` row. For a two-line title the icon centers to
@@ -847,19 +1038,6 @@ const SidebarStyles = Bonito.Styles(
         "text-shadow" => "0 1px 2px rgba(15,23,42,0.55)",
         "border-radius" => "5px 0 8px 0", "pointer-events" => "none",
         "font-family" => "'Inter', system-ui, sans-serif"),
-    # Home / Settings icons: borderless 32px slot, glyph in muted text color so
-    # it sits quietly above the colorful project tiles. The SVGs ship with white
-    # strokes, so we recolor them via a CSS filter.
-    CSS(".bt-side-nav-icon",
-        "width" => "32px", "height" => "32px",
-        "display" => "flex", "align-items" => "center", "justify-content" => "center",
-        "flex-shrink" => "0"),
-    # invert+sepia+rotate is the standard trick for tinting a white SVG via
-    # CSS without per-color SVG variants. Lands close to --bw-text-muted (#64748b).
-    CSS(".bt-side-nav-icon img",
-        "filter" => "invert(48%) sepia(13%) saturate(540%) hue-rotate(176deg) brightness(92%) contrast(86%)"),
-    CSS(".bt-side-active .bt-side-nav-icon img",
-        "filter" => "invert(38%) sepia(86%) saturate(2400%) hue-rotate(212deg) brightness(99%) contrast(95%)"),
     CSS(".bt-side-name",
         "font-size" => "var(--bw-font-size-sm)",
         "line-height" => "1.3",
@@ -1017,6 +1195,13 @@ const SidebarStyles = Bonito.Styles(
         # Same story for the "No open chats yet — open one from the
         # dashboard" empty state: a 56px column has no room for a sentence.
         CSS(".bt-sidebar:not(.bt-side-open) .bt-side-empty", "display" => "none"),
+        # No search in the rail either; the open sidebar has it.
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-search-row", "display" => "none"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-header",
+            "flex-direction" => "column-reverse", "justify-content" => "center", "padding" => "0 0 6px"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-navs", "flex-direction" => "column"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-results", "display" => "none"),
+        CSS(".bt-sidebar:not(.bt-side-open) .bt-side-chats.bt-side-searching", "display" => "flex"),
         # The per-chat "▾ files" affordance is absolutely positioned at the
         # row's bottom-right; in the 56px icon rail it overlays the chat icon.
         # The explicit `.bt-collapsed` path hides it (above) — the responsive
@@ -1039,11 +1224,14 @@ const SidebarStyles = Bonito.Styles(
             "display" => "block", "position" => "fixed", "inset" => "0", "z-index" => "899",
             "background" => "rgba(15,23,42,0.35)"),
         CSS(".bt-sidebar.bt-side-open .bt-side-header",
-            "justify-content" => "flex-end", "padding" => "0 8px 2px"),
+            "flex-direction" => "row", "justify-content" => "space-between", "padding" => "0 8px 4px"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-navs", "flex-direction" => "row"),
         CSS(".bt-sidebar.bt-side-open .bt-side-name", "display" => "-webkit-box"),
         # Room on the right for the ✕, so a long title never runs under it.
         CSS(".bt-sidebar.bt-side-open .bt-side-item",
             "justify-content" => "flex-start", "padding-right" => "44px"),
+        CSS(".bt-sidebar.bt-side-open .bt-side-item.bt-side-nav",
+            "justify-content" => "center", "padding" => "0"),
         CSS(".bt-sidebar.bt-side-open .bt-side-group",
             "font-size" => "var(--bw-font-size-xs)", "padding" => "10px 12px 4px", "height" => "auto",
             "margin" => "0", "background" => "none"),

@@ -10,7 +10,7 @@
 
     shown(view) = "(() => { const v = document.querySelector('.bt-view-$(view)'); return !!v && getComputedStyle(v).display !== 'none'; })()"
     in_view(view, text) = "document.querySelector('.bt-view-$(view)').textContent.includes($(TK.json(text)))"
-    active_entry = "(document.querySelector('.bt-side-item.bt-side-active .bt-side-name') || {}).textContent"
+    active_entry = "document.querySelector('.bt-side-item.bt-side-active')?.getAttribute('aria-label')"
 
     TK.to_dashboard(server)
     @test TK.wait_for(server, "the dashboard", shown("dash"); timeout = 20) == true

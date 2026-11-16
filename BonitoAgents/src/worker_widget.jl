@@ -513,11 +513,12 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
         prov_raw = get(payload, "provider", nothing)
         provider = (prov_raw === nothing || isempty(String(prov_raw))) ?
                        nothing : String(prov_raw)
+        title = String(get(payload, "title", ""))
         pick[] = Dict{String,Any}()              # reset so the same row can re-fire
         isempty(w_name) && return
         # Double-clicks: `do_import` drops a second one while the first runs.
         c.do_import(w_name, path; resume_session_id = resume_session_id,
-                    provider = provider)
+                    provider = provider, title)
     end
     # Plain DOM (not Bonito.Button) so the onclick can `preventDefault` the
     # enclosing <details> summary toggle (Rescan should NOT collapse the panel
@@ -582,6 +583,7 @@ function render_discover_panel(session::Bonito.Session, c::WorkerCard, wid::Stri
             session_id: btn.dataset.btSessionId   || '',
             provider:   btn.dataset.btProvider    || '',
             worker:     btn.dataset.btWorkerId    || '',
+            title:      btn.dataset.btSessionTitle || '',
         });
     }"""
     # `display: contents` so the wrapper is transparent to the card's layout.

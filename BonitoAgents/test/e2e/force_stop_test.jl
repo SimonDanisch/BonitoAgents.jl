@@ -22,7 +22,8 @@
     end
 
     agent(prompt) = occursin("hold the prompt", prompt) ?
-        [TK.text("The result is ready."), TK.delay(120000)] : [TK.text("follow-up received")]
+        [TK.text("The result is ready."), TK.delay(120000)] :
+        [TK.text("follow-up received"), TK.delay(8000), TK.text("follow-up done"), TK.end_turn()]
     s = TK.dev_server(; agent, ignore_cancel = true)
     try
         TK.open_browser(s)
@@ -51,7 +52,13 @@
         TK.send_message(s, "continue with this correction")
         @test TK.wait_for(s, "the next message reconnects and gets an answer",
             says("follow-up received"); timeout = 90)
-        @test TK.wait_for(s, "the follow-up ends normally", "!($busy)"; timeout = 30)
+        # The session restarts for this message, and the restart resets the
+        # page. The reset used to drop the busy dots while the server, busy with
+        # this very message, never sent them again: "Waiting for your next
+        # instruction" for the whole turn, and a queued message seemed stuck
+        # behind a finished agent (2026-11-16).
+        @test TK.eval_js(s, busy)
+        @test TK.wait_for(s, "the follow-up ends normally", "$(says("follow-up done")) && !($busy)"; timeout = 30)
         @test TK.eval_js(s, "!($pending)")
         @test isempty(TK.js_errors(s))
     finally

@@ -53,17 +53,20 @@ active_tab_label = "(document.querySelector('.bw-tab.bw-active .bw-tab-label')?.
 
 # An agent turn that renders a `read` tool whose TITLE is a real file path → the
 # title becomes a `.bt-path-link` we can actually click (the JS delegation path).
-agent_script(prompt) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl"),
+# `server_url`: a link to a share on the server's own address, which is a web
+# link like any other. It used to open as the worker file `/s/<token>/`.
+agent_script(prompt, server_url) = [TK.tool(kind = "read", title = joinpath(CWD, "hello.jl"),
                                  id = "read-real", tool_name = "Read",
                                  content = [TK.text_block("```julia\nprintln(\"hi from hello\")\n```")]),
                         TK.text("Video: [absolute clip]($(joinpath(CWD, "clip.mp4"))) " *
                                 "or [relative clip](clip.mp4). External: " *
                                 "[Julia](https://julialang.org). " *
+                                "[the shared demo]($(server_url)/s/0123456789abcdef0123456789abcdef/). " *
                                 "[relative source](./relative%20file.jl). " *
                                 "I wrote `Mantle/docs/examples.jl`.")]
 
 function run_suite(server)
-    server.agent_fn[] = agent_script
+    server.agent_fn[] = prompt -> agent_script(prompt, server.h.url)
 
     @testset "BonitoAgents file open (UI-only)" begin
         TK.new_chat(server; cwd = CWD, title = "Files")
@@ -251,6 +254,11 @@ function run_suite(server)
             @test TK.eval_js(server,
                 "!document.querySelector('.bt-agent-msg a[href=\"https://julialang.org\"]')" *
                 ".classList.contains('bt-path-link')") == true
+            # Web links, the server's own included, open beside the app.
+            share = "[...document.querySelectorAll('.bt-agent-msg a')].find(a => a.textContent === 'the shared demo')"
+            @test TK.eval_js(server, "!$share.classList.contains('bt-path-link') && $share.target === '_blank'") == true
+            @test TK.eval_js(server, "$share.getAttribute('href')") == "$(server.h.url)/s/0123456789abcdef0123456789abcdef/"
+            @test TK.eval_js(server, "document.querySelector('.bt-agent-msg a[href=\"https://julialang.org\"]').target") == "_blank"
 
             TK.eval_js(server,
                 "[...document.querySelectorAll('.bt-agent-msg a.bt-path-link')]" *
@@ -301,7 +309,7 @@ function run_suite(server)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    server = TK.dev_server(agent = agent_script)
+    server = TK.dev_server()
     try
         TK.open_browser(server)
         run_suite(server)

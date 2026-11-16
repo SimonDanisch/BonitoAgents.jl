@@ -1,7 +1,8 @@
-# ESC anywhere stops the agent's turn, but not in an editor the user opened:
-# Monaco, and since 2026-11-16 any contentEditable in an app's pane (a draft's
-# text in Community). There ESC leaves the editor; it used to stop the agent
-# and pause the chat's queue as well.
+# ESC anywhere stops the agent's turn, but not in a field the user types in
+# other than the composer: Monaco, and since 2026-11-16 any contentEditable in
+# an app's pane (a draft's text in Community) and any other input, such as the
+# sidebar's search. There ESC leaves the field; it used to stop the agent and
+# pause the chat's queue as well.
 @testitem "e2e:escape_in_app_editor" setup = [SharedServer] tags = [:e2e] begin
     S = SharedServer
     s = S.server()
@@ -26,9 +27,14 @@
         TK.eval_js(s, "$EDITOR.focus(); true")
         @test TK.eval_js(s, "document.activeElement === $EDITOR") == true
         TK.press_key!(s, "Escape")
+        # Nor does the sidebar's search: its ESC clears it.
+        TK.set_input(s, ".bt-side-search", "esc")
+        @test TK.eval_js(s, "document.activeElement === document.querySelector('.bt-side-search')") == true
+        TK.press_key!(s, "Escape")
         window = 3.0
         sleep(window)
         @test TK.eval_js(s, BUSY) == true
+        @test TK.eval_js(s, "document.querySelector('.bt-side-search').value") == ""
 
         # ESC elsewhere still stops it, and faster than the window above: had
         # the first one cancelled, the turn would have ended inside it.

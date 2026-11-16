@@ -57,7 +57,7 @@
         end
         only(w for w in values(state.workers[]) if w.name == name)
     end
-    home!(server) = TK.eval_js(server, "(() => { const h=[...document.querySelectorAll('.bt-side-item')].find(e => (e.innerText||'').trim() === 'Home'); if(!h) return false; h.click(); return true; })()")
+    home!(server) = TK.eval_js(server, "(() => { const h=document.querySelector('.bt-side-item[data-project-id=\"\"]'); if(!h) return false; h.click(); return true; })()")
 
     # strict_load: the mock writes a real transcript per session, each with its own id.
     server = TK.dev_server(agent = agent_script, strict_load = true)

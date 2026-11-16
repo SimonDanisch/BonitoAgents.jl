@@ -9,6 +9,13 @@ pieces fit together.
 
 ### Added
 
+- The sidebar has a search box: it finds chats by title (or folder), the open
+  ones first, then every other one, the most recently used first: closed chats,
+  chats never used, and the sessions the workers' scans found. A result opens
+  from there, without going through the dashboard. It finds the same after a
+  server restart.
+- A found session opened as a chat (from the search or the dashboard's Resume)
+  keeps its title, its first prompt, instead of its folder's name.
 - `bt_process`, `bt_sudo` and `bt_ssh` take `worker = "<name>"` to run on another
   worker of the fleet, with the chat's Remote julia switch. The job is in the
   chat's taskbar and the user can stop it. Later calls find it by its id alone. A
@@ -29,8 +36,12 @@ pieces fit together.
 - Two new chats open in two tabs no longer close each other over and over. The
   cap on live agents now counts only chats whose agent still runs, and never
   closes an empty chat that a tab shows.
-- ESC in an editor inside an app's pane (a draft's text in Community) leaves
-  the editor. It used to stop the agent's turn and pause the chat's queue too.
+- After a Force stop, the next message's turn shows as working. The page used
+  to show "Waiting for your next instruction" for that whole turn, while the
+  agent worked and messages queued behind it waited.
+- ESC in a field other than the composer (an editor in an app's pane, the
+  sidebar's search, a chat's title) leaves the field. It used to stop the
+  agent's turn and pause the chat's queue too.
 
 ## v0.2.2
 

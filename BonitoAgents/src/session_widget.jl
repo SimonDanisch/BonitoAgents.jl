@@ -100,7 +100,9 @@ function render_part(session::Bonito.Session, s::SessionRow)   # timed: diagnost
             dataBtSessionPath = js_path(s.path),
             dataBtSessionId   = s.session_id,
             dataBtProvider    = s.provider,
-            dataBtWorkerId    = s.worker_id);
+            dataBtWorkerId    = s.worker_id,
+            # Its first prompt, which a new chat for it takes as its title.
+            dataBtSessionTitle = s.preview);
         class = "bt-session-row"))
 end
 

@@ -2454,8 +2454,12 @@ class BonitoChat {
     // Concretely:
     //   • `bt-thinking-active` may be stuck on (process!(::Thought) emit
     //     races against teardown). Drop it.
-    //   • `bt-busy-active` is bound to a Julia Observable but its update
-    //     may not have shipped yet. Drop it defensively.
+    //   • NOT `bt-busy-active`: it is bound to the server's `busy_active`,
+    //     which the restart publishes right before this event, and its only
+    //     writer must be that binding. Removing it here left a chat restarted
+    //     FOR a message (a Force stop, then the next message) showing "Waiting
+    //     for your next instruction" for that message's whole turn: the server
+    //     stayed busy, so it never sent the class again (2026-11-16).
     //   • Pending chase rAFs queued from the last stream's `appendChunk`
     //     would otherwise fire AFTER the reset and snap to bottom — yank.
     //   • Any DOM bubble still carrying `bt-stream-active` (the streaming-
@@ -2470,7 +2474,6 @@ class BonitoChat {
     onSessionReset() {
         this.setCancelling(false);
         this.thinkingEl?.classList.remove('bt-thinking-active');
-        this.busyEl?.classList.remove('bt-busy-active');
         this.busyEl?.classList.remove('bt-busy-suppressed');
         this.cancelPendingScroll();
         for (const node of this.nodeById.values()) {
@@ -4457,10 +4460,14 @@ class BonitoChat {
                 this.cmdAcClose();
                 return;
             }
-            // So does an editor the user opened in an app's pane (a draft's
-            // text in Community): its ESC leaves the editor, not the turn.
+            // So does any other field the user types in, the composer being the
+            // one exception: an editor opened in an app's pane (a draft's text
+            // in Community), the sidebar's search, a chat's title. Its ESC
+            // leaves the field, not the turn.
             const t = e.target;
-            if (t && (t.isContentEditable || (t.closest && t.closest('.monaco-editor')))) return;
+            const field = t && t.closest && t.closest('input, textarea, select');
+            if (t && (t.isContentEditable || (field && field !== this.textInput) ||
+                      (t.closest && t.closest('.monaco-editor')))) return;
             e.preventDefault();
             this.cancel();
         };
@@ -5083,9 +5090,11 @@ function decorateCodeBlocks(rootEl) {
 // Recover the WORKER path from a Markdown anchor. CommonMark emits a link to
 // /work/media/clip.mp4 as an anchor with that href; left alone, the browser
 // turns it into http://dashboard/work/... and navigates to a route the server
-// cannot serve. Same-origin absolute URLs are the same failure after the
-// browser has resolved the href, so accept those too. Real web links remain
-// ordinary anchors.
+// cannot serve. A path is written as a path (or `file://`). A written http(s)
+// URL is a web link, the server's own included: a share link, an app or the
+// dashboard. Taking a same-origin URL for a worker path opened every share
+// link as the file `/s/<token>/`, "not found on the worker", while its copied
+// address worked (2026-11-16).
 // A malformed percent escape is still a valid Unix filename: keep it as written.
 function decodePath(text) {
     try { return decodeURIComponent(text); }
@@ -5108,9 +5117,9 @@ function markdownWorkerPath(anchor) {
     } else if (url.protocol === 'file:') {
         path = decodePath(url.pathname);
     } else if (url.protocol === 'http:' || url.protocol === 'https:') {
-        // An explicitly external URL is a web link. A same-dashboard URL
-        // is what a leading worker path becomes in the browser.
-        if (url.origin !== window.location.origin) return null;
+        // A leading-slash or relative path resolves to the dashboard's origin
+        // here too: only what was written as a URL is a web link.
+        if (/^https?:/i.test(raw)) return null;
         path = decodePath(url.pathname);
     } else {
         return null;
@@ -5129,7 +5138,15 @@ function linkifyPaths(rootEl) {
     rootEl.querySelectorAll('a[href]').forEach((el) => {
         if (el.classList.contains('bt-path-link')) return;
         const path = markdownWorkerPath(el);
-        if (!path) return;
+        if (!path) {
+            // A web link opens beside the app: following it in this tab would
+            // leave the app and its live chats.
+            if (/^https?:/i.test(el.getAttribute('href') || '')) {
+                el.target = '_blank';
+                el.rel = 'noopener noreferrer';
+            }
+            return;
+        }
         el.classList.add('bt-path-link');
         el.dataset.path = path;
     });

@@ -127,6 +127,34 @@ function worker_dir_or_error(state::ServerState, worker_id::AbstractString,
 end
 
 """
+    import_chat!(state, worker_id, path; name, resume_session_id, provider) -> ProjectInfo
+
+The chat for folder `path` on a worker, resuming `resume_session_id` if given:
+the chat that already does (`find_thread`), or a new one. What opening a found
+session or a folder does, from the dashboard or the sidebar's search.
+
+The folder is checked on the worker first (`worker_dir_or_error`): a discovered
+session's folder can have been renamed since the scan. The chat is registered,
+not brought up (`start_session = false`): the caller shows it right away, and
+its loading view (`ChatLoadingView`) brings it up with a spinner of its own,
+rather than the page waiting ~10 s for the agent's `session/load`.
+
+`title` is the found session's (its first prompt): a new chat takes it, so the
+session keeps the title it was found and listed by. A chat that already resumes
+the session keeps its own.
+"""
+function import_chat!(state::ServerState, worker_id::AbstractString, path::AbstractString;
+                      name::Union{Nothing,String} = nothing,
+                      resume_session_id::Union{Nothing,String} = nothing,
+                      provider::Union{Nothing,String} = nothing,
+                      title::AbstractString = "")
+    real = worker_dir_or_error(state, worker_id, path)
+    return create_project_from_worker!(state, String(worker_id), real;
+        name = name === nothing ? project_name_from_path(real) : name,
+        resume_session_id, provider, title, start_session = false)
+end
+
+"""
     create_project_from_worker!(srv, worker_name, worker_path;
                                  name, sync=false, resume_session_id=nothing, progress)
 
@@ -149,6 +177,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
                                       sync::Bool = false,
                                       resume_session_id::Union{String,Nothing} = nothing,
                                       provider::Union{String,Nothing} = nothing,
+                                      title::AbstractString = "",
                                       start_session::Bool = true,
                                       progress = nothing)
     # A worker may run a different OS than the server, so `worker_path` is a
@@ -201,6 +230,9 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
     # scan reports the provider per row, so a resumed kimi thread comes back up
     # under kimi instead of the default.
     p.provider = provider
+    # A found session's title (its first prompt): the new chat keeps it, rather
+    # than the folder's name (numbered, when the folder has chats already).
+    isempty(strip(title)) || (p.title[] = first(strip(title), TITLE_MAX_CHARS))
     track_project!(state, p; new_chat = true)
 
     if sync
@@ -2216,29 +2248,14 @@ function dashboard_dom(session::Bonito.Session, state::ServerState;
     function do_import(w_name::String, path::String;
                         name::Union{Nothing,String} = nothing,
                         resume_session_id::Union{Nothing,String} = nothing,
-                        provider::Union{Nothing,String} = nothing)
+                        provider::Union{Nothing,String} = nothing,
+                        title::AbstractString = "")
         importing[] && return nothing
         importing[] = true
         @async begin
             try
                 @info "do_import: starting" worker=w_name path resume=resume_session_id
-                # Ask the WORKER's filesystem whether this folder is really there
-                # and take ITS abspath. The picker's rows come from a `list_dir`
-                # the worker answered, but the address bar is free text and a
-                # discovered session's cwd can have been renamed since the scan.
-                real  = worker_dir_or_error(state, w_name, path)
-                pname = name !== nothing ? name : project_name_from_path(real)
-                # `start_session=false` so the registration finishes fast and we
-                # can flip `current_view` early — the chat bring-up itself
-                # (ensure_project_session!) is then driven by
-                # `ChatLoadingView`, which shows a full-panel spinner while
-                # it runs. Otherwise the user stares at the dashboard for ~10s
-                # of ACP `session/load` with only a tiny pill at the top.
-                p = create_project_from_worker!(state, w_name, real;
-                    name = pname,
-                    resume_session_id = resume_session_id,
-                    provider = provider,
-                    start_session = false)
+                p = import_chat!(state, w_name, path; name, resume_session_id, provider, title)
                 @info "do_import: registered project, flipping view" id=p.id
                 error_obs[]      = ""
                 discover_state[] = ""
