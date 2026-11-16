@@ -29,6 +29,8 @@ pieces fit together.
 - Two new chats open in two tabs no longer close each other over and over. The
   cap on live agents now counts only chats whose agent still runs, and never
   closes an empty chat that a tab shows.
+- ESC in an editor inside an app's pane (a draft's text in Community) leaves
+  the editor. It used to stop the agent's turn and pause the chat's queue too.
 
 ## v0.2.2
 

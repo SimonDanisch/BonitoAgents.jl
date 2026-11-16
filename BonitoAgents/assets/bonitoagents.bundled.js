@@ -3535,7 +3535,7 @@ class BonitoChat {
                 return;
             }
             const t = e.target;
-            if (t && t.closest && t.closest('.monaco-editor')) return;
+            if (t && (t.isContentEditable || t.closest && t.closest('.monaco-editor'))) return;
             e.preventDefault();
             this.cancel();
         };

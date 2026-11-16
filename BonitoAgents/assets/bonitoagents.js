@@ -4457,8 +4457,10 @@ class BonitoChat {
                 this.cmdAcClose();
                 return;
             }
+            // So does an editor the user opened in an app's pane (a draft's
+            // text in Community): its ESC leaves the editor, not the turn.
             const t = e.target;
-            if (t && t.closest && t.closest('.monaco-editor')) return;
+            if (t && (t.isContentEditable || (t.closest && t.closest('.monaco-editor')))) return;
             e.preventDefault();
             this.cancel();
         };
