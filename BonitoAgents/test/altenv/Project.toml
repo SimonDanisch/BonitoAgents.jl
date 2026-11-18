@@ -26,5 +26,8 @@ version = "0.0.1"
 [deps]
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 
+[sources]
+Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "sd/compile-time-improvements"}
+
 [compat]
 Bonito = "5.3"

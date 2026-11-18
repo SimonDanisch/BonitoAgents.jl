@@ -43,6 +43,7 @@ ComputePipeline = "95dc2771-c249-4cd0-9c9f-1f3b4330693c"
 WGLMakie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "WGLMakie"}
 Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "Makie"}
 ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "ComputePipeline"}
+Bonito = {url = "https://github.com/SimonDanisch/Bonito.jl.git", rev = "sd/compile-time-improvements"}
 
 [compat]
 Bonito = "5.3"
