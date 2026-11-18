@@ -14,7 +14,8 @@
     fixture = abspath(joinpath(@__DIR__, "..", "fixtures", "HelloApp"))
     VP = "document.querySelector('.bt-chatpane[aria-hidden=false]')"
     # A tool card in the visible pane, once it ran: its status and its text
-    # (the body expanded once).
+    # (the body expanded once). An expanded body shows "loading…" until its
+    # render arrives, which on a slow runner a probe read as the text.
     card(id) = """(() => {
         const c = $VP?.querySelector('.bt-tool-msg[data-msg-id*="$id"]'); if (!c) return false;
         const st = c.querySelector('.bt-tool-status')?.textContent || '';
@@ -25,7 +26,9 @@
             if (h.dataset.expanded !== 'true') h.click();
             return false;
         }
-        const body = c.querySelector('.bt-tool-body')?.innerText || '';
+        const b = c.querySelector('.bt-tool-body');
+        if (!b || b.querySelector('.bt-collapsable-loading, .bt-tool-loading')) return false;
+        const body = b.innerText || '';
         return body ? [st, body] : false; })()"""
     TILE = "document.querySelector('.bt-app-tile[data-app=\"hello\"]')"
     CARD = "$VP?.querySelector('.bt-prompt-card[data-prompt-kind=\"app_load\"]')"
