@@ -18,8 +18,9 @@ capture time.
   errors **loudly** at build instead of being swallowed.
 - `precompile/capture.sh` — runs a representative set of the e2e items (`ITEMS`, a
   regex over item names; the whole suite takes hours) under `--trace-compile`, in
-  the traced process itself (`nworkers = 0`), where the dev server runs. Raw
-  traces → `precompile/traces/`. It used to run `test/e2e/run_all.jl`, which went
+  the traced process itself (`nworkers = 0`), where the dev server runs, with the
+  shipped statements file moved aside so the trace holds everything the items
+  compile, not just what the old statements miss. Raw traces → `precompile/traces/`. It used to run `test/e2e/run_all.jl`, which went
   away with the move to ReTestItems; the statements then went stale from
   2026-09-25 on, and every server restart compiled the new paths on the first
   page, starving the thread every tab and worker link runs on (a 17 s stall on

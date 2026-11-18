@@ -31,6 +31,10 @@ pieces fit together.
   blocks are `@lock` blocks (no closure and no `lock` copy per call site), and
   string-keyed messages are built as `Dict{String,Any}` (an untyped literal with
   mixed values compiled five times as much).
+- The precompile statements are captured fresh: `capture.sh` runs the e2e items
+  without the shipped statements, and `generate.jl` no longer merges the old file
+  in, so statements for code that no longer runs drop out. 295 of the 3619
+  statements no longer applied; there are 3131 now, 7 of them stale.
 - A server update needs less memory and time. The installer no longer
   precompiles everything into the installing user's depot, which the server
   never reads, so BonitoAgents compiles once instead of twice. That compile
