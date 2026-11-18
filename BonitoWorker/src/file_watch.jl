@@ -102,7 +102,7 @@ function send_appended!(ch, path::AbstractString, offset::Int)
         bytes = read_from(path, offset)
         isempty(bytes) && return offset
         offset += length(bytes)
-        send_watch(ch, Dict("chunk" => String(bytes), "offset" => offset))
+        send_watch(ch, Dict{String,Any}("chunk" => String(bytes), "offset" => offset))
     end
 end
 
@@ -127,7 +127,7 @@ function watch_until_closed(ch, path::AbstractString, offset::Int, ino::Inotify)
     # A file that was there already may belong to a task that ended before the
     # watch began. One that appeared just now has nobody writing it until its
     # creator hands it on, so only its close can say it is over.
-    created || !nobody_writes(path) || return send_watch(ch, Dict("done" => true, "offset" => offset))
+    created || !nobody_writes(path) || return send_watch(ch, Dict{String,Any}("done" => true, "offset" => offset))
     while true
         events = next_events(ino)
         any(e -> e.mask & IN_MODIFY != 0, events) && (offset = send_appended!(ch, path, offset))
@@ -135,7 +135,7 @@ function watch_until_closed(ch, path::AbstractString, offset::Int, ino::Inotify)
         any(e -> e.mask & (IN_DELETE_SELF | IN_MOVE_SELF) != 0, events) && return nothing
         if any(e -> e.mask & IN_CLOSE_WRITE != 0, events) && nobody_writes(path)
             offset = send_appended!(ch, path, offset)
-            return send_watch(ch, Dict("done" => true, "offset" => offset))
+            return send_watch(ch, Dict{String,Any}("done" => true, "offset" => offset))
         end
     end
 end
@@ -152,7 +152,7 @@ WatchStop() = WatchStop(false, nothing, ReentrantLock())
 # Open a watcher under `stop`; an already stopped watch gets an EOFError at once.
 function watching!(open_watcher, stop::WatchStop)
     w = open_watcher()
-    stopped = lock(stop.lock) do
+    stopped = @lock stop.lock begin
         stop.stopped || (stop.current = w)
         stop.stopped
     end
@@ -161,7 +161,7 @@ function watching!(open_watcher, stop::WatchStop)
 end
 
 function stop!(stop::WatchStop)
-    w = lock(stop.lock) do
+    w = @lock stop.lock begin
         stop.stopped = true
         stop.current
     end
@@ -217,13 +217,13 @@ function watch_until_marker(ch, path::AbstractString, offset::Int, markers::Vect
     # the server keeps where, for a watch it opens again later.
     if offset < 0
         from = filesize(path)
-        send_watch(ch, Dict("start" => from))
+        send_watch(ch, Dict{String,Any}("start" => from))
     end
     watch_changes(path, stop) do
         bytes = read_from(path, from; max_bytes = typemax(Int))
         found = first_marker(String(copy(bytes)), markers)
         found === nothing ||
-            send_watch(ch, Dict("done" => true, "offset" => from + length(bytes), "marker" => found))
+            send_watch(ch, Dict{String,Any}("done" => true, "offset" => from + length(bytes), "marker" => found))
         from = max(from, from + length(bytes) - overlap)
         found !== nothing
     end

@@ -176,7 +176,7 @@ fail!(job::Job, detail) = update!(job,job.snapshot["completed"]; status="failed"
 cancel!(job::Job; detail="Cancelled") = update!(job,job.snapshot["completed"]; status="cancelled", detail)
 
 function Base.close(job::Job)
-    lock(job.lock) do
+    @lock job.lock begin
         job.closed = true
         job.socket === nothing || close(job.socket)
         isready(job.wake) || put!(job.wake,nothing)
@@ -201,7 +201,7 @@ function publish(job::Job)
                 send_frame(sock,encode(snapshot))
                 ack = receive_frame(sock)
                 ack == "ok $(snapshot["seq"])" || error("progress update refused: $ack")
-                lock(job.lock) do
+                @lock job.lock begin
                     job.acknowledged = snapshot["seq"]
                     job.last_error = ""
                 end
@@ -249,7 +249,9 @@ progress_logger(parent=current_logger(); context=progress_context()) =
     ProgressLogger(parent,Dict{String,Job}(),ReentrantLock(),Dict{String,String}(context))
 Logging.min_enabled_level(l::ProgressLogger) = min(Logging.LogLevel(-1),Logging.min_enabled_level(l.parent))
 Logging.shouldlog(::ProgressLogger,args...) = true
-Logging.catch_exceptions(::ProgressLogger) = false
+# As the logger it wraps: `false` let a log record whose value can't be shown
+# (`@info "x" v` with a throwing `show`) abort the eval that logged it.
+Logging.catch_exceptions(l::ProgressLogger) = Logging.catch_exceptions(l.parent)
 
 function Logging.handle_message(l::ProgressLogger,level,message,mod,group,id,file,line; kwargs...)
     provider = parentmodule(typeof(message))

@@ -138,7 +138,7 @@ Base.showerror(io::IO, e::WorkerUnreachableError) = print(io, e.op, " ", e.detai
 function register_rpc!(state::ServerState)
     rid = string(uuid4())
     ch  = Channel{Any}(1)
-    lock(state.lock) do
+    @lock state.lock begin
         state.pending_rpcs[rid] = ch
     end
     return (rid, ch)
@@ -158,7 +158,7 @@ the single value `git_diff_on_worker` exposes. The accumulator lives in
 function register_chunked_rpc!(state::ServerState)
     rid = string(uuid4())
     ch  = Channel{Any}(1)
-    lock(state.lock) do
+    @lock state.lock begin
         state.pending_chunks[rid] = ChunkAccumulator(ch, nothing, 0, IOBuffer(),
                                                      Dict{String,Any}())
     end
@@ -171,7 +171,7 @@ end
 # would leak — the RPC wrappers run this in a `finally` to cover that gap.
 # No-op once the key is gone (the normal success path already removed it).
 function unregister_rpc!(state::ServerState, key::AbstractString)
-    lock(state.lock) do
+    @lock state.lock let
         rid = String(key)
         haskey(state.pending_rpcs, rid) && delete!(state.pending_rpcs, rid)
         haskey(state.pending_chunks, rid) && delete!(state.pending_chunks, rid)
@@ -195,7 +195,7 @@ function wait_pending!(state::ServerState, ch::Channel, key::String,
     timer = Timer(timeout) do _
         # Atomic "take if present" so we don't race a concurrent
         # deliver_rpc_response!/deliver_chunk! popping the same key.
-        had = lock(state.lock) do
+        had = @lock state.lock begin
             if haskey(state.pending_rpcs, key)
                 delete!(state.pending_rpcs, key)
                 true
@@ -258,7 +258,7 @@ end
 # legacy-shaped frame (or an error frame) reaches the same channel through the
 # accumulator.
 function deliver_rpc_response!(state::ServerState, rid::AbstractString, value)
-    ch = lock(state.lock) do
+    ch = @lock state.lock begin
         if haskey(state.pending_rpcs, rid)
             pop!(state.pending_rpcs, rid)
         elseif haskey(state.pending_chunks, rid)
@@ -473,7 +473,7 @@ function retire_replaced_credential!(state::ServerState, worker_id::String,
                                      old::AbstractString, new::AbstractString)
     (isempty(old) || old == new) && return nothing
     root = root_state(state)
-    spare = lock(root.lock) do
+    spare = @lock root.lock begin
         haskey(root.worker_credentials[], old) &&
             !any(w -> w.worker_id != worker_id && w.credential == old, values(root.workers[]))
     end
@@ -511,7 +511,7 @@ end
 # the worker answers ours: `{ok: true}` (`accept_channel`) as the first frame
 # once it is served, or an abort with the reason; the relay passes either on to
 # the local process that asked.
-accept_channel(ch::WorkerLink.LinkChannel) = send_control(ch, Dict("ok" => true))
+accept_channel(ch::WorkerLink.LinkChannel) = send_control(ch, Dict{String,Any}("ok" => true))
 
 function accept_worker_channel(state::ServerState, worker_id::String, ch::WorkerLink.LinkChannel)
     header = decode_control(WorkerLink.header(ch))
@@ -574,7 +574,7 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
         "",
     )
     w.capabilities = String[String(c) for c in get(hello, "capabilities", Any[]) if c isa AbstractString]
-    lock(state.lock) do
+    @lock state.lock begin
         w.color_slot = existing === nothing ? free_color_slot(state.workers[], worker_id) : existing.color_slot
         state.worker_links[worker_id] = link
         state.workers[][worker_id] = w
@@ -584,7 +584,7 @@ function register_worker!(state::ServerState, worker_id::String, name::String,
     # From here on the link keeps it current (`worker_link_changed!`); what it
     # did before it was stored went unseen, so catch up once.
     WorkerLink.state(link) === :dead && (teardown_worker!(state, worker_id, link); return w)
-    lock(state.link_events) do
+    @lock state.link_events let
         connected = WorkerLink.state(link) === :connected
         online[] == connected || (online[] = connected)
         connected && wake_worker_chats!(state, worker_id)
@@ -637,7 +637,7 @@ function prune_missing_discovered!(state::ServerState, worker_id::AbstractString
     paths = unique(String(r["path"]) for r in rows if haskey(r, "path"))
     gone = Set(p for p in paths if worker_folder_gone(state, wid, p))
     isempty(gone) && return 0
-    lock(state.lock) do
+    @lock state.lock let
         current = get(state.discovered[], wid, nothing)
         current === nothing || filter!(r -> !(get(r, "path", "") in gone), current)
         save_discovered!(state)
@@ -665,7 +665,7 @@ end
 # A worker that comes (back) online can take the messages its chats held while
 # no session could be brought up there.
 function wake_worker_chats!(state::ServerState, worker_id::AbstractString)
-    chats = lock(state.lock) do
+    chats = @lock state.lock let
         ChatModel[m for (pid, m) in state.chat_models
                   if (p = get(state.projects[], pid, nothing)) !== nothing && p.worker_id == worker_id]
     end
@@ -898,7 +898,7 @@ decommissioned (offline) workers.
 function remove_worker!(state::ServerState, worker_id::AbstractString;
                          remove_projects::Bool = true)
     wid = String(worker_id)
-    link, dropped, evicted, affected = lock(state.lock) do
+    link, dropped, evicted, affected = @lock state.lock let
         # Out of the table BEFORE the kill below, so its `:dead` handler finds
         # it replaced and leaves the teardown to this function.
         l = get(state.worker_links, wid, nothing)
@@ -1220,7 +1220,7 @@ function read_worker_file_range(state::ServerState, worker_id::String,
                                 path::String, start::Int, count::Int)
     rid, ch = register_rpc!(state)
     resp = try
-        send_command(state, worker_id, Dict("type" => "read_file_range",
+        send_command(state, worker_id, Dict{String,Any}("type" => "read_file_range",
             "request_id" => rid, "path" => path, "start" => start, "count" => count))
         take_pending!(state, ch, rid, 30.0, "read_file_range on '$worker_id'")
     finally
@@ -1269,7 +1269,7 @@ function refresh_project_file_index!(state::ServerState, proj::ProjectInfo)
     idx = proj.file_index
     try
         res = list_worker_project_files(state, proj.worker_id, proj.worker_path)
-        lock(idx.lock) do
+        @lock idx.lock begin
             idx.files     = res.files
             idx.truncated = res.truncated
             idx.loaded_at = now(UTC)
@@ -1278,7 +1278,7 @@ function refresh_project_file_index!(state::ServerState, proj::ProjectInfo)
         @warn "project file index refresh failed" project=proj.id exception=e
         # Record the attempt so a dead worker isn't re-walked on every keystroke;
         # keep whatever files we already had.
-        lock(idx.lock) do
+        @lock idx.lock begin
             idx.loaded_at = now(UTC)
         end
     end
@@ -1296,7 +1296,7 @@ already fresh (use [`project_index_files`](@ref) directly).
 function ensure_project_file_index!(state::ServerState, proj::ProjectInfo;
                                     ttl::Real = PROJECT_INDEX_TTL, force::Bool = false)
     idx = proj.file_index
-    return lock(idx.lock) do
+    return @lock idx.lock let
         if idx.refresh_task !== nothing && !istaskdone(idx.refresh_task)
             return idx.refresh_task                    # a walk is already running
         end
@@ -1311,7 +1311,7 @@ function ensure_project_file_index!(state::ServerState, proj::ProjectInfo;
 end
 
 # Snapshot of the cached index (a copy, so callers can't mutate the shared vec).
-project_index_files(proj::ProjectInfo) = lock(proj.file_index.lock) do
+project_index_files(proj::ProjectInfo) = @lock proj.file_index.lock begin
     copy(proj.file_index.files)
 end
 
@@ -1366,7 +1366,7 @@ end
 function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
     # Snapshot candidates under the lock (T14) so we don't iterate
     # `state.projects[]` while a locked writer rehashes it.
-    candidates = lock(state.lock) do
+    candidates = @lock state.lock begin
         [(id, p.worker_path) for (id, p) in state.projects[]
          if p.worker_id == worker_id && p.locked_by === nothing]
     end
@@ -1375,7 +1375,7 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
         worker_path_missing(state, worker_id, wp) && push!(dead, id)
     end
     isempty(dead) && return 0
-    lock(state.lock) do
+    @lock state.lock begin
         for id in dead
             haskey(state.projects[], id) && delete!(state.projects[], id)
             # The review state is keyed by project id and holds pending comments.
@@ -1404,7 +1404,7 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
         error("Worker '$worker_name' is not connected")
     rid, ch = register_rpc!(state)
     resp = try
-        send_command(state, worker_name, Dict("type" => "scan_sessions", "request_id" => rid,
+        send_command(state, worker_name, Dict{String,Any}("type" => "scan_sessions", "request_id" => rid,
                                               "agents" => agents))
         take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
     finally
@@ -1467,7 +1467,7 @@ function scan_and_save!(state::ServerState, wid::String, agents::Bool)
         kept = [r for r in get(state.discovered[], wid, Dict{String,Any}[]) if !haskey(r, "error")]
         push!(kept, Dict{String,Any}("error" => "the last scan failed: " * sprint(showerror, e)))
     end
-    lock(state.lock) do
+    @lock state.lock begin
         state.discovered[][wid] = norm
         state.last_scan[wid] = time()
         save_discovered!(state)
@@ -1518,7 +1518,7 @@ function refresh_broken_titles!(state::ServerState, worker_id::AbstractString)
     # Decide under the lock, write outside it: each title write runs the hook
     # (projects.json + a notify to every tab), which has no business inside
     # the table lock.
-    repairs = lock(state.lock) do
+    repairs = @lock state.lock let
         out = Pair{ProjectInfo,String}[]
         for (pid, p) in state.projects[]
             p.worker_id == wid || continue
@@ -1605,7 +1605,7 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
         throw(WorkerUnreachableError("worker_state on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
-        send_command(state, worker_id, Dict("type" => "worker_state", "request_id" => rid))
+        send_command(state, worker_id, Dict{String,Any}("type" => "worker_state", "request_id" => rid))
         take_pending!(state, ch, rid, timeout, "worker_state on '$worker_id'")
     finally
         unregister_rpc!(state, rid)
@@ -1618,7 +1618,7 @@ end
 # Is an agent turn running in any chat on this worker? Only the server knows:
 # the worker sees agent processes, which exist for every open chat, busy or not.
 function worker_turn_in_flight(state::ServerState, worker_id::AbstractString)
-    models = lock(state.lock) do
+    models = @lock state.lock let
         ChatModel[m for (pid, m) in state.chat_models
                   if (p = get(state.projects[], pid, nothing)) !== nothing &&
                      p.worker_id == worker_id]
@@ -1641,7 +1641,7 @@ function force_worker_update!(state::ServerState, worker_id::AbstractString)
     spec = worker_update_spec(state)
     spec === nothing && throw(ArgumentError(
         "the server has not found out which build to install yet (is GitHub reachable from it?); try again in a minute"))
-    before = lock(state.lock) do
+    before = @lock state.lock let
         w = get(state.workers[], wid, nothing)
         w === nothing ? nothing : (w.update_state, w.update_message, w.update_since)
     end
@@ -1650,7 +1650,7 @@ function force_worker_update!(state::ServerState, worker_id::AbstractString)
     # so this stays, and stays true.
     set_worker_update!(state, wid, :requested, update_note(:requested))
     try
-        send_command(state, wid, Dict("type" => "force_update", "immediate" => true, "update_spec" => spec))
+        send_command(state, wid, Dict{String,Any}("type" => "force_update", "immediate" => true, "update_spec" => spec))
     catch
         # Not requested after all: the card goes back to what it said.
         before === nothing || set_worker_update!(state, wid, before[1], before[2]; since = before[3])
@@ -1685,7 +1685,7 @@ function apply_harness_status!(state::ServerState, worker_id::AbstractString, cm
     installed = get(cmd, "installed", nothing)
     installed isa AbstractDict ||
         (@warn "Worker harness_status carries no versions" worker_id; return false)
-    lock(state.lock) do
+    @lock state.lock begin
         w.harnesses = reported_harnesses(installed)
         w.harness_error = String(get(cmd, "error", ""))
     end
@@ -1735,7 +1735,7 @@ function worker_log(state::ServerState, worker_id::AbstractString;
         throw(WorkerUnreachableError("worker_log on '$worker_id'", "worker is not connected"))
     rid, ch = register_rpc!(state)
     resp = try
-        send_command(state, worker_id, Dict("type" => "read_log", "request_id" => rid,
+        send_command(state, worker_id, Dict{String,Any}("type" => "read_log", "request_id" => rid,
                                             "lines" => Int(lines), "since" => String(since),
                                             "until" => String(until), "grep" => String(grep)))
         take_pending!(state, ch, rid, timeout, "worker_log on '$worker_id'")

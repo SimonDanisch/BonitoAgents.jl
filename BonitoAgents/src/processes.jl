@@ -29,7 +29,7 @@ ChatProcess(d::AbstractDict) =
 
 function save_processes!(state::ServerState)
     rec = state.processes
-    lock(rec.lock) do
+    @lock rec.lock let
         data = Dict{String,Any}(project_id => Any[process_dict(p) for p in values(procs)]
                                 for (project_id, procs) in rec.chats if !isempty(procs))
         atomic_write_json(processes_file(state), data)
@@ -41,7 +41,7 @@ function load_processes!(state::ServerState)
     raw = load_json_tolerant(processes_file(state), "processes.json")
     raw isa AbstractDict || return nothing
     rec = state.processes
-    lock(rec.lock) do
+    @lock rec.lock let
         for (project_id, list) in raw, d in list
             p = try
                 ChatProcess(d)
@@ -80,7 +80,7 @@ function record_process!(state::ServerState, project_id::AbstractString,
                             String(get(d, "label", "")), Float64(get(d, "recorded_at", time())),
                             worker_instance(state, worker_id)) : nothing
     rec = state.processes
-    changed = lock(rec.lock) do
+    changed = @lock rec.lock let
         procs = get!(() -> Dict{Tuple{String,Int},ChatProcess}(), rec.chats, String(project_id))
         alive ? (procs[(worker_id, pid)] = p; true) : pop!(procs, (worker_id, pid), nothing) !== nothing
     end
@@ -184,7 +184,7 @@ function kill_leftovers!(state::ServerState, worker_id::AbstractString)
     since = time()
     instance = worker_instance(state, worker_id)
     rec = state.processes
-    by_chat = lock(rec.lock) do
+    by_chat = @lock rec.lock begin
         [(project_id, ChatProcess[p for p in values(procs)
                                   if p.worker_id == worker_id && p.instance != instance && p.recorded_at < since])
          for (project_id, procs) in rec.chats]

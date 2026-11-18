@@ -77,7 +77,7 @@ you get back IS the completion.
 
 function wait_handler(args::AbstractDict)
     wake = Channel{Nothing}(0)
-    lock(SERVER.waits.lock) do
+    @lock SERVER.waits.lock begin
         push!(SERVER.waits.active, wake)
     end
     note_wait_request!(args,wake)
@@ -88,7 +88,7 @@ function wait_handler(args::AbstractDict)
         end
         return wait_handler(args, wake)
     finally
-        lock(SERVER.waits.lock) do
+        @lock SERVER.waits.lock begin
             delete!(SERVER.waits.active, wake)
         end
         isopen(wake) && close(wake)

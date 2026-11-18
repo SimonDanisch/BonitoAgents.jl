@@ -26,7 +26,7 @@ end
 Base.close(group::MCPChannels) = foreach(close, lock(() -> copy(group.channels), group.state.lock))
 
 function mcp_channels_for(state::ServerState, project_id::AbstractString, host_worker::AbstractString="")
-    lock(state.lock) do
+    @lock state.lock let
         registry, key = isempty(host_worker) ? (state.mcp_ctrl, String(project_id)) :
             (state.eval_hosts, eval_host_key(project_id, host_worker))
         group = get(registry, key, nothing)
@@ -42,7 +42,7 @@ mcp_registry(ch::MCPChannel) = isempty(ch.host_worker) ?
 
 function HTTP.WebSockets.send(ch::MCPChannel, frame::AbstractString)
     rid = get(JSON.parse(frame), "request_id", nothing)
-    lock(ch.state.lock) do
+    @lock ch.state.lock begin
         ch.closed && error("MCP channel is closed")
         rid isa AbstractString && push!(ch.pending, String(rid))
     end
@@ -53,7 +53,7 @@ Base.isopen(ch::MCPChannel) = !ch.closed
 HTTP.WebSockets.isclosed(ch::MCPChannel) = ch.closed
 
 untrack_mcp_request!(ch::MCPChannel, rid) =
-    lock(ch.state.lock) do; delete!(ch.pending, String(rid)); end
+    @lock ch.state.lock begin; delete!(ch.pending, String(rid)); end
 
 function Base.close(ch::MCPChannel)
     pending = lock(ch.state.lock) do
@@ -79,7 +79,7 @@ end
 # Serve each client's channel independently, including its requests and replies.
 function serve_mcp_channel(state::ServerState, ch::MCPChannel)
     registry, key = mcp_registry(ch)
-    lock(state.lock) do
+    @lock state.lock let
         group = get!(() -> MCPChannels(state, MCPChannel[]), registry, key)
         push!(group.channels, ch)
     end
@@ -91,7 +91,7 @@ function serve_mcp_channel(state::ServerState, ch::MCPChannel)
                 d = JSON.parse(String(msg))
                 rid = get(d, "request_id", nothing)
                 if rid isa AbstractString
-                    ours = lock(state.lock) do
+                    ours = @lock state.lock begin
                         String(rid) in ch.pending && (delete!(ch.pending, String(rid)); true)
                     end
                     ours || continue

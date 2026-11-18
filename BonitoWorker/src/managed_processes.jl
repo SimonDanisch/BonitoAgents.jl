@@ -42,7 +42,7 @@ function save_process_jobs!(s::ProcessSupervisor)
     # Call under the supervisor lock; replacing the file is serialized.
     file = joinpath(s.directory, "jobs.json")
     tmp = file * ".tmp"
-    write(tmp, JSON.json(Dict("jobs"=>[j.record for j in values(s.jobs)], "closed_epochs"=>collect(s.closed_epochs))))
+    write(tmp, JSON.json(Dict{String,Any}("jobs"=>[j.record for j in values(s.jobs)], "closed_epochs"=>collect(s.closed_epochs))))
     mv(tmp, file; force=true)
     return nothing
 end
@@ -102,7 +102,7 @@ function process_log_pump(s::ProcessSupervisor, j::ManagedProcess)
         end
     catch e
         (e isa Base.IOError || e isa SystemError) || rethrow()
-        lock(s.lock) do
+        @lock s.lock begin
             j.record["error"] = "Output capture failed: " * sprint(showerror, e)
         end
         @error "managed process output capture failed" id=j.record["id"] exception=(e, catch_backtrace())
@@ -348,9 +348,9 @@ function managed_process_request(s::ProcessSupervisor, project, args::AbstractDi
     limit isa Integer && 1 <= limit <= 65536 || throw(ArgumentError("max_bytes must be 1–65536"))
     offset = get(args,"offset",nothing)
     offset === nothing || (offset isa Integer && offset >= 0) || throw(ArgumentError("offset must be nonnegative"))
-    return lock(s.lock) do
+    return @lock s.lock let
         if action == "list"
-            return Dict("jobs"=>[process_snapshot(s,j;max_bytes=512) for j in values(s.jobs) if j.record["project_id"] == project])
+            return Dict{String,Any}("jobs"=>[process_snapshot(s,j;max_bytes=512) for j in values(s.jobs) if j.record["project_id"] == project])
         end
         j = get(s.jobs,process_key(project,id),nothing)
         j === nothing && throw(ArgumentError("no managed process '$id' in this chat"))
@@ -359,7 +359,7 @@ function managed_process_request(s::ProcessSupervisor, project, args::AbstractDi
 end
 
 function close_process_jobs!(s::ProcessSupervisor, project=nothing; epoch=nothing)
-    ids = lock(s.lock) do
+    ids = @lock s.lock begin
         epoch === nothing || push!(s.closed_epochs,String(epoch))
         save_process_jobs!(s)
         [(j.record["project_id"],j.record["id"]) for j in values(s.jobs)
@@ -376,7 +376,7 @@ function publish_worker_process!(w, snapshot)
     ctrl = lock(() -> w.control, w.lock)
     ctrl === nothing && return nothing
     try
-        send_control(ctrl, Dict("type"=>"managed_process_update", "job"=>snapshot))
+        send_control(ctrl, Dict{String,Any}("type"=>"managed_process_update", "job"=>snapshot))
     catch e
         (e isa WebSockets.WebSocketError || e isa WorkerLink.LinkDead || e isa Base.IOError) || rethrow()
         # The worker remains authoritative while disconnected. connected!
@@ -398,9 +398,9 @@ function handle_managed_process(w, ws, cmd)
         action = get(cmd,"action","")
         if action == "close_chat"
             close_process_jobs!(w.jobs,project; epoch=String(cmd["epoch"]))
-            return Dict("requested"=>true)
+            return Dict{String,Any}("requested"=>true)
         end
-        return Dict("result"=>managed_process_request(w.jobs,project,cmd))
+        return Dict{String,Any}("result"=>managed_process_request(w.jobs,project,cmd))
     end
 end
 
@@ -408,7 +408,7 @@ function restore_process_jobs!(s::ProcessSupervisor)
     file = joinpath(s.directory,"jobs.json")
     isfile(file) || return nothing
     stored = JSON.parsefile(file)
-    lock(s.lock) do
+    @lock s.lock let
         union!(s.closed_epochs,String.(stored["closed_epochs"]))
         for raw in stored["jobs"]
             d = Dict{String,Any}(raw)

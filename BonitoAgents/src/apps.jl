@@ -396,7 +396,7 @@ are left out: their folders are the apps', not the user's projects.
 """
 function chat_folders(server::ServerState, user::User)
     by_folder = Dict{Tuple{String,String},Vector{ProjectInfo}}()
-    lock(server.lock) do
+    @lock server.lock begin
         for p in values(server.projects[])
             (isempty(p.app) && visible(user, p)) || continue
             push!(get!(Vector{ProjectInfo}, by_folder, project_location_key(p)), p)
@@ -455,7 +455,7 @@ function start_chat!(server::ServerState, owner::User, worker::WorkerInfo, path:
     end
     isempty(strip(title)) || (p.title[] = first(strip(title), TITLE_MAX_CHARS))
     isempty(prompt) || (p.auto_prompt = String(prompt))
-    lock(server.lock) do; save_projects!(server); end
+    @lock server.lock begin; save_projects!(server); end
     # The bring-up sends the prompt (`fire_auto_prompt!`).
     ensure_project_session!(server, p)
     return p

@@ -117,7 +117,7 @@ new_link(w::Worker) = WorkerLink.Link(:client; name = "the server",
 # gets its relay before it connects, and a reset (`:reset` comes before the new
 # connection delivers anything) swaps it, so neither ever races a channel.
 function swap_relay!(w::Worker, relay::MCPRelay)
-    old = lock(w.lock) do
+    old = @lock w.lock let
         prev = w.relay
         w.relay = relay
         prev
@@ -319,7 +319,7 @@ Keep the managed agent adapters at `spec` (harnesses.jl): one task per worker,
 which picks up the newest spec whenever it gets to it.
 """
 function schedule_harness_sync!(w::Worker, spec::HarnessSpec)
-    lock(w.lock) do
+    @lock w.lock let
         w.harness.spec = spec
         w.harness.pending = true
         t = w.harness.task
@@ -362,7 +362,7 @@ end
 # An install starts only while nothing runs and no agent session is starting;
 # checked and claimed under the lock, so a session cannot slip in between.
 function begin_harness_sync!(w::Worker)
-    return lock(w.lock) do
+    return @lock w.lock begin
         (worker_idle(w) && w.harness.sessions == 0) || return false
         w.harness.syncing = true
         return true
@@ -394,7 +394,7 @@ function report_harnesses(w::Worker, installed::AbstractDict, err::AbstractStrin
     ctrl = lock(() -> w.control, w.lock)
     ctrl === nothing && return nothing
     try
-        send_control(ctrl, Dict("type" => "harness_status", "installed" => installed, "error" => err))
+        send_control(ctrl, Dict{String,Any}("type" => "harness_status", "installed" => installed, "error" => err))
     catch e
         (e isa WebSockets.WebSocketError || e isa WorkerLink.LinkDead) || rethrow()
     end
@@ -408,7 +408,7 @@ Kill every agent and eval host `w` runs for the server, and abort the agents'
 channels with `reason`.
 """
 function reap!(w::Worker, reason::AbstractString)
-    sessions, hosts = lock(w.lock) do
+    sessions, hosts = @lock w.lock let
         s = collect(w.sessions)
         h = collect(values(w.eval_hosts))
         empty!(w.sessions)
@@ -544,7 +544,7 @@ function serve_channel(w::Worker, ch::WorkerLink.LinkChannel)
     return nothing
 end
 
-channel_ready(ch::WorkerLink.LinkChannel) = WebSockets.send(ch, MsgPack.pack(Dict("ok" => true)))
+channel_ready(ch::WorkerLink.LinkChannel) = WebSockets.send(ch, MsgPack.pack(Dict{String,Any}("ok" => true)))
 
 function refuse_channel(ch::WorkerLink.LinkChannel, reason::AbstractString)
     @error "BonitoWorker: refused the server's request" reason

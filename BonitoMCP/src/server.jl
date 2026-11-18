@@ -33,7 +33,7 @@ end
 # read loop from a `notifications/cancelled`), so multiple tasks may write a
 # response concurrently — `SERVER.out_lock` keeps one line per frame atomic.
 function send!(out::IO, payload::AbstractDict)
-    lock(SERVER.out_lock) do
+    @lock SERVER.out_lock begin
         println(out, JSON.json(payload))
         flush(out)
     end
@@ -153,7 +153,7 @@ function handle_cancelled!(req::AbstractDict)
         # unrelated Julia evaluation. Only the explicit job controls do that.
         if startswith(target_env,"\0bonito-wait:")
             key = target_env[length("\0bonito-wait:")+1:end]
-            lock(SERVER.waits.lock) do
+            @lock SERVER.waits.lock begin
                 for wake in SERVER.waits.active
                     string(objectid(wake)) == key && isopen(wake) && close(wake)
                 end
@@ -191,7 +191,7 @@ function interrupt_in_flight!(env_path::Union{String,Nothing}; scope_temp::Bool 
                              background::Bool = false)
     m = manager()
     targets = Any[]
-    lock(m.lock) do
+    @lock m.lock let
         for s in values(m.sessions)
             s.in_flight === nothing && continue
             if !background

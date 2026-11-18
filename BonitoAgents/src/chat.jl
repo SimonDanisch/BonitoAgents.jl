@@ -492,7 +492,7 @@ function ChatModel(state::ServerState, cwd::AbstractString;
     end
     on(model.yolo) do enabled
         enabled && return
-        lock(model.lock) do
+        @lock model.lock begin
             drop_idle_sends!(model)
             save_pending_sends!(model)
             emit_queue!(model)
@@ -531,7 +531,7 @@ end
 # `map(identity, session, obs)` so each tab gets its own connected child
 # (auto-GC'd on session close).
 function Base.copy(m::ChatModel, session::Bonito.Session, viewer::ServerState = m.viewer)
-    lock(m.lock) do
+    @lock m.lock begin
         ChatModel(
             m.lock,
             m.state, m.cwd, m.project_id,
@@ -639,7 +639,7 @@ SummaryMsg(chat::ChatModel, text::AbstractString) = SummaryMsg(string(uuid4()), 
 # Under MARKDOWN_LOCK (reentrant — markdown_html locks it again): the
 # read-render-write must be atomic against `append!`'s text-grow+cache-clear,
 # see the lock's doc near its definition.
-ensure_html!(m::SummaryMsg) = lock(MARKDOWN_LOCK) do
+ensure_html!(m::SummaryMsg) = @lock MARKDOWN_LOCK begin
     isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
 end
 
@@ -686,7 +686,7 @@ AgentMsg(chat::ChatModel, text::AbstractString) =
 
 # Lazy cache populate. Used by `msg_to_dict` / `wire_final`. Atomic under
 # MARKDOWN_LOCK against `append!` (see the lock's doc near its definition).
-ensure_html!(m::AgentMsg) = lock(MARKDOWN_LOCK) do
+ensure_html!(m::AgentMsg) = @lock MARKDOWN_LOCK begin
     isempty(m.html) ? (m.html = markdown_html(m.text)) : m.html
 end
 
@@ -1602,7 +1602,7 @@ is_pinned(chat::ChatModel, id::AbstractString) =
 # the bar's poll loop is running.
 function Base.push!(bar::TaskBar, m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg,SupervisedTask})
     added = false
-    lock(bar.lock) do
+    @lock bar.lock let
         if !any(t -> t === m, bar.items[])
             bar.items[] = push!(copy(bar.items[]), m)
             added = true
@@ -1627,7 +1627,7 @@ function finished!(m::Union{BashToolMsg,TaskToolMsg,TodoListMsg,JuliaEvalToolMsg
     catch e
         @warn "finalize! failed" id = msg_id(m) exception = (e, catch_backtrace())
     end
-    lock(bar.lock) do
+    @lock bar.lock begin
         bar.items[] = filter(t -> t !== m, bar.items[])
     end
     return nothing
@@ -1758,7 +1758,7 @@ bg_note_name(m::BashToolMsg) =
 
 function note_background!(chat::ChatModel, line)
     notes = shared(chat).bg_notes
-    lock(notes.lock) do
+    @lock notes.lock begin
         # The same ending can be announced twice before the note goes out; say it once.
         line isa AbstractString ? push!(notes.lines, String(line)) : (line in notes.lines || push!(notes.lines, line))
         notes.notifier === nothing &&
@@ -1780,7 +1780,7 @@ function deliver_bg_notes!(chat::ChatModel)
                 continue
             end
             # Taken with the notifier, so a line added from now on starts the next note.
-            lines = lock(notes.lock) do
+            lines = @lock notes.lock let
                 taken = copy(notes.lines)
                 empty!(notes.lines)
                 notes.notifier = nothing
@@ -1795,7 +1795,7 @@ function deliver_bg_notes!(chat::ChatModel)
             return nothing
         end
     finally
-        lock(notes.lock) do
+        @lock notes.lock begin
             notes.notifier === current_task() && (notes.notifier = nothing)
         end
     end
@@ -2080,7 +2080,7 @@ taskbar_dyn_key(m::BashToolMsg) =
 # here (it's the JS ticker; a key change every second would churn).
 taskbar_dyn_key(m::TaskToolMsg) =
     tool_chat(m) === nothing ? string(length(m.activity), "|", phase_note(m.phase)) :
-    lock(shared(tool_chat(m)).lock) do
+    @lock shared(tool_chat(m)).lock begin
         string(length(m.activity), ":", isempty(m.activity) ? "" : last(m.activity).label,
                "|", phase_note(m.phase))
     end
@@ -2092,7 +2092,7 @@ function tool_taskbar_item(chat::ChatModel, b::ToolMsg)
     s = shared(chat)
     # 0-based store index → deterministic click-to-scroll anchor. Stable:
     # the store is append-only.
-    idx = lock(s.lock) do
+    idx = @lock s.lock let
         i = findfirst(m -> m === b, s.msgs_store)
         i === nothing ? -1 : i - 1
     end
@@ -3111,7 +3111,7 @@ function tool_content_for_render(m::ToolMsg, chat_dir::AbstractString)
     chat = tool_chat(m)
     if chat !== nothing
         id = tool_id(m)
-        hit = lock(chat.lock) do
+        hit = @lock chat.lock begin
             haskey(chat.tool_content_cache, id) ?
                 chat.tool_content_cache[id] : nothing
         end
@@ -3135,7 +3135,7 @@ function cache_tool_content!(chat::Union{ChatModel,Nothing}, tool_id::AbstractSt
                               content::AbstractVector)
     chat === nothing && return nothing
     key = String(tool_id)
-    lock(chat.lock) do
+    @lock chat.lock let
         cache = chat.tool_content_cache
         order = chat.tool_cache_order
         cache[key] = Vector{Any}(content)
@@ -3381,7 +3381,7 @@ end
 # post-transfer sanity check, and each stat is a round-trip to another machine.
 function mirror_is_current(st::ShowTool, server_dst::AbstractString, current)
     (current === nothing || !isfile(server_dst)) && return false
-    stamp = lock(st.state.lock) do
+    stamp = @lock st.state.lock begin
         get(st.state.show_mirror_stamps, String(server_dst), nothing)
     end
     return stamp !== nothing && current.size == stamp.size && current.mtime == stamp.mtime
@@ -3412,7 +3412,7 @@ function record_mirror_stamp!(st::ShowTool, server_dst::AbstractString,
                               worker_src::AbstractString, before)
     after = worker_file_stamp(st, worker_src)
     (before === nothing || after === nothing || before != after) && return nothing
-    lock(st.state.lock) do
+    @lock st.state.lock let
         st.state.show_mirror_stamps[String(server_dst)] = (size = after.size, mtime = after.mtime)
     end
     return nothing
@@ -3446,10 +3446,10 @@ function fetch_show_file(st::ShowTool; refresh::Bool = false, stamp = missing)
     current = refresh ? nothing :
               (stamp === missing ? worker_file_stamp(st, worker_src) : stamp)
     !refresh && mirror_is_current(st, server_dst, current) && return server_dst
-    dst_lock = lock(st.state.lock) do
+    dst_lock = @lock st.state.lock begin
         get!(ReentrantLock, st.state.show_fetch_inflight, server_dst)
     end
-    return lock(dst_lock) do
+    return @lock dst_lock let
         # A racer may have fetched it while we waited. Re-check against the stamp
         # we already have rather than stat'ing again: the racer's copy is at
         # least as new as `current`, and if the file has moved on since, the next
@@ -3483,7 +3483,7 @@ end
 # MIME types. `.ogg` is AUDIO here (`.ogv` is the video container) — the old
 # mapping put an .ogg music file into a `<video>` element, which renders a black
 # rectangle with a play button.
-const SHOW_VIDEO_MIME = Dict(".mp4" => "video/mp4", ".webm" => "video/webm",
+const SHOW_VIDEO_MIME = Dict{String,String}(".mp4" => "video/mp4", ".webm" => "video/webm",
     ".ogv" => "video/ogg", ".mov" => "video/quicktime", ".m4v" => "video/mp4")
 const SHOW_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
     ".avif", ".ico")
@@ -4107,7 +4107,7 @@ end
 
 # Add a fresh message to the chat: push to the store, emit its "new" event.
 function send!(model::ChatModel, m::ChatMsg)
-    n = lock(model.lock) do
+    n = @lock model.lock begin
         push!(model.msgs_store, m)
         length(model.msgs_store)
     end
@@ -4132,7 +4132,7 @@ end
 function Base.append!(m::AgentMsg, t::AbstractString)
     # Grow + clear-cache atomically w.r.t. a concurrent `ensure_html!` on the
     # comm task (msgs.request) — see MARKDOWN_LOCK.
-    lock(MARKDOWN_LOCK) do
+    @lock MARKDOWN_LOCK begin
         m.text *= t
         m.html = ""
     end
@@ -4164,7 +4164,7 @@ function stream_chunk!(m::AgentMsg; every::Real = 0.05)
 end
 
 function flush_chunk!(m::AgentMsg)
-    lock(MARKDOWN_LOCK) do
+    @lock MARKDOWN_LOCK begin
         m.flush_pending = false
         m.flushed_at = time()
     end
@@ -4176,7 +4176,7 @@ Base.append!(m::UserMsg, t::AbstractString) = (m.text *= t; chat_emit(m.chat, wi
 # like a UserMessage. Append clears the HTML cache so the eventual close-time
 # render reflects the full text.
 Base.append!(m::SummaryMsg, t::AbstractString) =
-    (lock(MARKDOWN_LOCK) do; m.text *= t; m.html = ""; end; m)
+    (@lock MARKDOWN_LOCK begin; m.text *= t; m.html = ""; end; m)
 
 # Finalize a message: persist to chat.md (per-type writer) + emit its closing
 # event. UserMsg / TodoListMsg have no `*_final` event; a ToolMsg only persists once
@@ -4290,7 +4290,7 @@ const MARKDOWN_LOCK = ReentrantLock()
 # Wrap the rendered html in `.markdown-body` so `Bonito.MarkdownCSS` (which
 # is GitHub-style and already loaded into the shell) handles tables, code
 # blocks, lists, etc. — we don't have to duplicate the styling.
-markdown_html(text::AbstractString) = lock(MARKDOWN_LOCK) do
+markdown_html(text::AbstractString) = @lock MARKDOWN_LOCK let
     inner = sprint(io -> CM.html(io, MARKDOWN_PARSER(defuse_table_rule(String(text)))))
     "<div class=\"markdown-body\">" * inner * "</div>"
 end
@@ -4302,7 +4302,7 @@ end
 # `![clip](clip.mp4)` becomes a video, as in a shared page. `raw_html = false`
 # leaves out the HTML written into the text, and links to a `javascript:` url.
 function markdown_html(text::AbstractString, link::Function; raw_html::Bool = true)
-    inner = lock(MARKDOWN_LOCK) do
+    inner = @lock MARKDOWN_LOCK let
         ast = MARKDOWN_PARSER(defuse_table_rule(String(text)))
         for (node, entering) in ast
             entering || continue
@@ -4672,7 +4672,7 @@ function apply_session_config!(model::ChatModel; wait::Bool = false, submission 
     cli = client(model.agent); cli === nothing && return nothing
     s = shared(model)
     apply = function ()
-        lock(s.config_lock) do
+        @lock s.config_lock let
             client(s.agent) === cli || return
             for (id, val) in effective_session_config(s)
                 current = findfirst(o -> o isa AgentClientProtocol.ConfigOption && o.id == id,
@@ -5232,7 +5232,7 @@ bg_worker_id(state::ServerState, model::ChatModel) =
 function write_bg_content!(chat_dir::AbstractString, m::BashToolMsg)
     body = isempty(strip(m.command)) ? m.bg_text : "\$ $(m.command)\n\n$(m.bg_text)"
     open(tool_file(chat_dir, tool_id(m)), "w") do io
-        JSON.print(io, Dict("content" => [Dict("type" => "text", "text" => body)]))
+        JSON.print(io, Dict{String,Any}("content" => [Dict{String,Any}("type" => "text", "text" => body)]))
     end
     return nothing
 end
@@ -5301,7 +5301,7 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
     state = chat.state
     key = eval_sink_key(chat.project_id, eval_route_key(state, m))
     ch = Channel{String}(Inf)
-    held = lock(state.lock) do
+    held = @lock state.lock begin
         # A stale sink from a prior eval on the same route can only linger if its
         # loop died without cleanup; overwrite it (the MCP routes to the newest).
         state.eval_stream_sinks[key] = ch
@@ -5327,7 +5327,7 @@ function eval_stream_loop!(chat::ChatModel, m::JuliaEvalCall)
         end
     finally
         # Identity-guarded: a re-run on the same route may have replaced us.
-        lock(state.lock) do
+        @lock state.lock begin
             get(state.eval_stream_sinks, key, nothing) === ch &&
                 delete!(state.eval_stream_sinks, key)
         end
@@ -5436,7 +5436,7 @@ todo_taskbar_item(t::TodoListMsg) =
 # same cadence as the elapsed labels.
 taskbar_todo_rows(t::TodoListMsg) =
     t.chat === nothing ? [(e.content, e.status) for e in t.entries] :
-    lock(shared(t.chat).lock) do
+    @lock shared(t.chat).lock begin
         [(e.content, e.status) for e in t.entries]
     end
 
@@ -5475,7 +5475,7 @@ function process_todo!(chat::ChatModel, entries)
         # covers everything, since a stripped item is by construction
         # completed in some earlier bubble.
         new = collect(PlanEntry, entries)
-        prev_done = lock(s.lock) do
+        prev_done = @lock s.lock let
             done = Set{String}()
             for m in s.msgs_store
                 m isa TodoListMsg || continue
@@ -5665,7 +5665,7 @@ end
 # every TaskToolMsg commit.
 function replay_pending_subagent!(chat::ChatModel, m::TaskToolMsg)
     s = shared(chat)
-    held = lock(s.lock) do
+    held = @lock s.lock begin
         pop!(s.pending_subagent, tool_id(m), nothing)
     end
     held === nothing && return nothing
@@ -5811,7 +5811,7 @@ function start_main_consumer!(chat::ChatModel, cli)
     s.available_commands[] = AgentClientProtocol.CommandInfo[]
     chat_emit(s, commands_event(s.available_commands[]))
     task = Base.errormonitor(@async main_consumer!(chat, cli.messages))
-    lock(s.lock) do
+    @lock s.lock let
         s.main_consumer[] = (; task, client = cli)
     end
     return nothing
@@ -6675,7 +6675,7 @@ function continue_yolo!(chat::ChatModel, o::TurnOutcome)
         #
         # A missing reply is NOT a bail: a turn ending on a tool call has no closing
         # text, which used to stop Yolo silently.
-        reply, worked = lock(s.lock) do
+        reply, worked = @lock s.lock let
             turn = @view s.msgs_store[(o.nstore0+1):end]
             i = findlast(m -> m isa AgentMsg, turn)
             (i === nothing ? "" : turn[i].text), any(does_work, turn)
@@ -6715,7 +6715,7 @@ end
 # (the *_done teardown broadcast); the dict entry is already gone.
 function sweep_pending_asks!(chat::ChatModel)
     s = shared(chat)
-    asks = lock(s.lock) do
+    asks = @lock s.lock let
         v = collect(values(s.pending_asks)); empty!(s.pending_asks); v
     end
     for (ch, default) in asks
@@ -6840,12 +6840,12 @@ function handle_permission_request(chat::ChatModel, params)
                    "name"     => String(get(o, "name", get(o, "optionId", "?"))),
                    "kind"     => String(get(o, "kind", "")))
                for o in options if o isa AbstractDict]
-    isempty(opts) && return Dict("outcome" => Dict("outcome" => "cancelled"))
+    isempty(opts) && return Dict{String,Any}("outcome" => Dict{String,Any}("outcome" => "cancelled"))
     tc = get(params, "toolCall", Dict{String,Any}())
     tc isa AbstractDict || (tc = Dict{String,Any}())
     key = string(uuid4())
     ch  = Channel{String}(1)
-    let s = shared(chat); lock(s.lock) do; s.pending_asks[key] = (ch, ""); end; end
+    let s = shared(chat); @lock s.lock begin; s.pending_asks[key] = (ch, ""); end; end
     chat_emit(chat, Dict{String,Any}(
         "type"     => "permission",
         "key"      => key,
@@ -6854,7 +6854,7 @@ function handle_permission_request(chat::ChatModel, params)
     picked = try
         take_within(ch, PERMISSION_TIMEOUT, "")
     finally
-        let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
+        let s = shared(chat); @lock s.lock begin; delete!(s.pending_asks, key); end; end
         # Tell every tab to drop the card (the one that answered already
         # swapped it to its chosen state locally).
         chat_emit(chat, Dict{String,Any}("type" => "permission_done", "key" => key))
@@ -6863,10 +6863,10 @@ function handle_permission_request(chat::ChatModel, params)
         # Timeout: fall back to the pre-card behavior (auto-allow when an
         # allow option exists) so an unattended chat doesn't wedge forever.
         idx = findfirst(o -> o["kind"] in ("allow_once", "allow_always"), opts)
-        idx === nothing && return Dict("outcome" => Dict("outcome" => "cancelled"))
+        idx === nothing && return Dict{String,Any}("outcome" => Dict{String,Any}("outcome" => "cancelled"))
         picked = opts[idx]["optionId"]
     end
-    return Dict("outcome" => Dict("outcome" => "selected", "optionId" => String(picked)))
+    return Dict{String,Any}("outcome" => Dict{String,Any}("outcome" => "selected", "optionId" => String(picked)))
 end
 
 # ── Form elicitations (AskUserQuestion, MCP elicitations) ───────────────────
@@ -6921,12 +6921,12 @@ end
 function handle_elicitation_request(chat::ChatModel, params)
     # URL-mode elicitations can't be rendered in the chat — cancel cleanly.
     String(get(params, "mode", "form")) == "form" ||
-        return Dict("action" => "cancel")
+        return Dict{String,Any}("action" => "cancel")
     fields = parse_elicitation_fields(get(params, "requestedSchema", Dict{String,Any}()))
-    isempty(fields) && return Dict("action" => "decline")
+    isempty(fields) && return Dict{String,Any}("action" => "decline")
     key = string(uuid4())
     ch  = Channel{Any}(1)
-    let s = shared(chat); lock(s.lock) do; s.pending_asks[key] = (ch, :skip); end; end
+    let s = shared(chat); @lock s.lock begin; s.pending_asks[key] = (ch, :skip); end; end
     chat_emit(chat, Dict{String,Any}(
         "type"    => "question",
         "key"     => key,
@@ -6935,12 +6935,12 @@ function handle_elicitation_request(chat::ChatModel, params)
     answer = try
         take_within(ch, PERMISSION_TIMEOUT, :skip)
     finally
-        let s = shared(chat); lock(s.lock) do; delete!(s.pending_asks, key); end; end
+        let s = shared(chat); @lock s.lock begin; delete!(s.pending_asks, key); end; end
         chat_emit(chat, Dict{String,Any}("type" => "question_done", "key" => key))
     end
     answer isa AbstractDict ||
-        return Dict("action" => "decline")     # skipped / timed out
-    return Dict("action" => "accept", "content" => Dict{String,Any}(answer))
+        return Dict{String,Any}("action" => "decline")     # skipped / timed out
+    return Dict{String,Any}("action" => "accept", "content" => Dict{String,Any}(answer))
 end
 
 # ── Client lifecycle ───────────────────────────────────────────────────────
@@ -6955,7 +6955,7 @@ const BIND_CAP = 8
 # server serves it: its view opens a closed chat again just the same.
 function shown_chats(state::ServerState)
     tabs = root_state(state).tabs
-    return lock(tabs.lock) do
+    return @lock tabs.lock begin
         Set{String}(r.view[] for r in values(tabs.open) if r.view !== nothing)
     end
 end
@@ -7101,7 +7101,7 @@ function register_chat_model!(model::ChatModel)
     # spun up lazily by the first `push!`.)
     if !isempty(model.project_id)
         @info "registering chat model" project_id = model.project_id
-        lock(model.state.lock) do
+        @lock model.state.lock begin
             model.state.chat_models[model.project_id] = model
         end
         attach_process_tasks!(s)
@@ -7182,7 +7182,7 @@ function restart_chat_session!(model::ChatModel)
     # finishing — and wait (bounded) for it to settle. Otherwise WE are the
     # worker. Concurrent restarts must never both `close(old)`/`start_chat_client!`
     # (lost client / consumer-lock deadlock), so exactly one worker runs at a time.
-    running = lock(s.restart_lock) do
+    running = @lock s.restart_lock let
         s.restart_gen[] += 1
         r = s.restart_inflight[]
         r === nothing && (s.restart_inflight[] = Channel{Nothing}(0))
@@ -7275,7 +7275,7 @@ function record_bound_session!(model::ChatModel, session_id::AbstractString)
     p.resume_session_id == session_id && return
     p.resume_session_id = String(session_id)
     try
-        lock(model.state.lock) do; save_projects!(model.state); end
+        @lock model.state.lock begin; save_projects!(model.state); end
     catch e
         @warn "record_bound_session!: persist failed" exception=e
     end
@@ -7311,7 +7311,7 @@ end
 # size sane on long histories.
 function build_history_prelude(model::ChatModel)::String
     relevant = ChatMsg[]
-    lock(model.lock) do
+    @lock model.lock begin
         for m in model.msgs_store
             (m isa UserMsg || m isa AgentMsg) && push!(relevant, m)
         end
@@ -7345,7 +7345,7 @@ end
 # their own conversation, not part of the replay) and stashes it on the
 # model. Idempotent — a second arm before consume replaces the prelude.
 function arm_history_replay!(model::ChatModel)
-    lock(model.lock) do
+    @lock model.lock begin
         model.pending_history_replay[] = build_history_prelude(model)
     end
     @info "chat history replay armed" project_id = model.project_id n_msgs = length(model.msgs_store)
@@ -7815,7 +7815,7 @@ function session_defaults_bar(session::Bonito.Session, state::ServerState)
         (sel isa AbstractVector && length(sel) == 2 && !isempty(String(sel[1]))) || return
         cfg_id, value = String(sel[1]), String(sel[2])
         pick[] = ["", ""]                       # reset so the same pill can re-fire
-        lock(state.lock) do
+        @lock state.lock let
             d = copy(state.default_session_config[])
             d[cfg_id] = value
             state.default_session_config[] = d  # shared → all home views + bring-ups
@@ -8586,7 +8586,7 @@ function switch_provider!(model::ChatModel, new_provider::BinAgent)
         project.provider = previous_project_provider
         project.resume_session_id = previous_project_resume
         try
-            lock(model.state.lock) do; save_projects!(model.state); end
+            @lock model.state.lock begin; save_projects!(model.state); end
         catch e
             @warn "switch_provider!: could not persist rollback" exception = e
         end
@@ -8618,7 +8618,7 @@ function record_project_provider!(model::ChatModel, provider::BinAgent)
     # A failed write must not fail the switch — the agent has already changed in
     # memory and the chat is live; only the record across restarts is lost.
     try
-        lock(model.state.lock) do; save_projects!(model.state); end
+        @lock model.state.lock begin; save_projects!(model.state); end
     catch e
         @warn "record_project_provider!: persist failed" exception = e
     end
@@ -9115,7 +9115,7 @@ The newest `count` messages as the transcript renders them, with the total:
 `{n, start, msgs}`, `start` being the store index of the first one.
 """
 function transcript_tail(model::ChatModel; count::Int = 40)
-    n, s, slice = lock(model.lock) do
+    n, s, slice = @lock model.lock let
         store = model.msgs_store
         n = length(store)
         s = max(0, n - count)
@@ -9182,7 +9182,7 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     # Find + grab the ToolMsg under `model.lock` (T8): `findfirst` over
     # `msgs_store` races the consumer's `push!`. The msg object itself is then
     # rendered off-lock below.
-    msg = lock(model.lock) do
+    msg = @lock model.lock let
         idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]
     end
@@ -9210,10 +9210,10 @@ function handle_command!(model::ChatModel, session::Session, cmd::ToolRenderComm
     # request must not cancel ours. (Entries are tiny and per rendered tool;
     # dead pages leave a few behind until the chat closes — acceptable.)
     render_key = string(Bonito.root_session(session).id, '|', cmd.tool_id)
-    render_lock, gen_ref = lock(model.lock) do
+    render_lock, gen_ref = @lock model.lock begin
         get!(() -> (ReentrantLock(), Ref(0)), shared(model).tool_renders, render_key)
     end
-    my_gen = lock(model.lock) do
+    my_gen = @lock model.lock begin
         gen_ref[] += 1
     end
     Base.errormonitor(@async try
@@ -9271,7 +9271,7 @@ function handle_command!(model::ChatModel, ::Session, cmd::ThoughtRenderCommand)
     isempty(cmd.thought_id) && return nothing
     # Read the matching thought's text under `model.lock` (T8) — the lookup +
     # field read race the consumer's `push!`. Render markdown off-lock.
-    text = lock(model.lock) do
+    text = @lock model.lock let
         idx = findfirst(m -> m isa ThoughtMsg && m.id == cmd.thought_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx].text
     end
@@ -9406,7 +9406,7 @@ end
 # finds the key gone — no-op.
 function resolve_pending_ask!(model::ChatModel, key::AbstractString, value)
     s = shared(model)
-    entry = lock(s.lock) do
+    entry = @lock s.lock begin
         pop!(s.pending_asks, String(key), nothing)
     end
     entry === nothing && return nothing
@@ -9427,7 +9427,7 @@ handle_command!(model::ChatModel, ::Any, cmd::QuestionSkipCommand) =
 function handle_command!(model::ChatModel, ::Any, cmd::StopToolCommand)
     isempty(cmd.tool_id) && return nothing
     managed_process_control!(model, cmd.tool_id) && return nothing
-    target = lock(model.lock) do
+    target = @lock model.lock let
         idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
         idx === nothing ? nothing : model.msgs_store[idx]
     end
@@ -9526,7 +9526,7 @@ function handle_command!(model::ChatModel, session::Session, cmd::EditFileComman
         # `open_project_file!`'s open-guard — never a silent no-op.
         replace(String(cmd.path), r":\d+$" => "")
     else
-        msg = lock(model.lock) do
+        msg = @lock model.lock let
             idx = findfirst(m -> m isa ToolMsg && tool_id(m) == cmd.tool_id, model.msgs_store)
             idx === nothing ? nothing : model.msgs_store[idx]
         end

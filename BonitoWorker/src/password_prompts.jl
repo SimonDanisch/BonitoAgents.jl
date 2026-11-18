@@ -272,7 +272,7 @@ function answer_prompt!(s::ProcessSupervisor, project::AbstractString, id::Abstr
     answer = get(args, "deny", false) === true ? nothing : String(get(args, "secret", ""))
     answer === nothing || !occursin(r"[\n\r\0]", answer) ||
         throw(ArgumentError("an answer is one line"))
-    job = lock(s.lock) do
+    job = @lock s.lock let
         j = get(s.jobs, process_key(project, id), nothing)
         j === nothing && throw(ArgumentError("no managed process '$id' in this chat"))
         prompt = j.record["prompt"]
@@ -316,7 +316,7 @@ end
 
 # The ready bt_ssh connection `via` of the same chat.
 function ssh_route(s::ProcessSupervisor, project::AbstractString, via::AbstractString)
-    return lock(s.lock) do
+    return @lock s.lock let
         j = get(s.jobs, process_key(project, via), nothing)
         j !== nothing && j.launch isa SshLaunch ||
             throw(ArgumentError("no bt_ssh connection '$via' in this chat"))

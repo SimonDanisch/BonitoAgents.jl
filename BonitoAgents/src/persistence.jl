@@ -97,7 +97,7 @@ function acp_frame_logger(chat_dir::AbstractString)
     lk = ReentrantLock()
     return function (dir::Symbol, msg::AbstractDict)
         ts = Dates.format(now(UTC), dateformat"yyyy-mm-dd\THH:MM:SS.sss\Z")
-        lock(lk) do
+        @lock lk begin
             open(path, "a") do io
                 JSON.print(io, Dict{String,Any}(
                     "ts" => ts, "dir" => String(dir), "msg" => msg))
@@ -270,7 +270,7 @@ function print_front_matter(io::IO, session::ChatSession)
 end
 
 function write_session_header(session::ChatSession)
-    lock(chat_file_lock(session)) do
+    @lock chat_file_lock(session) begin
         atomic_write_text(session.path) do io
             print_front_matter(io, session)
             println(io)
@@ -283,7 +283,7 @@ function update_session_id!(session::ChatSession, new_id::String)
     # The read-modify-write runs under the per-file lock so an `append_*` can't
     # land between the read and the rewrite (lost append), and the write is
     # atomic (tmp + mv) so a crash can't truncate the file (T13).
-    lock(chat_file_lock(session)) do
+    @lock chat_file_lock(session) let
         content = isfile(path) ? read(path, String) : "\n"
         # Strip existing +++ block
         body = replace(content, r"^\+\+\+.*?\+\+\+\n"s => ""; count=1)
@@ -426,7 +426,7 @@ end
 # interleave with `update_session_id!`'s read-modify-write (which would drop the
 # append) and concurrent appenders from different tasks stay whole.
 append_block(session::ChatSession, msg::ChatMsg) =
-    lock(chat_file_lock(session)) do
+    @lock chat_file_lock(session) begin
         open(io -> history_block(io, msg), session.path, "a")
     end
 
@@ -469,7 +469,7 @@ rebuilt in store order. Runs under the per-file lock so live appends and the
 `update_session_id!` header RMW can't interleave with the rebuild.
 """
 function rewrite_history(session::ChatSession, msgs::AbstractVector)
-    lock(chat_file_lock(session)) do
+    @lock chat_file_lock(session) begin
         atomic_write_text(session.path) do io
             print_front_matter(io, session)
             println(io)
@@ -490,7 +490,7 @@ that point, but the old canonical transcript must survive on disk. Returns the
 backup path, or `nothing` when there is no chat.md yet.
 """
 function backup_history!(session::ChatSession)
-    lock(chat_file_lock(session)) do
+    @lock chat_file_lock(session) let
         isfile(session.path) || return nothing
         bak = session.path * ".bak"
         cp(session.path, bak; force = true)

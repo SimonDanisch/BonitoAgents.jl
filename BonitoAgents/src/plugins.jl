@@ -17,7 +17,7 @@ const REGISTERED_APPS_LOCK = ReentrantLock()
 "Register an app type from an opt-in plugin package. Registering twice is harmless."
 function register_app!(A::Type{<:AgentApp})
     app_id(A) # fail here, with the useful missing-method error, rather than at server startup
-    lock(REGISTERED_APPS_LOCK) do
+    @lock REGISTERED_APPS_LOCK begin
         A in REGISTERED_APPS || push!(REGISTERED_APPS, A)
     end
     return A
@@ -29,7 +29,7 @@ end
     # Do not let inference fold the then-empty const vector into a permanent
     # empty tuple in `serve`.
     apps = Base.inferencebarrier(REGISTERED_APPS)
-    return lock(REGISTERED_APPS_LOCK) do
+    return @lock REGISTERED_APPS_LOCK begin
         Tuple(apps)
     end
 end
@@ -102,7 +102,7 @@ function load_app!(server::ServerState, path::AbstractString)
     path = abspath(expanduser(String(path)))
     id, project = package_at(path)
     name = id.name
-    return lock(server.apps.loading) do
+    return @lock server.apps.loading let
         added = !in_server_env(id, path)
         added && add_to_server_env!(path)
         try
@@ -197,7 +197,7 @@ end
 
 # The first answer counts. A later one (another tab, the timer) finds it decided.
 function decide!(r::AppRegistry, key::AbstractString, decision::Symbol)
-    lock(r.lock) do
+    @lock r.lock let
         req = get(r.pending, key, nothing)
         (req === nothing || isready(req.decision)) && return false
         put!(req.decision, decision)

@@ -43,7 +43,7 @@ carry the chat on by themselves).
 """
 function interrupted_turn(chat::ChatModel)
     s = shared(chat)
-    return lock(s.lock) do
+    return @lock s.lock let
         # The outbox keeps the message being answered (status :sent) until its
         # turn ends, so only a message not delivered yet is one queued behind it.
         queued_behind = any(e -> e isa PendingSend && e.status !== :sent, s.pending_sends)
@@ -77,7 +77,7 @@ function note_interrupted_turns!(state::ServerState, worker_id::AbstractString)
     for m in candidates
         turn = interrupted_turn(m)
         turn === nothing && continue
-        lock(state.lock) do
+        @lock state.lock begin
             haskey(watch.interrupted, m.project_id) ||
                 (watch.interrupted[m.project_id] = InterruptedTurn(String(worker_id), instance,
                                                                    turn[1], turn[2], time()))
@@ -90,7 +90,7 @@ end
 
 # The same run of the worker carries on (its link resumed): so do its turns.
 function forget_interrupted_turns!(state::ServerState, worker_id::AbstractString)
-    lock(state.lock) do
+    @lock state.lock begin
         filter!(kv -> kv.second.worker_id != worker_id, state.crash_watch.interrupted)
         delete!(state.crash_watch.noted, String(worker_id))
     end
@@ -110,7 +110,7 @@ off.
 """
 function worker_run_started!(state::ServerState, worker_id::AbstractString, hello::AbstractDict)
     crashed = String(get(hello, "crashed_instance", ""))
-    lock(state.lock) do
+    @lock state.lock begin
         state.crash_watch.instances[String(worker_id)] = String(get(hello, "instance", ""))
     end
     isempty(crashed) || @warn "worker restarted after a crash" worker_id crashed_instance = crashed
@@ -126,7 +126,7 @@ crashed (`crashed`, "" when none did), and drop the rest. Returns the chats
 continued.
 """
 function recover_interrupted_turns!(state::ServerState, worker_id::AbstractString, crashed::AbstractString)
-    notes = lock(state.lock) do
+    notes = @lock state.lock let
         mine = [(pid, t) for (pid, t) in state.crash_watch.interrupted if t.worker_id == worker_id]
         foreach(n -> delete!(state.crash_watch.interrupted, n[1]), mine)
         delete!(state.crash_watch.noted, String(worker_id))   # the next outage is a new one

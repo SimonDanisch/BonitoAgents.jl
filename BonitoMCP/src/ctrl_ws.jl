@@ -43,7 +43,7 @@ end
 AgentWaits() = AgentWaits(ReentrantLock(), Set{Channel{Nothing}}())
 
 function wake_agent_waits!()
-    lock(SERVER.waits.lock) do
+    @lock SERVER.waits.lock begin
         foreach(close, SERVER.waits.active)
         empty!(SERVER.waits.active)
     end
@@ -224,7 +224,7 @@ function ctrl_dial_loop(wsurl::AbstractString, handshake::AbstractString;
 end
 
 function fail_control_requests!(message::AbstractString)
-    pending = lock(SERVER.control.pending_lock) do
+    pending = @lock SERVER.control.pending_lock let
         channels = collect(values(SERVER.control.pending))
         empty!(SERVER.control.pending)
         channels
@@ -266,7 +266,7 @@ function call_server(op::AbstractString; timeout::Real = 30.0, kw...)
     end
     id = Threads.atomic_add!(ctrl.next_id, 1)
     ch = Channel{Any}(1)
-    lock(ctrl.pending_lock) do; ctrl.pending[id] = ch; end
+    @lock ctrl.pending_lock begin; ctrl.pending[id] = ch; end
     try
         send_ctrl_frame(Dict("type" => "dev_request", "dev_id" => id,
                              "op" => String(op),
@@ -278,7 +278,7 @@ function call_server(op::AbstractString; timeout::Real = 30.0, kw...)
         reply isa Exception && throw(reply)
         return reply
     finally
-        lock(ctrl.pending_lock) do; delete!(ctrl.pending, id); end
+        @lock ctrl.pending_lock begin; delete!(ctrl.pending, id); end
     end
 end
 
@@ -290,7 +290,7 @@ function handle_ctrl_frame!(ws, msg::AbstractDict)
         # side ever owns the channel.
         ctrl = SERVER.control
         id = Int(get(msg, "dev_id", -1))
-        ch = lock(ctrl.pending_lock) do
+        ch = @lock ctrl.pending_lock begin
             haskey(ctrl.pending, id) ? pop!(ctrl.pending, id) : nothing
         end
         ch === nothing && return nothing

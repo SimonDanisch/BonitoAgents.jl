@@ -52,7 +52,7 @@ end
 # Messages + chat_dir for a project: the live model's store when the chat is
 # open (fresh, no re-parse), else the persisted chat.md history.
 function overview_msgs(state::ServerState, p::ProjectInfo)
-    model = lock(state.lock) do
+    model = @lock state.lock begin
         get(state.chat_models, p.id, nothing)
     end
     if model !== nothing

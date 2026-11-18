@@ -1364,7 +1364,7 @@ function schedule_auto_update!(w::Worker, target_wire;
     target = update_spec_from_wire(target_wire)
     target === nothing && return :none         # the server has no spec to offer
     (force || update_needed(config, target)) || return :none
-    return lock(w.lock) do
+    return @lock w.lock let
         u = w.update
         if u.task !== nothing && !istaskdone(u.task)
             # Installing already (gate up): leave it. Still waiting for idle
@@ -1386,8 +1386,8 @@ end
 # Never call it holding `w.lock`: it takes `reporting` first.
 function report_update!(w::Worker, status::AbstractString;
                         error::AbstractString = "", busy::Integer = 0)
-    lock(w.update.reporting) do
-        ctrl, frame = lock(w.lock) do
+    @lock w.update.reporting let
+        ctrl, frame = @lock w.lock let
             u = w.update
             u.status == status || (u.since = time())
             u.status, u.error, u.busy = String(status), String(error), Int(busy)
@@ -1401,8 +1401,8 @@ end
 # The step stored last, once more: for a new link, or a request that found an
 # update under way. Nothing when no update ever started.
 function report_update!(w::Worker)
-    lock(w.update.reporting) do
-        ctrl, frame = lock(w.lock) do
+    @lock w.update.reporting let
+        ctrl, frame = @lock w.lock begin
             w.control, isempty(w.update.status) ? nothing : update_status_frame(w.update)
         end
         frame === nothing || send_update_status(ctrl, frame)
@@ -1486,7 +1486,7 @@ function open_eval_host!(w::Worker, project_id::AbstractString, env::AbstractDic
     c = w.config
     isempty(project_id) && error("open_eval_host: project_id is empty")
     isempty(c.mcp_command) && error("open_eval_host: this worker has no MCP launch command")
-    lock(w.lock) do
+    @lock w.lock let
         existing = get(w.eval_hosts, project_id, nothing)
         if existing !== nothing && process_running(existing)
             return (pid = Int(getpid(existing)), existed = true)
@@ -1497,7 +1497,7 @@ function open_eval_host!(w::Worker, project_id::AbstractString, env::AbstractDic
         persist_identity!(c)
         host_env = merge(inherited_env(),
                          Dict{String,String}(String(k) => String(v) for (k, v) in env),
-                         Dict("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id),
+                         Dict{String,String}("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id),
                          owner_env(c.worker_id),
                          mcp_relay_env(relay, project_id; host = true, owner))
         args = eval_host_arguments(c.mcp_arguments)
@@ -1746,15 +1746,15 @@ function handle_list_dir(ws, cmd::AbstractDict)
             # `isfile` follows symlinks and is false for a broken link, so
             # `filesize` is only called on a real regular file (no throw).
             isf = isfile(full)
-            push!(entries, Dict("name" => name, "dir" => isdir(full),
+            push!(entries, Dict{String,Any}("name" => name, "dir" => isdir(full),
                                 "size" => isf ? filesize(full) : 0))
         end
-        Dict("type"       => "list_dir_response",
+        Dict{String,Any}("type"       => "list_dir_response",
              "request_id" => request_id,
              "path"       => abspath(path),
              "entries"    => entries)
     catch e
-        Dict("type"       => "list_dir_response",
+        Dict{String,Any}("type"       => "list_dir_response",
              "request_id" => request_id,
              "error"      => sprint(showerror, e))
     end
@@ -1788,10 +1788,10 @@ function handle_make_dir(ws, cmd::AbstractDict)
         full = joinpath(parent, name)
         ispath(full) && error("already exists: $full")
         mkdir(full)
-        Dict("type" => "make_dir_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "make_dir_response", "request_id" => request_id,
              "path" => abspath(full))
     catch e
-        Dict("type" => "make_dir_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "make_dir_response", "request_id" => request_id,
              "error" => sprint(showerror, e))
     end
     try
@@ -1820,10 +1820,10 @@ function handle_ensure_dir(ws, cmd::AbstractDict)
         # mkpath would silently succeed against it and create a sibling.
         ispath(path) && !isdir(path) && error("not a directory: $path")
         mkpath(path)
-        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "ensure_dir_response", "request_id" => request_id,
              "path" => abspath(path))
     catch e
-        Dict("type" => "ensure_dir_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "ensure_dir_response", "request_id" => request_id,
              "error" => sprint(showerror, e))
     end
     try
@@ -1859,7 +1859,7 @@ function handle_stat_path(ws, cmd::AbstractDict)
     response = try
         isempty(raw_path) && error("path is empty")
         isf = isfile(raw_path)   # follows symlinks; false for dirs / broken links
-        Dict("type"       => "stat_path_response",
+        Dict{String,Any}("type"       => "stat_path_response",
              "request_id" => request_id,
              "path"       => abspath(raw_path),
              "exists"     => ispath(raw_path),
@@ -1869,7 +1869,7 @@ function handle_stat_path(ws, cmd::AbstractDict)
              "size"       => isf ? filesize(raw_path) : 0,
              "mtime"      => isf ? mtime(raw_path) : 0.0)
     catch e
-        Dict("type"       => "stat_path_response",
+        Dict{String,Any}("type"       => "stat_path_response",
              "request_id" => request_id,
              "error"      => sprint(showerror, e))
     end
@@ -1941,13 +1941,13 @@ function handle_list_project_files(ws, cmd::AbstractDict)
             truncated && break
         end
         sort!(files)
-        Dict("type"       => "list_project_files_response",
+        Dict{String,Any}("type"       => "list_project_files_response",
              "request_id" => request_id,
              "path"       => abspath(root),
              "files"      => files,
              "truncated"  => truncated)
     catch e
-        Dict("type"       => "list_project_files_response",
+        Dict{String,Any}("type"       => "list_project_files_response",
              "request_id" => request_id,
              "error"      => sprint(showerror, e))
     end
@@ -2083,10 +2083,10 @@ function handle_kill_file_writers(ws, cmd::AbstractDict)
             r = ccall(:kill, Cint, (Cint, Cint), Cint(p), Cint(15))   # SIGTERM
             r == 0 || @debug "kill_file_writers: SIGTERM failed" pid=p errno=Libc.errno()
         end
-        Dict("type" => "kill_file_writers_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "kill_file_writers_response", "request_id" => request_id,
              "killed" => targets, "writers" => writers, "supported" => Sys.islinux())
     catch e
-        Dict("type" => "kill_file_writers_response", "request_id" => request_id,
+        Dict{String,Any}("type" => "kill_file_writers_response", "request_id" => request_id,
              "error" => sprint(showerror, e))
     end
     try
@@ -2127,7 +2127,7 @@ function clone_repo_response(request_id::AbstractString, url::AbstractString,
 
         created = true                     # from here on, the clone owns dst_path
         do_clone(url, dst_path, pr_number)
-        return Dict("type"       => "clone_repo_response",
+        return Dict{String,Any}("type"       => "clone_repo_response",
                     "request_id" => request_id,
                     "dst_path"   => dst_path)
     catch e
@@ -2141,7 +2141,7 @@ function clone_repo_response(request_id::AbstractString, url::AbstractString,
                 @warn "clone_repo cleanup failed" dst_path exception=rmerr
             end
         end
-        return Dict("type"       => "clone_repo_response",
+        return Dict{String,Any}("type"       => "clone_repo_response",
                     "request_id" => request_id,
                     "error"      => sprint(showerror, e))
     end
@@ -2250,7 +2250,7 @@ function debug_checkout(; repo::AbstractString, rev::AbstractString,
     project === nothing && error("this worker has no active project to develop the checkout into")
     isempty(repo) && error("no repository url to clone")
     isempty(rev) && error("no revision to check out")
-    lock(DEBUG_CHECKOUT_LOCK) do
+    @lock DEBUG_CHECKOUT_LOCK let
         dest = debug_checkout_dir(project)
         created = false
         if !ispath(joinpath(dest, ".git"))
@@ -2322,11 +2322,11 @@ function debug_checkout_response(request_id::AbstractString, repo::AbstractStrin
                                  rev::AbstractString, packages::Vector{String})
     try
         r = debug_checkout(; repo, rev, packages)
-        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "debug_checkout_response", "request_id" => request_id,
                     "path" => r.path, "mode" => r.mode, "created" => r.created)
     catch e
         e isa InterruptException && rethrow()
-        return Dict("type" => "debug_checkout_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "debug_checkout_response", "request_id" => request_id,
                     "error" => sprint(showerror, e))
     end
 end
@@ -2647,7 +2647,7 @@ function inject_mcp_grant(line::String, relay::MCPRelay, owner::AbstractString)
         project_id = get(values, "BONITOAGENTS_PROJECT_ID", "")
         isempty(project_id) && error("injected MCP is missing its chat identity")
         merge!(values, mcp_relay_env(relay, project_id; owner))
-        mcp["env"] = [Dict("name" => k, "value" => v) for (k, v) in sort!(collect(values); by = first)]
+        mcp["env"] = [Dict{String,Any}("name" => k, "value" => v) for (k, v) in sort!(collect(values); by = first)]
         changed = true
     end
     return changed ? JSON.json(msg) : line
@@ -3182,7 +3182,7 @@ function acp_list_sessions(prov, worker_id::AbstractString; timeout::Real = 8.0)
         end
         Base.errormonitor(reader)
         ask(id, method, params) = begin
-            write(proc, JSON.json(Dict("jsonrpc" => "2.0", "id" => id,
+            write(proc, JSON.json(Dict{String,Any}("jsonrpc" => "2.0", "id" => id,
                                        "method" => method, "params" => params)), "\n")
             flush(proc)
             while !haskey(replies, id) && !istaskdone(reader) && time() < deadline
@@ -3196,7 +3196,7 @@ function acp_list_sessions(prov, worker_id::AbstractString; timeout::Real = 8.0)
         init = ask(0, "initialize", Dict(
             "protocolVersion" => 1,
             "clientCapabilities" => Dict(
-                "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+                "fs" => Dict{String,Any}("readTextFile" => true, "writeTextFile" => true),
                 "elicitation" => prov.elicitation)))
         init isa AbstractDict && haskey(init, "result") || return rows
         caps = get(get(init["result"], "agentCapabilities", Dict()), "sessionCapabilities", nothing)
@@ -3205,7 +3205,7 @@ function acp_list_sessions(prov, worker_id::AbstractString; timeout::Real = 8.0)
         kind = AgentProviders.provider_name(prov)
         id, cursor = 1, nothing
         while true
-            params = cursor === nothing ? Dict{String,Any}() : Dict("cursor" => cursor)
+            params = cursor === nothing ? Dict{String,Any}() : Dict{String,Any}("cursor" => cursor)
             resp = ask(id, "session/list", params)
             resp isa AbstractDict && haskey(resp, "result") || break
             res = resp["result"]
@@ -3290,7 +3290,7 @@ function git_capture(dir::AbstractString, args::Cmd)
         # un-coloured output no matter how the user's git is configured. The
         # repo is the agent's to write (hooks, fsmonitor): no worker credentials.
         cmd = setenv(`git -C $dir $args`,
-                     merge(inherited_env(), Dict("LC_ALL" => "C", "GIT_PAGER" => "cat",
+                     merge(inherited_env(), Dict{String,String}("LC_ALL" => "C", "GIT_PAGER" => "cat",
                                                  "GIT_OPTIONAL_LOCKS" => "0", "GIT_CONFIG_NOSYSTEM" => "1")))
         success(pipeline(cmd; stdout = out, stderr = devnull))
     catch e
@@ -3406,7 +3406,7 @@ function git_diff_response(request_id::AbstractString, path::AbstractString,
             end
         end
 
-        return Dict("type" => "git_diff_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "git_diff_response", "request_id" => request_id,
                     "repo" => root, "branch" => branch, "head" => head,
                     "base" => effective, "patch" => patch,
                     # "" ⇒ the whole repo; otherwise the sub-path the diff was
@@ -3415,7 +3415,7 @@ function git_diff_response(request_id::AbstractString, path::AbstractString,
                     "scope" => isempty(scope) ? "" : first(scope))
     catch e
         e isa InterruptException && rethrow()
-        return Dict("type" => "git_diff_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "git_diff_response", "request_id" => request_id,
                     "error" => sprint(showerror, e))
     end
 end
@@ -3557,12 +3557,12 @@ function find_repos_response(request_id::AbstractString, path::AbstractString,
         isempty(path) && error("missing path")
         isdir(path) || error("not a directory: $path")
         found = find_repos(path; max_depth = max_depth)
-        return Dict("type" => "find_repos_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "find_repos_response", "request_id" => request_id,
                     "path" => abspath(path), "repos" => found.repos,
                     "truncated" => found.truncated, "unreadable" => found.unreadable)
     catch e
         e isa InterruptException && rethrow()
-        return Dict("type" => "find_repos_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "find_repos_response", "request_id" => request_id,
                     "error" => sprint(showerror, e))
     end
 end
@@ -3905,8 +3905,8 @@ end
 
 function worker_state_response(w::Worker, request_id::AbstractString)
     try
-        sessions = lock(w.lock) do
-            [Dict("cwd" => s.cwd,
+        sessions = @lock w.lock begin
+            [Dict{String,Any}("cwd" => s.cwd,
                   "project_id" => s.project_id,
                   # A session whose agent has exited but whose entry is still
                   # here is exactly the "chat looks alive, nothing happens" bug.
@@ -3921,7 +3921,7 @@ function worker_state_response(w::Worker, request_id::AbstractString)
         link = WorkerLink.state(w.link)
         rss = worker_rss()
         gc = Base.gc_num()
-        return Dict("type" => "worker_state_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "worker_state_response", "request_id" => request_id,
                     "pid" => getpid(),
                     "uptime_s" => WORKER_STARTED[] == 0.0 ? 0.0 :
                                   round(time() - WORKER_STARTED[]; digits = 1),
@@ -3946,7 +3946,7 @@ function worker_state_response(w::Worker, request_id::AbstractString)
                     "session_count" => length(sessions))
     catch e
         e isa InterruptException && rethrow()
-        return Dict("type" => "worker_state_response", "request_id" => request_id,
+        return Dict{String,Any}("type" => "worker_state_response", "request_id" => request_id,
                     "error" => sprint(showerror, e))
     end
 end

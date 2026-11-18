@@ -67,7 +67,7 @@ media_sizes_file(s::ServerState) = joinpath(s.state_dir, "media_sizes.json")
 
 function save_media_sizes!(state::ServerState)
     rec = state.media_sizes
-    lock(rec.lock) do
+    @lock rec.lock let
         data = Dict{String,Any}()
         for ((worker_id, path), (w, h)) in rec.sizes
             get!(() -> Dict{String,Any}(), data, worker_id)[path] = [w, h]
@@ -81,7 +81,7 @@ function load_media_sizes!(state::ServerState)
     raw = load_json_tolerant(media_sizes_file(state), "media_sizes.json")
     raw isa AbstractDict || return nothing
     rec = state.media_sizes
-    lock(rec.lock) do
+    @lock rec.lock begin
         for (worker_id, files) in raw
             files isa AbstractDict || continue
             for (path, wh) in files
@@ -241,7 +241,7 @@ end
 
 function save_body_heights(model::ChatModel)
     rec = shared(model).body_heights
-    lock(rec.lock) do
+    @lock rec.lock begin
         atomic_write_json(body_heights_file(model.chat_dir),
             Dict{String,Any}(id => [collect(e) for e in list] for (id, list) in rec.heights))
     end
@@ -275,7 +275,7 @@ the wire's `body_h`; `nothing` before it was ever measured.
 """
 function body_heights(model::ChatModel, tool_id::AbstractString)
     rec = shared(model).body_heights
-    return lock(rec.lock) do
+    return @lock rec.lock let
         list = get(rec.heights, String(tool_id), nothing)
         (list === nothing || isempty(list)) && return nothing
         Dict{String,Int}(string(w) => h for (w, h, _) in list)
@@ -286,7 +286,7 @@ end
 # 0 before it was.
 function media_extra(model::ChatModel, tool_id::AbstractString)
     rec = shared(model).body_heights
-    return lock(rec.lock) do
+    return @lock rec.lock let
         list = get(rec.heights, String(tool_id), nothing)
         (list === nothing || isempty(list)) ? 0 : last(list)[3]
     end

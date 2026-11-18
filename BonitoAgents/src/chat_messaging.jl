@@ -19,7 +19,7 @@ function set_chat_messaging!(state::ServerState, project_id::AbstractString, on:
     visible(state, p) || error("chat is not available")
     p.chat_messaging == on && return p
     p.chat_messaging = on
-    lock(state.lock) do; save_projects!(state); end
+    @lock state.lock begin; save_projects!(state); end
     notify_projects!(state)
     if !on
         root = root_state(state)

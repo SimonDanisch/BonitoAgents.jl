@@ -9,10 +9,10 @@ const ACP = AgentClientProtocol
 
 # Standard MCP-list serialisation, shared by every agent bring-up.
 mcp_list_payload(mcp_servers) =
-    [Dict("name"    => s.name,
+    [Dict{String,Any}("name"    => s.name,
           "command" => s.command,
           "args"    => s.args,
-          "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
+          "env"     => [Dict{String,Any}("name" => k, "value" => v) for (k,v) in s.env])
      for s in mcp_servers]
 
 # Server-global system prompt (state_dir/AGENTS.md) as the `_meta` extension

@@ -468,7 +468,7 @@ function start_dev_proxy(p::DevProxy, state::ServerState)
         # the dev worker: a crashed test run must not leave them listening.
         authelia = run(pipeline(with_parent(`$(p.authelia_bin) --config $(config)`);
                                 stdout = log("authelia"), stderr = log("authelia")); wait = false)
-        caddy_env = merge(ENV, Dict("XDG_DATA_HOME" => mkpath(joinpath(dir, "data")),
+        caddy_env = merge(ENV, Dict{String,String}("XDG_DATA_HOME" => mkpath(joinpath(dir, "data")),
                                     "XDG_CONFIG_HOME" => mkpath(joinpath(dir, "config"))))
         caddyfile = p.tunnel ? write_dev_tunnel(p, cfg, dir) : cfg.caddyfile
         caddy = run(pipeline(setenv(with_parent(`$(p.caddy_bin) run --config $(caddyfile) --adapter caddyfile --watch`),

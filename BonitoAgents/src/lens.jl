@@ -305,7 +305,7 @@ function write_saved_lenses(lenses::Vector{SavedLens})
     path = lenses_path()
     mkpath(dirname(path))
     open(path, "w") do io
-        JSON.print(io, [Dict("title" => l.title, "query" => l.query,
+        JSON.print(io, [Dict{String,Any}("title" => l.title, "query" => l.query,
                              "color" => l.color) for l in lenses])
     end
     return nothing
@@ -339,7 +339,7 @@ emit_lens_vocab(model::ChatModel) =
 emit_saved_lenses(model::ChatModel, lenses::Vector{SavedLens}) =
     chat_emit(model, Dict{String,Any}(
         "type" => "lens.saved",
-        "lenses" => [Dict("title" => l.title, "query" => l.query, "color" => l.color)
+        "lenses" => [Dict{String,Any}("title" => l.title, "query" => l.query, "color" => l.color)
                      for l in lenses]))
 
 # Per-tab independence on a broadcast channel: the result carries the `q` it

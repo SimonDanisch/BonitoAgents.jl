@@ -92,7 +92,7 @@ BonitoAgents.app_icon(::TodoApp) =
 # Every change goes through here: `f` gets a copy of the list and returns the
 # new one, which is saved and then shown.
 function update_todos!(f, app::TodoApp)
-    lock(app.lock) do
+    @lock app.lock begin
         app.todos.val = f(copy(app.todos[]))
         atomic_write_json(app.file, TodoFile(app.next_id, app.todos[]))
     end
@@ -337,7 +337,7 @@ function panel_rows(app::TodoApp, todos::Vector{Todo})
     server = app.ctx.server
     item(t) = Dict{String,Any}(
         "id" => t.id, "text" => t.text,
-        "chats" => [Dict("id" => c, "title" => something(chat_title(server, c), c)) for c in t.chats],
+        "chats" => [Dict{String,Any}("id" => c, "title" => something(chat_title(server, c), c)) for c in t.chats],
         "done_label" => isdone(t) ?
             join(filter(!isempty, ["✓ by " * done_by(app, t; you = "you"),
                                    relative_time_label(datetime2unix(t.done_at)), t.note]), " · ") : "")

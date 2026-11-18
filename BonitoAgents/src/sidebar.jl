@@ -322,7 +322,7 @@ function open_chat_projects(state::ServerState,
                             projects::AbstractDict{<:AbstractString,ProjectInfo})
     out  = filter!(p -> visible(state, p), open_chat_projects(projects))
     have = Set(p.id for p in out)
-    live = lock(state.lock) do
+    live = @lock state.lock begin
         collect(keys(state.chat_models))
     end
     for id in live
@@ -353,7 +353,7 @@ One of `:active`, `:online`, `:offline` — the sidebar icon's glow.
 function chat_status(state::ServerState, p::ProjectInfo)
     w = get(state.workers[], p.worker_id, nothing)
     (w === nothing || !isopen(w)) && return :offline
-    m = lock(state.lock) do; get(state.chat_models, p.id, nothing); end
+    m = @lock state.lock begin; get(state.chat_models, p.id, nothing); end
     m === nothing && return :online
     return m.busy_active[] ? :active : :online
 end
@@ -504,12 +504,13 @@ function search_results_dom(state::ServerState, workers::AbstractDict, q::Abstra
     isempty(found.open) && isempty(found.other) &&
         return DOM.div("No chat matches “$(strip(q))”."; class = "bt-side-empty")
     rows = Any[]
-    isempty(found.open) || push!(rows, DOM.div("Open"; class = "bt-side-group"),
-                                 (search_hit_dom(state, workers, h) for h in found.open)...)
-    isempty(found.other) || push!(rows, DOM.div("Not open"; class = "bt-side-group"),
-                                  (search_hit_dom(state, workers, h) for h in found.other)...)
+    for (label, hits) in (("Open", found.open), ("Not open", found.other))
+        isempty(hits) && continue
+        push!(rows, DOM.div(label; class = "bt-side-group"))
+        append!(rows, (search_hit_dom(state, workers, h) for h in hits))
+    end
     found.more > 0 && push!(rows, DOM.div("$(found.more) more: add a word to narrow it down."; class = "bt-side-empty"))
-    return DOM.div(rows...; class = "bt-side-results-list")
+    return DOM.div(rows; class = "bt-side-results-list")
 end
 
 # Per-PROCESS boot id scoping the sidebar's localStorage last-route memory:
@@ -550,7 +551,7 @@ function project_sidebar(session::Bonito.Session, state::ServerState,
         # otherwise persistently "open"). Persisted so the close survives a
         # restart; reopening from the dashboard clears it (bring_up_project_session!).
         p.dismissed = true
-        lock(state.lock) do; save_projects!(state); end
+        @lock state.lock begin; save_projects!(state); end
         notify_projects!(state)
         # Flip the view away FIRST, then tear the session down off the event
         # task (T21). `stop_session!` closes the transport (network I/O) and the

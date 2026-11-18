@@ -302,7 +302,7 @@ WorkerCredential(d::AbstractDict) =
     WorkerCredential(String(d["name"]), String(d["hash"]), String(d["owner"]), DateTime(d["created"]),
                      String(get(d, "digest", "")))
 
-Base.Dict(c::WorkerCredential) = Dict("name" => c.name, "hash" => c.hash, "owner" => c.owner,
+Base.Dict(c::WorkerCredential) = Dict{String,Any}("name" => c.name, "hash" => c.hash, "owner" => c.owner,
                                      "created" => string(c.created), "digest" => c.digest)
 
 credential_digest(password::AbstractString) = bytes2hex(SHA.sha256(String(password)))
@@ -381,7 +381,7 @@ Account(d::AbstractDict) = Account(String(d["name"]), String(d["display_name"]),
                                    Vector{String}(d["groups"]), d["disabled"] === true,
                                    String(d["password_hash"]))
 
-Base.Dict(a::Account) = Dict("name" => a.name, "display_name" => a.display_name, "email" => a.email,
+Base.Dict(a::Account) = Dict{String,Any}("name" => a.name, "display_name" => a.display_name, "email" => a.email,
                              "groups" => a.groups, "disabled" => a.disabled,
                              "password_hash" => a.password_hash)
 
@@ -410,7 +410,7 @@ Invite(id, groups, created_by, created, expires) = Invite(id, groups, created_by
 Invite(d::AbstractDict) = Invite(String(d["id"]), Vector{String}(d["groups"]), String(d["created_by"]),
                                  DateTime(d["created"]), DateTime(d["expires"]), String(get(d, "account", "")))
 
-Base.Dict(i::Invite) = Dict("id" => i.id, "groups" => i.groups, "created_by" => i.created_by,
+Base.Dict(i::Invite) = Dict{String,Any}("id" => i.id, "groups" => i.groups, "created_by" => i.created_by,
                             "created" => string(i.created), "expires" => string(i.expires),
                             "account" => i.account)
 

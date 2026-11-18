@@ -633,9 +633,16 @@ fi
 # Project.toml files only declare deps and are never a runtime env. update()
 # rather than resolve(): it re-pins git deps (Bonito, BonitoBook, BonitoWidgets)
 # against their `rev`'s current HEAD, and picks up compat bounds tightened upstream.
+# No precompile here: it would compile the whole env into the INSTALLER's depot,
+# which the server never reads (it has its own, below). That doubled every
+# update's compile time and its peak memory.
+update_env() {
+    JULIA_PKG_PRECOMPILE_AUTO=0 \
+        "$JULIA_BIN" "--project=$MONOREPO_DIR" --startup-file=no -e 'import Pkg; Pkg.update()'
+}
 if [[ $UPDATE -eq 1 ]]; then
     step "Julia env (monorepo root)"
-    "$JULIA_BIN" "--project=$MONOREPO_DIR" --startup-file=no -e 'import Pkg; Pkg.update()'
+    update_env
     ok "updated"
 fi
 
@@ -664,8 +671,16 @@ ok "julia $JULIA_VERSION"
 # git refuses a repository someone else owns unless it is named as safe.
 as_service git config --global --get-all safe.directory 2> /dev/null | grep -qxF "$MONOREPO_DIR" ||
     as_service git config --global --add safe.directory "$MONOREPO_DIR"
-as_service "$SERVICE_JULIA" "--project=$MONOREPO_DIR" --startup-file=no \
-    -e 'import Pkg; Pkg.instantiate(); using BonitoAgents'
+# Precompiling BonitoAgents (its precompile statements) peaked at 4.7 GB, next to
+# the running server. One thread for the pkgimage's native code and an earlier GC
+# bring it to 3.2 GB, for a minute more (measured 2026-11-18, Julia 1.12).
+# Both are environment variables, so they reach Pkg's precompile processes.
+precompile_service() {
+    as_service JULIA_IMAGE_THREADS=1 JULIA_HEAP_SIZE_HINT=2G \
+        "$SERVICE_JULIA" "--project=$MONOREPO_DIR" --startup-file=no \
+        -e 'import Pkg; Pkg.instantiate(); using BonitoAgents'
+}
+precompile_service
 ok "packages installed and precompiled"
 
 # ── The first admin ───────────────────────────────────────────────────────────

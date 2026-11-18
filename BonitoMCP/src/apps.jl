@@ -332,7 +332,7 @@ end
 function open_chat(ctx::ReplayContext; title::AbstractString = "", kw...)
     chat = ReplayChat(ctx, String(title), Dict{Symbol,Any}(kw), Msg[],
                       Base.RefValue(true))
-    lock(ctx.lock) do
+    @lock ctx.lock let
         push!(ctx.calls, :open_chat => (; title = String(title), kw...))
         push!(ctx.chats, chat)
     end
@@ -356,7 +356,7 @@ config(ctx::ReplayContext) = ctx.values
 state(ctx::ReplayContext) = lock(() -> copy(ctx.store), ctx.lock)
 
 state!(ctx::ReplayContext, key::AbstractString, value) =
-    lock(ctx.lock) do
+    @lock ctx.lock begin
         push!(ctx.calls, :state! => (String(key) => value))
         ctx.store[String(key)] = value
     end
@@ -364,7 +364,7 @@ state!(ctx::ReplayContext, key::AbstractString, value) =
 function send(chat::ReplayChat, msg::Msg;
               to_agent::Union{AbstractString,Nothing} = agent_text(msg))
     chat.open[] || error("send on a closed ReplayChat")
-    lock(chat.ctx.lock) do
+    @lock chat.ctx.lock begin
         push!(chat.ctx.calls, :send => (; msg, to_agent))
         push!(chat.messages, msg)
     end

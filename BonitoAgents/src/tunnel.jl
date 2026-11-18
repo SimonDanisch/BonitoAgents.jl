@@ -160,7 +160,7 @@ function admit!(g::TunnelAuthentication, request::HTTP.Request)
             request.context[:login_cookies] = [String(v) for (k, v) in answer.headers if lowercase(k) == "set-cookie"]
             @info "login gate: Authelia renewed the login cookie" client target = first(request.target, 120) cookie = join(cookies, ",") new_cookie = join(handed, ",") user = name
         end
-        lock(g.lock) do
+        @lock g.lock begin
             g.accepted[client] = AcceptedCookie(join(isempty(handed) ? cookies : handed, ","), name, time())
             # A long-running server meets many addresses; a day of them is plenty.
             length(g.accepted) > 1000 && filter!(kv -> time() - kv.second.at < 86400, g.accepted)

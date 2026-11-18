@@ -175,10 +175,10 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     init = ACP.send_request(conn, "initialize", Dict(
         "protocolVersion"    => 1,
         "clientCapabilities" => Dict(
-            "fs" => Dict("readTextFile" => true, "writeTextFile" => true),
+            "fs" => Dict{String,Any}("readTextFile" => true, "writeTextFile" => true),
             "_meta" => client_meta(a.provider),
             "elicitation" => a.provider.elicitation),
-        "clientInfo"         => Dict("name"    => "BonitoAgents.WorkerAgent",
+        "clientInfo"         => Dict{String,Any}("name"    => "BonitoAgents.WorkerAgent",
                                      "version" => "0.1.0")))
     init_caps = get(ACP._result_dict(init), "agentCapabilities", nothing)
     a.loads_sessions = init_caps isa AbstractDict &&
@@ -189,7 +189,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     # replay. The response carries the session-config blocks either way. Only
     # Claude honours the `_meta.systemPrompt.preset` AGENTS.md append.
     new_session() = ACP.send_request(conn, "session/new",
-        merge(Dict("cwd" => a.worker_path, "mcpServers" => mcp_list), prompt_meta))
+        merge(Dict{String,Any}("cwd" => a.worker_path, "mcpServers" => mcp_list), prompt_meta))
 
     session_id, msgs, result = if a.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=a.worker_path resume=a.resume_session_id
@@ -241,7 +241,7 @@ end
 function stop!(a::WorkerAgent; permanent::Bool = false)
     # Hold bind_lock so a mid-bind stop! WAITS for the bind to finish (then a.client
     # is set and we close cleanly) instead of nulling ws[] under the half-built conn.
-    lock(a.bind_lock) do
+    @lock a.bind_lock begin
         # `permanent=true` (stop_session! on a CLOSED/evicted chat) latches the
         # agent dead so a turn buffered past close can't lazily re-bind it into an
         # orphaned subprocess. Done UNDER bind_lock so it races cleanly with a

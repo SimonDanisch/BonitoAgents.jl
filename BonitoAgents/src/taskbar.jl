@@ -92,7 +92,7 @@ Base.isopen(tb::TaskBar) = tb.open[]
 # Close the bar: stops its poll loop and drops every task (chat teardown).
 function Base.close(tb::TaskBar)
     tb.open[] = false
-    lock(tb.lock) do; tb.items[] = Any[]; end
+    @lock tb.lock begin; tb.items[] = Any[]; end
     return nothing
 end
 
@@ -113,7 +113,7 @@ function run_taskbar!(tb::TaskBar)
                 @warn "taskbar poll: isdone/finished! threw" exception = (e, catch_backtrace())
             end
         end
-        lock(tb.lock) do
+        @lock tb.lock begin
             isempty(tb.items[]) || (tb.items[] = copy(tb.items[]))
         end
         sleep(1.0)

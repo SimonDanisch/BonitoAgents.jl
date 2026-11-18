@@ -309,7 +309,7 @@ the OTHER session's. Needs the chat's 'remote julia' switch.
 """
 function remote_session(worker::AbstractString; env_path::Union{AbstractString,Nothing} = nothing)
     key = (String(worker), env_path === nothing ? "" : String(env_path))
-    lock(VALUE_RELAY.lock) do
+    @lock VALUE_RELAY.lock begin
         get!(() -> RemoteSession(key[1], key[2], key[1], nothing, ReentrantLock()),
              VALUE_RELAY.sessions, key)
     end
@@ -348,10 +348,10 @@ function check_sendable(f)
 end
 
 function Base.close(r::RemoteSession)
-    lock(r.lock) do
+    @lock r.lock begin
         drop!(r)
     end
-    lock(VALUE_RELAY.lock) do
+    @lock VALUE_RELAY.lock begin
         get(VALUE_RELAY.sessions, (r.worker, r.env_path), nothing) === r &&
             delete!(VALUE_RELAY.sessions, (r.worker, r.env_path))
     end
@@ -398,7 +398,7 @@ connection may have died unnoticed (the other session restarted): with `retry`
 the request is sent once more on a new one.
 """
 function exchange(r::RemoteSession, head::String, payload::Union{Nothing,Some}; returns::Bool, retry::Bool)
-    lock(r.lock) do
+    @lock r.lock let
         attempts = retry && r.sock !== nothing ? 2 : 1
         for attempt in 1:attempts
             try

@@ -41,7 +41,7 @@ end
 # Every live host of one chat, as `(worker_id, ws)`.
 function eval_hosts_of(state::ServerState, project_id::AbstractString)
     prefix = project_id * "\0"
-    lock(state.lock) do
+    @lock state.lock begin
         [(String(k[(length(prefix) + 1):end]), ws) for (k, group) in state.eval_hosts
          if startswith(k, prefix) for ws in group.channels]
     end
@@ -63,7 +63,7 @@ function set_remote_eval!(state::ServerState, project_id::AbstractString, on::Bo
     p === nothing && error("unknown chat '$(project_id)'")
     if p.remote_eval != on
         p.remote_eval = on
-        lock(state.lock) do; save_projects!(state); end
+        @lock state.lock begin; save_projects!(state); end
         notify_projects!(state)
         on || close_eval_hosts!(state, p.id)
         # The ONLY record that this was ever flipped. Without it a report of
@@ -163,10 +163,10 @@ function ensure_eval_host!(state::ServerState, project_id::String, label::String
     ws = eval_host_ws(state, project_id, w.worker_id)
     ws === nothing || return ws
     key = eval_host_key(project_id, w.worker_id)
-    lk = lock(state.lock) do
+    lk = @lock state.lock begin
         get!(state.eval_host_locks, key, ReentrantLock())
     end
-    lock(lk) do
+    @lock lk let
         ws = eval_host_ws(state, project_id, w.worker_id)
         ws === nothing || return ws
         env = Dict{String,String}("BONITOAGENTS_PROJECT_ID" => project_id)
@@ -219,7 +219,7 @@ function close_eval_hosts!(state::ServerState, project_id::AbstractString)
             @warn "eval host did not acknowledge its shutdown" project_id worker_id = wid exception = e
         end
         close(ws)   # leaves the registry, and ends the channel of a host still alive
-        lock(state.lock) do
+        @lock state.lock let
             key = eval_host_key(project_id, wid)
             # The spawn lock goes with the host, so one entry per (chat, worker) that
             # ever ran a remote eval doesn't stay for the server's life — unless
@@ -377,7 +377,7 @@ function sync_folder!(state::ServerState, p::ProjectInfo, w::WorkerInfo,
     destination = nothing
     try
         destination = transfer_channel(state, dst_w.worker_id,
-            Dict("direction" => "to_worker", "dst_path" => String(dst)); timeout = 30.0)
+            Dict{String,Any}("direction" => "to_worker", "dst_path" => String(dst)); timeout = 30.0)
         result = RemoteSync.relay_directory(RemoteSync.WebSocketIO(source),
             RemoteSync.WebSocketIO(destination); on_progress = progress)
         # Legacy receivers have no final protocol ACK. Their clean channel
