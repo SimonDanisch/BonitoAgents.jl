@@ -97,7 +97,7 @@ end
             "BONITOAGENTS_SERVER_URL" => "http://server.example:8038",
             "BONITOAGENTS_PUBLIC_URL" => "https://agents.example",
             "BT_INHERITED_PROBE" => "kept") do
-        env = BonitoWorker.provider_env(BonitoWorker.AgentProviders.find_provider("ClaudeCode"),
+        env = BonitoWorker.provider_env(BonitoWorker.AgentProviders.find_provider("ClaudeCode"), "w-test",
                                         Dict("BONITOAGENTS_PROJECT_ID" => "chat-1"))
         for k in ("BONITOAGENTS_WORKER_CREDENTIAL", "BONITOAGENTS_SERVER_URL", "BONITOAGENTS_PUBLIC_URL")
             @test !haskey(env, k)
@@ -105,7 +105,7 @@ end
         @test !any(v -> occursin("not-for-agents", v), values(env))
         @test env["BT_INHERITED_PROBE"] == "kept"
         @test env["BONITOAGENTS_PROJECT_ID"] == "chat-1"
-        @test env[BonitoWorker.AGENT_OWNER_ENV] == BonitoWorker.load_or_generate_worker_id()
+        @test env[BonitoWorker.AGENT_OWNER_ENV] == "w-test"    # the id the worker runs as, never read from disk
     end
 end
 

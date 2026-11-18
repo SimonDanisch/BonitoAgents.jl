@@ -122,12 +122,21 @@ end
 
 # ── Configure + launch ───────────────────────────────────────────────────────
 import BonitoWorker
-BonitoWorker.install!(; server_url    = SERVER,
-                         credential    = CREDENTIAL,
-                         projects_root = pwd(),
-                         update_spec   = Dict("repo"       => REPO,
-                                              "rev"        => REV,
-                                              "source_id"  => SOURCE_ID,
-                                              "bonito_url" => BONITO_URL,
-                                              "bonito_rev" => BONITO_REV),
-                         code_changed  = code_changed)
+try
+    BonitoWorker.install!(; server_url    = SERVER,
+                             credential    = CREDENTIAL,
+                             projects_root = pwd(),
+                             update_spec   = Dict("repo"       => REPO,
+                                                  "rev"        => REV,
+                                                  "source_id"  => SOURCE_ID,
+                                                  "bonito_url" => BONITO_URL,
+                                                  "bonito_rev" => BONITO_REV),
+                             code_changed  = code_changed)
+catch e
+    # What the installer refuses to do is the outcome of this run, said once,
+    # not a stack trace with the reason somewhere in it.
+    e isa BonitoWorker.InstallError || rethrow()
+    println()
+    println("==> Not installed: ", sprint(showerror, e))
+    exit(1)
+end

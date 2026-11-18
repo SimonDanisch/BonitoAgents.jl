@@ -154,8 +154,11 @@ end
         # A new one replaces it.
         BW.write_config!(; server_url = "https://a.example", credential = "w-2:other", projects_root = dir)
         @test stored() == "w-2:other"
-        # Another server's credential is no use here.
-        BW.write_config!(; server_url = "https://b.example", projects_root = dir)
-        @test stored() == ""
+        # Another server's credential is no use here, and is not thrown away for
+        # it either: without one for THAT server the install is refused, since an
+        # empty credential is a worker that is refused every 5 s for days.
+        @test_throws BW.InstallError BW.write_config!(; server_url = "https://b.example", projects_root = dir)
+        @test stored() == "w-2:other"
+        @test JSON.parsefile(BW.config_path())["server_url"] == "https://a.example"
     end
 end

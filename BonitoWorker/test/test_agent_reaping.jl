@@ -180,14 +180,19 @@ probe_provider(bin, args; env = Dict{String,String}()) =
         @testset "the session scan spawns and reaps like a session" begin
             @testset "every provider spawn carries our mark" begin
                 prov = probe_provider("true", String[]; env = Dict("PROVIDER_ONLY" => "1"))
-                env  = BW.provider_env(prov)
+                # The id the worker was STARTED with, never one read from disk at
+                # spawn time: that read minted a new identity when the files were gone.
+                mine = BW.load_or_generate_worker_id()
+                env  = BW.provider_env(prov, mine)
                 # The mark is what makes a stray findable at all.
-                @test env[BW.AGENT_OWNER_ENV] == BW.load_or_generate_worker_id()
+                @test env[BW.AGENT_OWNER_ENV] == mine
                 @test env[BW.AGENT_OWNER_DIR_ENV] == BW.config_dir()
                 @test env["PROVIDER_ONLY"] == "1"
                 @test haskey(env, "PATH")            # live ENV is the base
                 # ...and a caller's overrides win over both.
-                @test BW.provider_env(prov, Dict("PROVIDER_ONLY" => "2"))["PROVIDER_ONLY"] == "2"
+                @test BW.provider_env(prov, mine, Dict("PROVIDER_ONLY" => "2"))["PROVIDER_ONLY"] == "2"
+                @test !hasmethod(BW.owner_env, Tuple{})
+                @test !hasmethod(BW.provider_env, Tuple{typeof(prov)})
             end
 
             @testset "a scan leaves nothing behind, even ignoring SIGTERM" begin
@@ -205,7 +210,7 @@ probe_provider(bin, args; env = Dict{String,String}()) =
                 """])
                 # Never answers `initialize`, so the scan gives up on the timeout
                 # and takes the teardown path — which is the path under test.
-                @test BW.acp_list_sessions(prov; timeout = 1.0) == Dict{String,Any}[]
+                @test BW.acp_list_sessions(prov, "w-test"; timeout = 1.0) == Dict{String,Any}[]
 
                 @test isfile(pidfile)
                 pid, pgid, child = parse.(Int, split(read(pidfile, String)))

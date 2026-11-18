@@ -468,6 +468,12 @@ function render_service_unit(; project::AbstractString = "@bonito-agents",
     Description=BonitoAgents worker
     After=network-online.target
     Wants=network-online.target
+    # A worker that cannot stay up is not helped by the fifth restart in a row:
+    # it burned 4 s of CPU every 5 s until someone read its log. After this many
+    # failed starts within the interval the unit stays failed; once the cause is
+    # fixed, `systemctl --user reset-failed bonito-worker.service` lets it start.
+    StartLimitIntervalSec=600
+    StartLimitBurst=5
 
     [Service]
     Type=simple
@@ -476,6 +482,9 @@ function render_service_unit(; project::AbstractString = "@bonito-agents",
     $(service_exec_stop())
     Restart=on-failure
     RestartSec=5
+    # Status 78 (EX_CONFIG): the worker found no config. A restart cannot fix
+    # that; reinstalling can (BonitoWorker.EXIT_CONFIG).
+    RestartPreventExitStatus=78
     # Cap the whole process tree (worker + MCP + Malt eval workers share the
     # unit's cgroup) so a runaway computation gets OOM-killed + restarted instead
     # of freezing the desktop. Tune or remove this line if you want no limit.
@@ -566,7 +575,7 @@ else
 end
 
 """
-    install_service!(; projects_root, memory_max="85%") -> (path, changed::Bool)
+    install_service!(; projects_root, memory_max="85%") -> (path, changed::Bool, restarted::Bool)
 
 Idempotently install/upgrade the `--user` systemd unit and make sure it's
 enabled (boot) + running. Re-running is safe:
@@ -608,7 +617,7 @@ function install_service!(; projects_root::AbstractString = pwd(),
     # changed for the bounce decision.
     must_restart = changed || code_changed
     run(`systemctl --user $(must_restart ? "restart" : "start") $SERVICE_NAME`)
-    return path, changed
+    return path, changed, must_restart
 end
 
 """
@@ -701,18 +710,75 @@ end
 function apply_run_mode!(mode::Symbol; projects_root::AbstractString = pwd(),
                           code_changed::Bool = true)
     if mode === :service
-        path, changed = install_service!(; projects_root, code_changed)
-        return (; mode, path, changed)
+        path, changed, restarted = install_service!(; projects_root, code_changed)
+        return (; mode, path, changed, restarted)
     else
         uninstall_service!()          # ensure no service competes with the bg process
         # `code_changed=true` triggers a stop+respawn even if the live PID is
         # still healthy — needed to reload new BonitoMCP/BonitoWorker code.
         proc, logfile = spawn_worker(; force_restart = code_changed)
-        return (; mode, proc, logfile)
+        return (; mode, proc, logfile, restarted = proc !== nothing)
     end
 end
 
 # ── Install / start ────────────────────────────────────────────────────────────
+
+"""
+    InstallError
+
+What `install!` refuses to do, and why, for the person running the installer:
+`install.jl` prints it as the install's outcome, not as a stack trace.
+"""
+struct InstallError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::InstallError) = print(io, e.msg)
+
+install_command(server_url::AbstractString) = "curl -fsSL $(server_url)/install.jl | julia - <credential>"
+
+# A server only this machine reaches (`LocalAuth` in the server's identity.jl: it
+# listens on localhost) lets every worker in; every other kind of server checks
+# a credential "Add worker" issued.
+function local_server(server_url::AbstractString)
+    host = lowercase(HTTP.URI(server_url).host)
+    host in ("localhost", "::1", "[::1]") && return true
+    ip = try
+        Sockets.IPv4(host)
+    catch e
+        e isa ArgumentError || rethrow()                # not a dotted quad: a name
+        return false
+    end
+    return ip.host >> 24 == 127                        # 127.0.0.0/8, not "127.example"
+end
+
+# The credential `config.json` gets. Installed again without one (to update, or
+# from another folder), the machine keeps the one it has for this server: writing
+# "" would lock it out, and a new credential per reinstall leaves the old ones
+# lying around. With none to keep, a worker for a server that checks credentials
+# is not installed at all: it would dial for days and be refused every 5 s, the
+# reason in a log nobody reads, and the install itself said "installed" (11-18).
+function resolve_credential(server_url::String, credential::String, cfg::String)
+    if !isempty(credential)
+        parts = split(credential, ':'; limit = 2)
+        (length(parts) == 2 && !any(isempty, parts)) ||
+            throw(InstallError("BonitoWorker: a worker credential is `name:password`, as \"Add worker\" " *
+                               "on $(server_url) prints it; what was given is not of that form."))
+        return credential
+    end
+    previous = isfile(cfg) ? JSON.parsefile(cfg) : Dict{String,Any}()
+    kept = String(get(previous, "credential", ""))
+    kept_for = String(get(previous, "server_url", ""))
+    if kept_for == server_url && !isempty(kept)
+        @info "BonitoWorker: keeping this machine's worker credential" credential = first(split(kept, ':'))
+        return kept
+    end
+    local_server(server_url) && return ""
+    why = isempty(kept) ? "this machine has none" :
+        "the one this machine has is for $(kept_for), which $(server_url) does not know"
+    throw(InstallError("BonitoWorker: no worker credential was given, and $(why). " *
+                       "Get one from \"Add worker\" on $(server_url) and run the command it shows:\n" *
+                       "    " * install_command(server_url)))
+end
 
 # Write the worker's `config.json` (read back by `start()`). Shared by `install!`
 # and `dev_server`, so the two stay in lock-step. `name` defaults to the derived
@@ -731,16 +797,7 @@ function write_config!(; server_url::AbstractString,
                           # installer opts in below after recording a real spec.
                           auto_update::Bool = false)
     cfg = config_path()
-    # Installed again without a credential (to update, or from another folder):
-    # the machine keeps the one it has for this server. Writing "" would lock it
-    # out, and a new credential per reinstall leaves the old ones lying around.
-    if isempty(credential) && isfile(cfg)
-        previous = JSON.parsefile(cfg)
-        if get(previous, "server_url", "") == server_url && !isempty(get(previous, "credential", ""))
-            credential = previous["credential"]
-            @info "BonitoWorker: keeping this machine's worker credential" credential = first(split(credential, ':'))
-        end
-    end
+    credential = resolve_credential(String(server_url), String(credential), cfg)
     config = Dict(
         "worker_id" => load_or_generate_worker_id(),
         "server_url"    => String(server_url),
@@ -783,6 +840,8 @@ function install!(; server_url::String,
     cfg = write_config!(; server_url, credential, projects_root, update_spec, auto_update)
 
     mode = run_mode == :prompt ? choose_run_mode() : run_mode
+    logfile = worker_log_path()
+    mark = log_mark(logfile)
     result = apply_run_mode!(mode; projects_root = abspath(projects_root),
                               code_changed = code_changed)
     println()
@@ -799,6 +858,7 @@ function install!(; server_url::String,
         println("      journalctl --user -u $(SERVICE_NAME) -f")
         println("    Switch back to a plain process: re-run the installer and pick [2].")
         println()
+        report_connection(result.restarted, logfile, mark)
         return result
     end
 
@@ -833,7 +893,75 @@ function install!(; server_url::String,
     println()
     println("      julia --project=@bonito-agents --threads=2 -e \"using BonitoWorker; BonitoWorker.start()\"")
     println()
+    report_connection(result.restarted, logfile, mark)
     return result
+end
+
+# Where the worker's log ends now: `first_connection` reads what comes after.
+log_mark(logfile::AbstractString) = isfile(logfile) ? filesize(logfile) : 0
+
+# What one log line says about the connection: `(ok, line)` for the lines the
+# worker writes when it got in or could not (worker.jl: `serve`), else `nothing`.
+function connection_outcome(line::AbstractString)
+    ok = occursin("registered with server", line)
+    failed = occursin("refused this worker", line) || occursin("did not take the connection", line) ||
+             occursin("connection failed", line)
+    (ok || failed) || return nothing
+    # Without the logger's location suffix: it says nothing to the person installing.
+    return (ok = ok, line = String(strip(replace(line, r"\s+@ \S+ \S+:\d+\s*$" => ""))))
+end
+
+"""
+    first_connection(logfile, mark; timeout = 120) -> Union{NamedTuple,Nothing}
+
+The first thing the worker started by `install!` says about its connection, read
+from its log past `mark`: `(ok = true, line)` when it registered, `(ok = false,
+line)` when the server refused it or the dial failed; `nothing` when it said
+neither within `timeout` seconds. The log may not exist yet (a first install).
+"""
+function first_connection(logfile::AbstractString, mark::Integer; timeout::Real = 120)
+    deadline = time() + timeout
+    dir = dirname(logfile)
+    mkpath(dir)
+    try
+        while true
+            if isfile(logfile)
+                # Rotated under us: read the new generation from its start.
+                filesize(logfile) < mark && (mark = 0)
+                text = open(io -> (seek(io, mark); read(io, String)), logfile)
+                for line in eachline(IOBuffer(text))
+                    outcome = connection_outcome(line)
+                    outcome === nothing || return outcome
+                end
+            end
+            remaining = deadline - time()
+            remaining <= 0 && return nothing
+            # Woken by the directory (the log is appended to, or created). The
+            # watch starts on the first call, so a write just before it is seen
+            # on the next pass; the cap keeps that pass near.
+            FileWatching.watch_folder(dir, min(remaining, 2.0))
+        end
+    finally
+        FileWatching.unwatch_folder(dir)
+    end
+end
+
+# Tells the person installing what the worker they just started found out, so
+# a credential the server refuses shows up here and now, not in a log later.
+function report_connection(restarted::Bool, logfile::AbstractString, mark::Integer; timeout::Real = 120)
+    restarted || return nothing
+    println("==> Waiting for the worker's first connection (up to $(round(Int, timeout)) s) ...")
+    outcome = first_connection(logfile, mark; timeout)
+    if outcome === nothing
+        println("    No word from the worker yet. Its log: ", logfile)
+    elseif outcome.ok
+        println("==> Worker connected: ", outcome.line)
+    else
+        println("==> Worker could NOT connect: ", outcome.line)
+        println("    It keeps trying every few seconds; once the cause is fixed it comes in by itself.")
+        println("    Its log: ", logfile)
+    end
+    return outcome
 end
 
 # Launch `BonitoWorker.start()` as a detached background process so it outlives
@@ -946,7 +1074,31 @@ function _bind_lifetime_to_parent!()
     return nothing
 end
 
+"""
+    ConfigMissing
+
+`start` found no `config.json`: this machine was never installed, or its install
+went missing (the whole Scratch space was wiped with `~/.julia/scratchspaces`, 11-16).
+"""
+struct ConfigMissing <: Exception
+    path::String
+end
+Base.showerror(io::IO, e::ConfigMissing) =
+    print(io, "BonitoWorker: no config at $(e.path): this machine is not installed, or its install ",
+              "was deleted. Run the install command from \"Add worker\" on the dashboard: ",
+              install_command("<server-url>"))
+
+# sysexits.h EX_CONFIG. The service unit does not restart a worker that exits
+# with it (`RestartPreventExitStatus`): a config error is for a person to fix.
+const EXIT_CONFIG = 78
+
+read_config(path::AbstractString = config_path()) =
+    isfile(path) ? Dict{String,Any}(JSON.parsefile(path)) : throw(ConfigMissing(String(path)))
+
 function start(; force::Bool = false)
+    # Whoever started us reads this (journald for the service); the log below
+    # is a redirect of fd 1/2, so after it only the file hears us.
+    console = stderr
     # Before anything can log: the file is a redirect of fd 1 and 2, so starting
     # it late means the first seconds of a worker's life — which is where a
     # failed dial or a bad config shows up — go to wherever the service manager
@@ -965,9 +1117,17 @@ function start(; force::Bool = false)
     # other machine can reach.
     start_file_log!(worker_log_path();
                     redirect = get(ENV, LOG_INHERITED_ENV, "") != "1")
-    cfg = config_path()
-    isfile(cfg) || error("BonitoWorker: no config at $cfg — run the installer first " *
-                          "(`curl -fsSL <server-url>/install.jl | julia -`)")
+    config = try
+        read_config()
+    catch e
+        e isa ConfigMissing || rethrow()
+        message = sprint(showerror, e)
+        @error message
+        println(console, "ERROR: ", message)
+        # Nothing a restart fixes: on this status the unit leaves the worker
+        # down (`RestartPreventExitStatus`) instead of restarting it every 5 s.
+        exit(EXIT_CONFIG)
+    end
     other = running_worker_pid()
     if other !== nothing && !force
         @warn "BonitoWorker: a worker is already running; refusing to start a duplicate" *
@@ -986,7 +1146,6 @@ function start(; force::Bool = false)
     # worker's agents.
     reap_stray_agents!()
     worker_id = load_or_generate_worker_id()
-    config = JSON.parse(read(cfg, String))
     connect_and_serve(;
         server_url    = String(config["server_url"]),
         credential    = String(get(config, "credential", "")),
@@ -1165,6 +1324,7 @@ function run_auto_update!(w::Worker, target::Dict{String,String};
     report_update!(w, "installing")
     try
         update_packages!(target)
+        persist_identity!(w.config)
         write_update_spec!(config, target)
     catch e
         e isa InterruptException && rethrow()
@@ -1334,6 +1494,7 @@ function open_eval_host!(w::Worker, project_id::AbstractString, env::AbstractDic
         relay = w.relay
         owner = "host:" * project_id
         revoke_mcp_grants!(relay, owner)
+        persist_identity!(c)
         host_env = merge(inherited_env(),
                          Dict{String,String}(String(k) => String(v) for (k, v) in env),
                          Dict("BONITOAGENTS_EVAL_HOST_WORKER" => c.worker_id),
@@ -1392,7 +1553,12 @@ end
 # killed every chat there. A copy runs from a config dir of its own.
 const AGENT_OWNER_ENV = "BONITOAGENTS_OWNER_WORKER"
 const AGENT_OWNER_DIR_ENV = "BONITOAGENTS_OWNER_CONFIG"
-owner_env(worker_id::AbstractString = load_or_generate_worker_id(), dir::AbstractString = config_dir()) =
+# `worker_id` has no default on purpose. The default that read it from disk
+# minted a NEW identity when the config directory had been wiped under a running
+# worker (every file of the Scratch space, 11-16): its agents then carried an id
+# the server had never seen, and the next start came up as a stranger. A running
+# worker passes the id it was started with; `persist_identity!` puts the files back.
+owner_env(worker_id::AbstractString, dir::AbstractString = config_dir()) =
     Dict{String,String}(AGENT_OWNER_ENV => String(worker_id), AGENT_OWNER_DIR_ENV => String(dir))
 
 # The environment an agent-side child (agent, session scan, eval host, git in a
@@ -1419,10 +1585,10 @@ end
 # nothing can ever clean up: the scan spawn used to skip this, and its strays —
 # a Julia agent still precompiling outlives the SIGTERM that ends the scan — were
 # invisible to both halves of the reaper, at ~500 MB each.
-function provider_env(provider, extra::AbstractDict = Dict{String,String}())
+function provider_env(provider, worker_id::AbstractString, extra::AbstractDict = Dict{String,String}())
     return merge(inherited_env(),
                  provider.env,
-                 owner_env(),
+                 owner_env(worker_id),
                  extra)
 end
 
@@ -2859,16 +3025,17 @@ else
 end
 
 """
-    scan_sessions(; home = homedir(), acp = scan_acp_providers()) -> Vector{Dict}
+    scan_sessions(; home = homedir(), acp) -> Vector{Dict}
 
 Every session on this machine, of every agent: Claude's from its files
-(`scan_claude_sessions`), the others' over ACP (`acp`). A session whose folder
+(`scan_claude_sessions`), the others' over ACP (`acp`, the rows of
+`scan_acp_providers`). A session whose folder
 no longer exists is left out, whichever agent it is from: agents keep their
 sessions long after the folder is gone (throwaway temp dirs especially), and
 there is nothing to resume into. The one place that rule lives: the paths are
 this machine's, so only the worker can check them.
 """
-function scan_sessions(; home::String = homedir(), acp = scan_acp_providers())
+function scan_sessions(; home::String = homedir(), acp::AbstractVector)
     sessions = try
         scan_claude_sessions(; home)
     catch e
@@ -2879,13 +3046,18 @@ function scan_sessions(; home::String = homedir(), acp = scan_acp_providers())
     return filter!(r -> isdir(String(r["path"])), sessions)
 end
 
-function handle_scan_sessions(ws, cmd::AbstractDict)
+function handle_scan_sessions(w::Worker, ws, cmd::AbstractDict)
     request_id = String(get(cmd, "request_id", ""))
     # `agents = false`: the session files alone. Asking the agents starts one
     # process per installed agent (seconds each), which a chat being opened has
     # no use for: it only checks its own Claude session.
-    sessions = get(cmd, "agents", true) === false ?
-        scan_sessions(; acp = Dict{String,Any}[]) : scan_sessions()
+    acp = if get(cmd, "agents", true) === false
+        Dict{String,Any}[]
+    else
+        persist_identity!(w.config)
+        scan_acp_providers(w.config.worker_id)
+    end
+    sessions = scan_sessions(; acp)
     try
         send_control(ws, Dict(
             "type"       => "scan_sessions_result",
@@ -2898,7 +3070,7 @@ function handle_scan_sessions(ws, cmd::AbstractDict)
 end
 
 """
-    scan_acp_providers() -> Vector{Dict}
+    scan_acp_providers(worker_id) -> Vector{Dict}
 
 Discovered sessions from every installed provider that can list its own over
 ACP, in the same row shape as `scan_claude_sessions`.
@@ -2919,7 +3091,7 @@ the scan cost the SUM of every agent's start-up (MiMo alone takes 3 s), passed t
 server's 15 s on a freshly restarted worker, and the card then showed no
 projects at all, Claude's included.
 """
-function scan_acp_providers(; timeout::Real = 8.0)
+function scan_acp_providers(worker_id::AbstractString; timeout::Real = 8.0)
     provs = [prov for prov in AgentProviders.current_providers()
              # ClaudeCode is covered by the file scan (which also yields subagents,
              # liveness and pids that `session/list` doesn't carry).
@@ -2927,7 +3099,7 @@ function scan_acp_providers(; timeout::Real = 8.0)
                 (isfile(prov.bin) || Sys.which(prov.bin) !== nothing)]
     listings = map(provs) do prov
         @async try
-            acp_list_sessions(prov; timeout)
+            acp_list_sessions(prov, worker_id; timeout)
         catch e
             # The agent could not be started, or died while we talked to it.
             e isa Base.IOError || rethrow()
@@ -2988,9 +3160,9 @@ end
 #
 # `timeout` bounds the WHOLE listing (start, initialize, every page), not each
 # request: the server gives the entire scan 15 s. What arrived by then is kept.
-function acp_list_sessions(prov; timeout::Real = 8.0)
+function acp_list_sessions(prov, worker_id::AbstractString; timeout::Real = 8.0)
     deadline = time() + timeout
-    proc = open(detach(Cmd(`$(prov.bin) $(prov.args)`; env = provider_env(prov))), "r+")
+    proc = open(detach(Cmd(`$(prov.bin) $(prov.args)`; env = provider_env(prov, worker_id))), "r+")
     rows = Dict{String,Any}[]
     try
         replies = Dict{Int,Any}()
