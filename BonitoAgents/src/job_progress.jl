@@ -9,7 +9,7 @@ end
 
 function job_book(state, pid)
     state = root_state(state)
-    lock(state.lock) do
+    @lock state.lock begin
         get!(state.job_progress,String(pid)) do
             path = joinpath(state.state_dir,"chats",pid,"progress.json")
             stored = load_json_tolerant(path,"job progress")
@@ -59,7 +59,7 @@ function job_update!(book::JobBook, frame, worker, connection)
             # A reconnect may replay the latest acknowledged state; reconnect
             # the indicator without allowing an older terminal state to revive.
             if frame["seq"] == prior["seq"]
-                jobs[frame["id"]] = merge(prior,Dict("connected"=>true,"connection"=>connection))
+                jobs[frame["id"]] = merge(prior,Dict{String,Any}("connected"=>true,"connection"=>connection))
                 book.changed[] = jobs
                 return nothing
             end
@@ -103,12 +103,12 @@ function progress_worker_connected!(state, worker, online)
     state = root_state(state)
     books = lock(() -> collect(values(state.job_progress)),state.lock)
     for book in books
-        lock(book.lock) do
+        @lock book.lock let
             jobs = copy(book.changed[])
             changed = false
             for (id,job) in jobs
                 get(job,"worker",nothing) == worker || continue
-                jobs[id] = merge(job,Dict("worker_online"=>online))
+                jobs[id] = merge(job,Dict{String,Any}("worker_online"=>online))
                 changed = true
             end
             changed && (book.changed[]=jobs)
@@ -118,11 +118,11 @@ function progress_worker_connected!(state, worker, online)
 end
 
 function progress_disconnected!(book, connection)
-    lock(book.lock) do
+    @lock book.lock let
         jobs = copy(book.changed[])
         for (id,job) in jobs
             get(job,"connection",nothing) == connection || continue
-            jobs[id] = merge(job,Dict("connected"=>false))
+            jobs[id] = merge(job,Dict{String,Any}("connected"=>false))
         end
         book.changed[] = jobs
         save_jobs!(book)
@@ -245,12 +245,12 @@ function job_progress_view(session, book; icon=false)
     dismiss = Observable(Dict{String,Any}())
     on(session,dismiss) do request
         isempty(request) && return
-        lock(book.lock) do
+        @lock book.lock let
             jobs = copy(book.changed[])
             job = get(jobs,get(request,"id",""),nothing)
             job === nothing && return
             job["generation"] == get(request,"generation",nothing) || return
-            jobs[job["id"]] = merge(job,Dict("dismissed"=>true))
+            jobs[job["id"]] = merge(job,Dict{String,Any}("dismissed"=>true))
             book.changed[] = jobs
             save_jobs!(book)
         end

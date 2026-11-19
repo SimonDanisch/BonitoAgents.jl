@@ -106,7 +106,7 @@ function mcp_relay_env(relay::MCPRelay, project_id::AbstractString;
         relay.grants[token] = RelayGrant("progress", project_id, host, "progress:" * project_id)
         token
     end
-    return Dict("BONITOAGENTS_CONTROL_URL" => "ws://" * WebSockets.server_addr(relay.server),
+    return Dict{String,Any}("BONITOAGENTS_CONTROL_URL" => "ws://" * WebSockets.server_addr(relay.server),
                 "BONITOAGENTS_VALUES_ADDR" => tcp_address(relay),
                 "BONITOAGENTS_CONTROL_TOKEN" => control,
                 "BONITOAGENTS_EVAL_TOKEN" => eval,
@@ -189,7 +189,7 @@ function Base.close(peer::RelayPeer)
 end
 
 function revoke_mcp_grants!(relay::MCPRelay, owner::AbstractString)
-    peers = lock(relay.lock) do
+    peers = @lock relay.lock begin
         filter!(p -> p.second.owner != owner, relay.grants)
         [p for p in values(relay.peers) if p.owner == owner]
     end

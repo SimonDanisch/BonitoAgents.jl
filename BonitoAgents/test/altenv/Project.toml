@@ -27,4 +27,4 @@ version = "0.0.1"
 Bonito = "824d6782-a2ef-11e9-3a09-e5662e0c26f8"
 
 [compat]
-Bonito = "5.3"
+Bonito = "5.3.1"

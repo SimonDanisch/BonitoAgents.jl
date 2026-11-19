@@ -29,6 +29,24 @@ ITEMS="${ITEMS:-^e2e:(smoke|dashboard_layout|overview|sidebar|sidebar_groups|set
 rm -rf "$TRACE_DIR"; mkdir -p "$TRACE_DIR"
 export DISPLAY="${DISPLAY:-:1}"
 
+# The trace has to hold every method the items compile. Against a pkgimage that
+# already has the shipped statements it would hold only what they miss, and the
+# statements of code that changed or went away would never drop out (the file
+# grew to 3619, ~400 of them for DOM paths Bonito no longer takes). So the items
+# run without the file: BonitoAgents compiles without it, and generate.jl writes
+# the new one. If anything fails before that, the old file goes back.
+STATEMENTS="$REPO/BonitoAgents/src/precompile_statements.jl"
+PARKED=""
+if [[ -f "$STATEMENTS" ]]; then
+    PARKED="$(mktemp)"
+    mv "$STATEMENTS" "$PARKED"
+fi
+restore_statements() {
+    [[ -n "$PARKED" ]] || return 0
+    if [[ -f "$STATEMENTS" ]]; then rm -f "$PARKED"; else mv "$PARKED" "$STATEMENTS"; fi
+}
+trap restore_statements EXIT
+
 echo ">> running e2e items under --trace-compile (DISPLAY=$DISPLAY)"
 # The items run IN the traced process (`nworkers = 0`): test/runtests.jl runs
 # them in a worker process of their own, which --trace-compile never reaches.

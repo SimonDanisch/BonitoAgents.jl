@@ -279,7 +279,7 @@ comment tray the other.
 function review_state!(state::ServerState, project_id::AbstractString;
                        base::AbstractString = "")
     id = String(project_id)
-    return lock(state.lock) do
+    return @lock state.lock let
         existing = get(state.review_states, id, nothing)
         existing isa ReviewState && return existing
         st = ReviewState(; base)
@@ -291,7 +291,7 @@ end
 # Drop a project's review state — it is keyed by project id, so leaving it behind
 # would hand a NEW project that reuses the id someone else's pending comments.
 forget_review_state!(state::ServerState, project_id::AbstractString) =
-    lock(state.lock) do
+    @lock state.lock begin
         delete!(state.review_states, String(project_id))
         return nothing
     end

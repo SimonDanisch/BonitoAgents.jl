@@ -74,7 +74,7 @@ make_eval_bridge(prefix::AbstractString, project_id::AbstractString, ws, host) =
 # drops the OLDEST frames: the newest ones are the likeliest to matter (the
 # most recent snapshot/bundle), and the pull/re-mount paths heal older losses.
 function park_frame!(eb::EvalBridge, prefix::AbstractString, payload::Vector{UInt8})
-    lock(eb.parked_lock) do
+    @lock eb.parked_lock let
         q = get!(() -> Vector{Vector{UInt8}}(), eb.parked, String(prefix))
         push!(q, payload)
         eb.parked_bytes += length(payload)
@@ -119,7 +119,7 @@ end
 # same lock, so UI tasks that just `get(state.eval_workers, …)` raced a concurrent
 # insert/delete (Dict rehash). All reads go through here.
 eval_bridge_for(state::ServerState, project_id::AbstractString) =
-    lock(state.lock) do
+    @lock state.lock begin
         get(state.eval_workers, String(project_id), nothing)
     end
 
@@ -139,7 +139,7 @@ bridge, whose mount then fails fast to the static fallback.
 function bridge_for_ref(state::ServerState, project_id::AbstractString, ref::AbstractString)
     prefix = first(split(ref, '/'; limit = 2))
     host_keys = String(project_id) * "\0"
-    lock(state.lock) do
+    @lock state.lock begin
         for (key, eb) in state.eval_workers
             (key == project_id || startswith(key, host_keys)) && eb.prefix == prefix && return eb
         end
@@ -235,7 +235,7 @@ function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, redial_gr
     end
     id = Threads.atomic_add!(eb.reqid, 1)
     ch = Channel{Any}(1)
-    lock(eb.pending_lock) do; eb.pending[id] = ch; end
+    @lock eb.pending_lock begin; eb.pending[id] = ch; end
     send_ctrl(eb, Dict{String,Any}("op" => op, "id" => id,
                                    (String(k) => v for (k, v) in kw)...))
     try
@@ -247,7 +247,7 @@ function call_ctrl(eb::EvalBridge, op::AbstractString; timeout = 30.0, redial_gr
         result isa Exception && throw(result)
         return result
     finally
-        lock(eb.pending_lock) do; delete!(eb.pending, id); end
+        @lock eb.pending_lock begin; delete!(eb.pending, id); end
     end
 end
 
@@ -268,7 +268,7 @@ function handle_worker_control(eb::EvalBridge, msg::AbstractDict)
         # capacity-1 channel first and this `put!` would then block the relay
         # loop forever. Popping means whichever of {reply, fail_pending!} gets
         # the entry first is the sole writer; the other finds it gone.
-        ch = lock(eb.pending_lock) do
+        ch = @lock eb.pending_lock let
             id = Int(msg["id"])
             haskey(eb.pending, id) ? pop!(eb.pending, id) : nothing
         end
@@ -303,7 +303,7 @@ end
 # called when the WS drops, so callers don't sit on a 30 s timeout for replies
 # that physically can't come back over the dead socket.
 function fail_pending!(eb::EvalBridge, why::AbstractString)
-    drained = lock(eb.pending_lock) do
+    drained = @lock eb.pending_lock let
         pp = collect(values(eb.pending))
         empty!(eb.pending)
         pp
@@ -427,11 +427,11 @@ function serve_eval_bridge(state::ServerState, ws::WorkerLink.LinkChannel, proje
     # write. The heavy cleanup (fail_pending, asset-host close, wiring clear) is
     # disjoint by prefix from the fresh bridge, so we do it AFTER releasing the
     # lock rather than holding it across those other locks.
-    eb, to_fail, to_retire = lock(state.lock) do
+    eb, to_fail, to_retire = @lock state.lock let
         existing = get(state.eval_workers, project_id, nothing)
         if existing !== nothing && existing.prefix == prefix
             @info "eval worker reconnected" project_id prefix
-            lock(existing.wlock) do; existing.ws = ws; end
+            @lock existing.wlock begin; existing.ws = ws; end
             (existing, existing, nothing)          # fail its orphaned pending below
         else
             fresh = make_eval_bridge(prefix, project_id, ws, Bonito.HTTPAssetServer(state.srv))
@@ -492,7 +492,7 @@ function serve_eval_bridge(state::ServerState, ws::WorkerLink.LinkChannel, proje
         # only with the worker session — see `teardown_eval_bridge!`. The identity
         # guard avoids clobbering a channel a concurrent reconnect swapped in.
         fail_pending!(eb, "eval bridge channel dropped; awaiting redial")
-        lock(eb.wlock) do
+        @lock eb.wlock begin
             eb.ws === ws && (eb.ws = nothing)
         end
     end
@@ -503,12 +503,12 @@ end
 # — so a later bridge (same tab) re-attaches cleanly instead of
 # short-circuiting on a stale attach tag.
 function clear_bridge_wiring!(eb::EvalBridge)
-    lock(eb.pc_lock) do
+    @lock eb.pc_lock begin
         empty!(eb.page_conns)
         empty!(eb.tab_prefix)
     end
     # A retired bridge's parked frames belong to a dead worker session — drop them.
-    lock(eb.parked_lock) do
+    @lock eb.parked_lock begin
         empty!(eb.parked)
         eb.parked_bytes = 0
     end
@@ -521,7 +521,7 @@ end
 # worker disconnect): releases the proxied asset host, fails in-flight control
 # requests, drops host-side wiring, and evicts from state.eval_workers. Idempotent.
 function teardown_eval_bridge!(state::ServerState, project_id::AbstractString)
-    eb = lock(state.lock) do
+    eb = @lock state.lock let
         e = get(state.eval_workers, String(project_id), nothing)
         e === nothing || delete!(state.eval_workers, String(project_id))
         e
@@ -566,7 +566,7 @@ end
 function wake_agent_waits!(model)
     for ws in mcp_channels_for(model.state, model.project_id)
         try
-            HTTP.WebSockets.send(ws, JSON.json(Dict("op" => "wake_waits")))
+            HTTP.WebSockets.send(ws, JSON.json(Dict{String,Any}("op" => "wake_waits")))
         catch e
             (e isa HTTP.WebSockets.WebSocketError || e isa Base.IOError ||
              e isa EOFError || e isa WorkerLink.LinkDead ||
@@ -584,7 +584,7 @@ function dev_op(state::ServerState, ::Val{:wait_input}, args::AbstractDict, call
     model === nothing && return false
     s = shared(model)
     id = String(get(args, "tool_id", ""))
-    return lock(s.lock) do
+    return @lock s.lock let
         any(e -> e isa PendingSend && e.status === :submitted && e.mode === :next &&
                 has_other_turn(s, e.span.turn),
             s.pending_sends) && return true
@@ -694,7 +694,7 @@ function route_eval_chunk!(state::ServerState, project_id::AbstractString,
                            route::AbstractString, chunk::AbstractString; keep::Int = 8192)
     isempty(chunk) && return nothing
     key = eval_sink_key(project_id, route)
-    ch = lock(state.lock) do
+    ch = @lock state.lock let
         sink = get(state.eval_stream_sinks, key, nothing)
         # A running run whose card does not listen yet: kept for it.
         held = get(state.eval_stream_pending, key, nothing)
@@ -853,18 +853,18 @@ end
 # prefix so the caller can `mount(root=prefix, …)`. Idempotent per tab (opens are
 # serialized under `open_lock`); the page-root is closed when the tab closes.
 function ensure_page_root!(root::Bonito.Session, eb::EvalBridge)
-    lock(eb.open_lock) do
+    @lock eb.open_lock let
         existing = lock(() -> get(eb.tab_prefix, root.id, nothing), eb.pc_lock)
         if existing !== nothing
             # Reconnect / re-mount on a known tab: rebind its connection + flush.
-            lock(eb.pc_lock) do; eb.page_conns[existing] = Bonito.connection(root); end
+            @lock eb.pc_lock begin; eb.page_conns[existing] = Bonito.connection(root); end
             flush_parked!(eb, existing, Bonito.connection(root))
             return existing
         end
         # Mint the worker-side page-root (round-trip; rare, so under open_lock so
         # concurrent first-mounts on this tab share one root).
         prefix = String(call_ctrl(eb, "open_root"))
-        lock(eb.pc_lock) do
+        @lock eb.pc_lock begin
             eb.tab_prefix[root.id] = prefix
             eb.page_conns[prefix] = Bonito.connection(root)
         end
@@ -873,7 +873,7 @@ function ensure_page_root!(root::Bonito.Session, eb::EvalBridge)
         # Rebind + flush on every (re)connect of this tab's websocket, so a
         # reconnect can't leave the relay pointed at the dead connection.
         Bonito.on(root.on_open) do _
-            lock(eb.pc_lock) do; eb.page_conns[prefix] = Bonito.connection(root); end
+            @lock eb.pc_lock begin; eb.page_conns[prefix] = Bonito.connection(root); end
             flush_parked!(eb, prefix, Bonito.connection(root))
         end
 
@@ -884,15 +884,15 @@ function ensure_page_root!(root::Bonito.Session, eb::EvalBridge)
 
         Bonito.on(root.on_close) do _
             Bonito.unregister_remote!(root, prefix)
-            lock(eb.pc_lock) do
+            @lock eb.pc_lock begin
                 delete!(eb.page_conns, prefix)
                 delete!(eb.tab_prefix, root.id)
             end
-            lock(eb.parked_lock) do
+            @lock eb.parked_lock let
                 q = pop!(eb.parked, prefix, nothing)
                 q === nothing || (eb.parked_bytes -= sum(length, q; init = 0))
             end
-            send_ctrl(eb, Dict("op" => "close_root", "root" => prefix))
+            send_ctrl(eb, Dict{String,Any}("op" => "close_root", "root" => prefix))
         end
         return prefix
     end
@@ -903,7 +903,7 @@ end
 # `free_session(sub_id)` back through the bridge, dropping the browser-side
 # objects/listeners a removed mount left on shared observables.
 close_remote_sub!(eb::EvalBridge, sub_id::AbstractString) =
-    (send_ctrl(eb, Dict("op" => "close", "sub" => String(sub_id))); nothing)
+    (send_ctrl(eb, Dict{String,Any}("op" => "close", "sub" => String(sub_id))); nothing)
 
 # ── RemoteRef: a worker-held eval RESULT as a composable value ───────────────
 # (spec: docs/superpowers/specs/2026-07-15-remote-ref-design.md)
@@ -965,7 +965,7 @@ function Bonito.jsrender(session::Bonito.Session, r::RemoteRef)
         yes || return
         rs = render_sub[]
         rs === nothing || close_remote_sub!(eb, rs)          # unmount the live render
-        send_ctrl(eb, Dict("op" => "evict", "sub" => r.session_id))   # free the holder value
+        send_ctrl(eb, Dict{String,Any}("op" => "evict", "sub" => r.session_id))   # free the holder value
         isopen(session) && Bonito.evaljs(session, Bonito.js"""(() => {
             const n = $(node);
             if (n) n.innerHTML = '<div class="bt-tool-empty">app closed &amp; freed</div>';

@@ -198,7 +198,7 @@ function run_update!(state::ServerState, project_id::AbstractString,
     get(d, "collected", false) === true && (r.collected = true)
     # What it prints before its card listens is held for the card.
     key = eval_sink_key(project_id, r.route)
-    lock(state.lock) do
+    @lock state.lock begin
         if r.status != "running"
             delete!(state.eval_stream_pending, key)
         elseif haskey(d, "status") && !haskey(state.eval_stream_sinks, key)
@@ -271,7 +271,7 @@ function adopt_run!(m::JuliaEvalToolMsg)
     chat === nothing && return nothing
     chat = shared(chat)
     state = chat.state
-    r = lock(chat.runs.lock) do
+    r = @lock chat.runs.lock let
         best = nothing
         for c in values(chat.runs.runs)
             c.card === nothing && run_matches(state, c, m) || continue
@@ -300,7 +300,7 @@ run_matches(state::ServerState, r::ChatRun, m::JuliaEvalToolMsg) =
 # yet (agents that name nothing). It may not exist yet — see `adopt_run!`.
 function bind_card!(chat::ChatModel, r::ChatRun)
     state = chat.state
-    card = lock(chat.lock) do
+    card = @lock chat.lock let
         store = chat.msgs_store
         i = findlast(m -> m isa JuliaEvalToolMsg && m.run === nothing &&
                           run_matches(state, r, m), store)
@@ -408,7 +408,7 @@ function note_finished_runs!(chat::ChatModel)
     return nothing
 end
 
-due_notes(book::RunBook) = lock(book.lock) do
+due_notes(book::RunBook) = @lock book.lock let
     sort!([r for r in values(book.runs) if r.status != "running" && !r.collected && !r.notified];
           by = r -> r.finished)
 end
@@ -427,7 +427,7 @@ function deliver_run_notes!(chat::ChatModel)
                 wait_idle(chat)
                 continue
             end
-            lock(book.lock) do
+            @lock book.lock begin
                 foreach(r -> r.notified = true, due)
             end
             note = UserMsg(chat, run_note_text(chat, due))
@@ -436,7 +436,7 @@ function deliver_run_notes!(chat::ChatModel)
             return nothing
         end
     finally
-        lock(book.lock) do; book.notifier = nothing; end
+        @lock book.lock begin; book.notifier = nothing; end
     end
     return nothing
 end
@@ -523,7 +523,7 @@ function continued_eval(m::JuliaContinueToolMsg)
         return r === nothing ? nothing : r.card
     end
     key = eval_route_key(chat.state, m)
-    return lock(chat.lock) do
+    return @lock chat.lock let
         store = chat.msgs_store
         me = findlast(x -> x === m, store)
         i = findprev(x -> x isa JuliaEvalToolMsg && eval_route_key(chat.state, x) == key, store,
@@ -537,7 +537,7 @@ function waited_evals(m::JuliaWaitToolMsg)
     chat = tool_chat(m)
     chat === nothing && return JuliaEvalToolMsg[]
     book = shared(chat).runs
-    runs = lock(book.lock) do
+    runs = @lock book.lock let
         isempty(m.runs) ?
             sort!([r for r in values(book.runs) if r.status == "running" || !r.collected]; by = r -> r.started) :
             [book.runs[id] for id in m.runs if haskey(book.runs, id)]
@@ -609,7 +609,7 @@ function awaited(e::JuliaEvalToolMsg)
     chat = tool_chat(e)
     chat === nothing && return false
     chat = shared(chat)
-    waiters = lock(chat.lock) do
+    waiters = @lock chat.lock begin
         [x for x in chat.msgs_store if (x isa JuliaContinueToolMsg || x isa JuliaWaitToolMsg) &&
                                       tool_status(x) in ("pending", "in_progress")]
     end

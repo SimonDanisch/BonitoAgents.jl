@@ -230,14 +230,14 @@ The turns open right now: our prompts the agent is still replying to, and the
 agent's own turn if one runs. Empty means the agent is not working. A prompt
 whose reply is over but whose answer the agent holds (`isreplied`) is not open.
 """
-open_turns(conn::Connection) = lock(conn.lock) do
+open_turns(conn::Connection) = @lock conn.lock let
     turns = Turn[p for p in conn.active_prompts if !isreplied(p)]
     conn.agent_turn === nothing || push!(turns, conn.agent_turn)
     turns
 end
 
 # Every turn the connection still has to end, replied prompts included.
-all_turns(conn::Connection) = lock(conn.lock) do
+all_turns(conn::Connection) = @lock conn.lock let
     turns = Turn[conn.active_prompts...]
     conn.agent_turn === nothing || push!(turns, conn.agent_turn)
     turns
@@ -299,7 +299,7 @@ function dispatcher_loop(conn::Connection)
         # racing teardown either registers before us (and gets failed below) or
         # sees `closed` and throws — it can never park on a channel nobody will
         # ever feed (A1/A2).
-        stranded = lock(conn.lock) do
+        stranded = @lock conn.lock let
             conn.closed = true
             for (_, ch) in conn.capture
                 close(ch)
@@ -339,7 +339,7 @@ end
 # outside the lock so a slow transport write can't serialize against the
 # dispatcher's response delivery.
 function register_pending!(conn::Connection, id::Int, ch::Channel)
-    lock(conn.lock) do
+    @lock conn.lock begin
         conn.closed && throw(ConnectionClosed("connection torn down"))
         conn.pending[id] = ch
     end
@@ -350,7 +350,7 @@ end
 # `capture` field doc. `session/load` only.
 function register_capture!(conn::Connection, id::Int,
                            response::Channel, updates::Channel)
-    lock(conn.lock) do
+    @lock conn.lock begin
         conn.closed && throw(ConnectionClosed("connection torn down"))
         conn.pending[id] = response
         push!(conn.capture, id => updates)
@@ -363,7 +363,7 @@ end
 # is the agent's steering/handoff mechanism, and the only way to free a turn the
 # SDK holds open for a background shell.
 function register_prompt!(conn::Connection, span::PromptTurn)
-    lock(conn.lock) do
+    @lock conn.lock begin
         conn.closed && throw(ConnectionClosed("connection torn down"))
         conn.pending[span.id] = span.response
         push!(conn.active_prompts, span)
@@ -417,27 +417,27 @@ function send_raw(conn::Connection, msg::AbstractDict)
     # locking and must not serialize against wire writes.
     notify_frame(conn, :out, msg)
     line = JSON.json(msg) * "\n"
-    lock(conn.lock) do
+    @lock conn.lock begin
         send(conn.transport, line)
     end
 end
 
 function send_request(conn::Connection, method::String, params)::Any
-    id = lock(conn.lock) do
+    id = @lock conn.lock let
         id = conn.next_id
         conn.next_id += 1
         id
     end
     ch = Channel{Any}(1)
     register_pending!(conn, id, ch)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
     result = take!(ch)
     result isa Exception && throw(result)
     return result
 end
 
 function send_notification(conn::Connection, method::String, params)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "method" => method, "params" => params))
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "method" => method, "params" => params))
 end
 
 # Like `send_request`, but gives up after `timeout` seconds (A3). Used by setup
@@ -447,12 +447,12 @@ end
 # raise `ConnectionClosed`; the caller closes the connection and the agent is
 # reaped.
 function send_request(conn::Connection, method::String, params, timeout::Real)::Any
-    id = lock(conn.lock) do
+    id = @lock conn.lock let
         i = conn.next_id; conn.next_id += 1; i
     end
     ch = Channel{Any}(1)
     register_pending!(conn, id, ch)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => id, "method" => method, "params" => params))
 
     # A one-shot timer closes `ch` if no response lands in time. The timer
     # callback is the ONLY thing that closes `ch` on the timeout path, so a
@@ -464,7 +464,7 @@ function send_request(conn::Connection, method::String, params, timeout::Real)::
     catch e
         # Channel closed with nothing delivered: timed out (or torn down).
         if e isa InvalidStateException
-            lock(conn.lock) do
+            @lock conn.lock begin
                 delete!(conn.pending, id)
             end
             throw(ConnectionClosed("request `$method` timed out after $(timeout)s"))
@@ -490,7 +490,7 @@ Learning the tool→owner association is what makes the second case possible; se
 function owner_of(conn::Connection, update::SessionUpdate)
     tagged = parent_tool_use_id(update)
     tid    = tool_call_id(update)
-    lock(conn.lock) do
+    @lock conn.lock let
         if tagged !== nothing
             # Remember, then forget on the tool's own terminal frame — AFTER this
             # call returns it, so the terminal frame still reaches its owner.
@@ -567,7 +567,7 @@ function reset_turn_state!(conn::Connection)
 end
 
 function next_request_id(conn::Connection)
-    lock(conn.lock) do
+    @lock conn.lock let
         i = conn.next_id; conn.next_id += 1; i
     end
 end
@@ -586,7 +586,7 @@ function request_updates(conn::Connection, method::String, params)
     response = Channel{Any}(1)
     updates  = Channel{SessionUpdate}(BUF)
     register_capture!(conn, id, response, updates)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id,
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => id,
                         "method" => method, "params" => params))
     return updates, response
 end
@@ -599,18 +599,18 @@ function prompt_request(conn::Connection, params)
     reset_turn_state!(conn)
     span = PromptTurn(next_request_id(conn))
     register_prompt!(conn, span)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => span.id,
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => span.id,
                         "method" => "session/prompt", "params" => params))
     return span
 end
 
 function send_response(conn::Connection, id, result)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id, "result" => result))
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => id, "result" => result))
 end
 
 function send_error_response(conn::Connection, id, code::Int, message::String)
-    send_raw(conn, Dict("jsonrpc" => "2.0", "id" => id,
-                        "error" => Dict("code" => code, "message" => message)))
+    send_raw(conn, Dict{String,Any}("jsonrpc" => "2.0", "id" => id,
+                        "error" => Dict{String,Any}("code" => code, "message" => message)))
 end
 
 # ── Receiving ─────────────────────────────────────────────────────────────────
@@ -674,7 +674,7 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
                 return nothing        # dispatch_message handles ONE frame; not a loop
             end
 
-            ch = lock(conn.lock) do
+            ch = @lock conn.lock begin
                 isempty(conn.capture) ? nothing : last(first(conn.capture))
             end
             if ch !== nothing
@@ -703,7 +703,7 @@ function dispatch_message(conn::Connection, msg::AbstractDict)
         # register concurrently, so an unlocked get/delete here could miss an
         # entry mid-insert and hang the caller forever.
         ended = nothing
-        ch = lock(conn.lock) do
+        ch = @lock conn.lock let
             i = findfirst(t -> first(t) == id, conn.capture)
             if i !== nothing
                 close(last(conn.capture[i]))
@@ -793,7 +793,7 @@ function cycle_ended!(conn::Connection, u::UsageUpdateNotif)
     if is_autonomous_origin(u.origin_kind)
         end_agent_turn!(conn)
     elseif conn.agent_turns && u.cost_amount !== nothing
-        replying = lock(conn.lock) do
+        replying = @lock conn.lock let
             i = findfirst(p -> !isreplied(p), conn.active_prompts)
             i === nothing ? nothing : conn.active_prompts[i]
         end
@@ -814,7 +814,7 @@ end
 reply_over!(::Connection, ::AgentTurn) = nothing
 
 function end_agent_turn!(conn::Connection)
-    turn = lock(conn.lock) do
+    turn = @lock conn.lock let
         t = conn.agent_turn
         conn.agent_turn = nothing
         t

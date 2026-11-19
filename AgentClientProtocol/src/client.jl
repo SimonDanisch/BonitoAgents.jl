@@ -139,7 +139,7 @@ end
 function on_request(h::FSRequestHandler, method::AbstractString, params)
     if method == "fs/read_text_file"
         path = get(params, "path", "")
-        return Dict("content" => read(path, String))
+        return Dict{String,Any}("content" => read(path, String))
 
     elseif method == "fs/write_text_file"
         path = get(params, "path", "")
@@ -153,15 +153,15 @@ function on_request(h::FSRequestHandler, method::AbstractString, params)
         options = get(params, "options", [])
         idx = findfirst(o -> get(o, "kind", "") in ("allow_once", "allow_always"), options)
         if idx !== nothing
-            return Dict("outcome" => Dict("outcome" => "selected",
+            return Dict{String,Any}("outcome" => Dict{String,Any}("outcome" => "selected",
                                           "optionId" => options[idx]["optionId"]))
         end
-        return Dict("outcome" => Dict("outcome" => "cancelled"))
+        return Dict{String,Any}("outcome" => Dict{String,Any}("outcome" => "cancelled"))
 
     elseif method == "terminal/create"
-        return Dict("terminalId" => string(rand(UInt32), base=16))
+        return Dict{String,Any}("terminalId" => string(rand(UInt32), base=16))
     elseif method == "terminal/output"
-        return Dict("output" => "", "exitStatus" => nothing)
+        return Dict{String,Any}("output" => "", "exitStatus" => nothing)
     elseif method in ("terminal/release", "terminal/kill", "terminal/wait_for_exit")
         return nothing
     end
@@ -196,7 +196,7 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
         "or point CLAUDE_AGENT_ACP at the binary / pass agent_bin=.")
 
     env = merge(Dict(k => v for (k,v) in ENV),
-                Dict("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
+                Dict{String,Any}("CLAUDE_PERMISSION_MODE" => "bypassPermissions",
                      "CLAUDE_MAX_TURNS"        => "100"),
                 agent_env)
 
@@ -216,19 +216,19 @@ function Client(cwd::String, handler::Handler = FSRequestHandler(cwd);
         send_request(conn, "initialize", Dict(
             "protocolVersion"    => 1,
             "clientCapabilities" => Dict(
-                "fs" => Dict("readTextFile" => true, "writeTextFile" => true)
+                "fs" => Dict{String,Any}("readTextFile" => true, "writeTextFile" => true)
             ),
-            "clientInfo" => Dict("name" => "AgentClientProtocol.jl", "version" => "0.1.0")
+            "clientInfo" => Dict{String,Any}("name" => "AgentClientProtocol.jl", "version" => "0.1.0")
         ), SETUP_TIMEOUT_SECONDS)
 
-        mcp_list = [Dict("name"    => s.name,
+        mcp_list = [Dict{String,Any}("name"    => s.name,
                          "command" => s.command,
                          "args"    => s.args,
-                         "env"     => [Dict("name" => k, "value" => v) for (k,v) in s.env])
+                         "env"     => [Dict{String,Any}("name" => k, "value" => v) for (k,v) in s.env])
                     for s in mcp_servers]
 
         result = send_request(conn, "session/new",
-                              Dict("cwd" => cwd, "mcpServers" => mcp_list),
+                              Dict{String,Any}("cwd" => cwd, "mcpServers" => mcp_list),
                               SETUP_TIMEOUT_SECONDS)
         session_id = result["sessionId"]
 
@@ -262,7 +262,7 @@ end
 function prompt!(client::Client, text::String;
                  images::Vector{ImageAttachment} = ImageAttachment[],
                  receipt_id::Union{String,Nothing} = nothing)
-    blocks = Any[Dict("type" => "text", "text" => text)]
+    blocks = Any[Dict{String,Any}("type" => "text", "text" => text)]
     for img in images
         push!(blocks, Dict(
             "type"     => "image",
@@ -270,8 +270,8 @@ function prompt!(client::Client, text::String;
             "mimeType" => img.mime,
         ))
     end
-    params = Dict("sessionId" => client.session_id, "prompt" => blocks)
-    receipt_id === nothing || (params["_meta"] = Dict("bonitoPromptId" => receipt_id))
+    params = Dict{String,Any}("sessionId" => client.session_id, "prompt" => blocks)
+    receipt_id === nothing || (params["_meta"] = Dict{String,Any}("bonitoPromptId" => receipt_id))
     return prompt_request(client.conn, params)
 end
 
@@ -282,12 +282,12 @@ function steer!(client::Client, text::String;
                 images::Vector{ImageAttachment} = ImageAttachment[])
     get(client.session_result, "bonitoActiveSteering", false) ||
         error("The agent does not advertise active-only steering.")
-    blocks = Any[Dict("type" => "text", "text" => text)]
-    append!(blocks, [Dict("type" => "image", "data" => Base64.base64encode(img.data),
+    blocks = Any[Dict{String,Any}("type" => "text", "text" => text)]
+    append!(blocks, [Dict{String,Any}("type" => "image", "data" => Base64.base64encode(img.data),
                          "mimeType" => img.mime) for img in images])
     params = Dict{String,Any}("sessionId" => client.session_id, "prompt" => blocks)
     if get(client.session_result, "bonitoSteeringIdleBehavior", "") == "promptRequired"
-        params["_meta"] = Dict("steering" => Dict("idleBehavior" => "promptRequired"))
+        params["_meta"] = Dict{String,Any}("steering" => Dict{String,Any}("idleBehavior" => "promptRequired"))
     else
         params["activeOnly"] = true
     end
@@ -398,7 +398,7 @@ function cancel!(client::Client)
     isempty(turns) && return turns
     (@atomic conn.cancel_at) > 0 || (@atomic conn.cancel_at = time())
     send_notification(conn, "session/cancel",
-                      Dict("sessionId" => client.session_id))
+                      Dict{String,Any}("sessionId" => client.session_id))
     return turns
 end
 
@@ -413,7 +413,7 @@ end
 function set_config_option!(client::Client, config_id::AbstractString,
                             value::AbstractString; timeout::Real = 30.0)
     return send_request(client.conn, "session/set_config_option",
-        Dict("sessionId" => client.session_id,
+        Dict{String,Any}("sessionId" => client.session_id,
              "configId"  => String(config_id),
              "value"     => String(value)), timeout)
 end

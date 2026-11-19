@@ -56,7 +56,7 @@ function resolve_session_notice!(model; warnings_only = false)
         info = s.session_notice[]
         (isempty(info) || get(info, "resolved", false)) && return nothing
         warnings_only && info["severity"] != "warning" && return nothing
-        save_session_notice!(s, merge(info, Dict("resolved" => true)))
+        save_session_notice!(s, merge(info, Dict{String,Any}("resolved" => true)))
     end
     return nothing
 end
@@ -72,7 +72,7 @@ function handle_command!(model::ChatModel, ::Any, command::DismissNoticeCommand)
         # A click from an older tab must not dismiss a different, newer failure.
         get(info, "id", nothing) == command.id || return nothing
         get(info, "dismissed", false) && return nothing
-        save_session_notice!(s, merge(info, Dict("dismissed" => true)))
+        save_session_notice!(s, merge(info, Dict{String,Any}("dismissed" => true)))
     end
     return nothing
 end

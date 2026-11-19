@@ -10,7 +10,7 @@ end
 
 function process_book(state, pid)
     state = root_state(state)
-    lock(state.lock) do
+    @lock state.lock begin
         get!(state.process_jobs,String(pid)) do
             path = joinpath(state.state_dir,"chats",pid,"process_jobs.json")
             raw = load_json_tolerant(path,"managed processes")
@@ -28,7 +28,7 @@ function process_book(state, pid)
 end
 
 function save_process_book!(book)
-    atomic_write_json(book.path,Dict("epoch"=>book.epoch,"retired"=>book.retired,"jobs"=>book.jobs))
+    atomic_write_json(book.path,Dict{String,Any}("epoch"=>book.epoch,"retired"=>book.retired,"jobs"=>book.jobs))
     book.last_saved = time()
     return nothing
 end
@@ -64,7 +64,7 @@ function attach_process_tasks!(chat::ChatModel)
     chat = shared(chat)
     isopen(chat.taskbar) || return nothing
     book = process_book(chat.state,chat.project_id)
-    lock(book.lock) do
+    @lock book.lock let
         for (key,d) in book.jobs
             task = get(book.tasks,key,nothing)
             if !(d["status"] in BonitoWorker.PROCESS_ACTIVE)
@@ -92,7 +92,7 @@ function detach_process_tasks!(chat)
     state = root_state(chat.state)
     book = lock(() -> get(state.process_jobs,chat.project_id,nothing),state.lock)
     book === nothing && return nothing
-    lock(book.lock) do
+    @lock book.lock begin
         filter!(kv -> kv.second.chat !== chat,book.tasks)
     end
     return nothing
@@ -112,7 +112,7 @@ function managed_process_update!(state,worker,d; requested::Bool = false)
         previous = get(book.jobs,key,nothing)
         previous !== nothing && (d["revision"],d["output_bytes"]) <
             (previous["revision"],previous["output_bytes"]) && return (false, false)
-        record = merge(Dict{String,Any}(d),Dict("worker"=>String(worker),"connected"=>true))
+        record = merge(Dict{String,Any}(d),Dict{String,Any}("worker"=>String(worker),"connected"=>true))
         record["output"] = last(String(get(record,"output","")),2048)
         record["notify_pending"] = get(previous === nothing ? Dict() : previous,"notify_pending",false) ||
             (previous !== nothing && previous["status"] in BonitoWorker.PROCESS_ACTIVE &&
@@ -159,7 +159,7 @@ end
 
 function note_line(n::JobEndingNote)
     book = process_book(n.state, n.project_id)
-    return lock(book.lock) do
+    return @lock book.lock let
         record = get(book.jobs, n.key, nothing)
         (record === nothing || !get(record, "notify_pending", false)) && return nothing
         record["notify_pending"] = false
@@ -172,7 +172,7 @@ end
 # The agent got back how jobs ended, in the result of a call of its own.
 function saw_ending!(book::ProcessBook, worker::AbstractString, result::AbstractDict)
     jobs = haskey(result, "jobs") ? result["jobs"] : (result,)
-    lock(book.lock) do
+    @lock book.lock let
         seen = false
         for j in jobs
             j["status"] in BonitoWorker.PROCESS_ACTIVE && continue
@@ -190,7 +190,7 @@ end
 # chat's own, unless only another worker has a job of that id. `nothing` when
 # several other workers do.
 function job_holder(p::ProjectInfo, book::ProcessBook, id::AbstractString)
-    holders = lock(book.lock) do
+    holders = @lock book.lock begin
         unique!([String(d["worker"]) for d in values(book.jobs) if d["id"] == id])
     end
     (isempty(holders) || p.worker_id in holders) && return p.worker_id
@@ -235,10 +235,10 @@ function process_request(state,pid,args)
         # Worker snapshots already stream on the control channel. A voluntary
         # wait observes them without blocking on a fresh RPC to a sleeping or
         # disconnected worker, so incoming input can release the wait promptly.
-        snapshot = lock(book.lock) do
+        snapshot = @lock book.lock let
             d = get(book.jobs,managed_task_id(w.worker_id,String(get(args,"id",""))),nothing)
             d === nothing && error("no managed process with that id in this chat")
-            merge(copy(d),Dict("connected"=>isopen(w)))
+            merge(copy(d),Dict{String,Any}("connected"=>isopen(w)))
         end
         saw_ending!(book,w.worker_id,snapshot)
         return public_process_result(w,snapshot)
@@ -246,7 +246,7 @@ function process_request(state,pid,args)
     request = Dict{String,Any}(String(k)=>v for (k,v) in args if k in
         ("action","id","argv","cwd","label","env","offset","max_bytes","epoch","destination","options","ssh"))
     if action in ("start","sudo","ssh")
-        lock(book.lock) do
+        @lock book.lock begin
             get(request,"epoch","") == book.epoch || error("agent session ended; use the current session to start work")
         end
         haskey(request,"cwd") || (request["cwd"] = default_job_folder(p,w))
@@ -254,7 +254,7 @@ function process_request(state,pid,args)
     result = worker_process_request(state,p,w,request)
     # A list names every worker's jobs: those of other workers as the book has them.
     if action == "list" && isempty(strip(String(get(args,"worker",""))))
-        others = lock(book.lock) do
+        others = @lock book.lock begin
             [copy(d) for d in values(book.jobs) if d["worker"] != p.worker_id]
         end
         for d in others
@@ -293,7 +293,7 @@ end
 
 function public_process_result(worker,result)
     if haskey(result,"jobs")
-        return Dict("jobs"=>[public_process_result(worker,d) for d in result["jobs"]])
+        return Dict{String,Any}("jobs"=>[public_process_result(worker,d) for d in result["jobs"]])
     end
     visible = Dict{String,Any}(String(k)=>v for (k,v) in result if !(k in
         ("epoch","revision","os_started","recorded_at","project_id")))
@@ -310,7 +310,7 @@ function close_process_epoch!(state,pid,worker,epoch)
     (w === nothing || !isopen(w) || !can(w,"managed_process")) && return nothing
     try
         worker_rpc(state,worker,"managed_process",
-            Dict("action"=>"close_chat","project_id"=>pid,"epoch"=>epoch);timeout=20.0)
+            Dict{String,Any}("action"=>"close_chat","project_id"=>pid,"epoch"=>epoch);timeout=20.0)
     catch e
         e isa InterruptException && rethrow()
         # The retired epoch is durable. A worker reconnect's snapshots retry
@@ -323,7 +323,7 @@ end
 function close_managed_processes!(state,pid)
     state = root_state(state)
     book = process_book(state,pid)
-    targets = lock(book.lock) do
+    targets = @lock book.lock let
         epochs = Set([book.epoch; [String(d["epoch"]) for d in values(book.jobs)
             if d["status"] in BonitoWorker.PROCESS_ACTIVE]])
         for epoch in epochs
@@ -361,7 +361,7 @@ function managed_process_control!(model,id)
     catch e
         e isa InterruptException && rethrow()
         book = process_book(model.state,model.project_id)
-        lock(book.lock) do
+        @lock book.lock let
             d = get(book.jobs,managed_task_id(worker,job),nothing)
             d === nothing || (d["control_error"] = sprint(showerror,e))
         end
@@ -373,7 +373,7 @@ end
 
 function taskbar_extra_controls(session,bar,t::ManagedProcessTask)
     controls = map(("terminate"=>"Terminate", "kill"=>"Force kill")) do (action,label)
-        payload = "managed-control:" * JSON.json(Dict("action"=>action,"worker"=>t.worker,"id"=>t.snapshot["id"]))
+        payload = "managed-control:" * JSON.json(Dict{String,Any}("action"=>action,"worker"=>t.worker,"id"=>t.snapshot["id"]))
         DOM.button(label;class="bw-menu-item" * (action=="kill" ? " bw-menu-danger" : ""),
             onclick=js"event => { event.preventDefault(); event.stopPropagation(); $(bar.stop_request).notify($payload); }")
     end
@@ -436,7 +436,7 @@ function process_prompt_cards(state,pid::AbstractString)
     state = root_state(state)
     book = lock(() -> get(state.process_jobs,pid,nothing),state.lock)
     book === nothing && return Dict{String,Any}[]
-    records = lock(book.lock) do
+    records = @lock book.lock begin
         [copy(d) for d in values(book.jobs)
          if get(d,"prompt",nothing) !== nothing && d["status"] in BonitoWorker.PROCESS_ACTIVE]
     end
@@ -581,7 +581,7 @@ function book_record(m::ProcessToolMsg)
              length(named) == 1 ? only(named).worker_id : nothing
     worker === nothing && return nothing
     key = managed_task_id(worker, m.job_id)
-    return lock(book.lock) do
+    return @lock book.lock let
         record = get(book.jobs, key, nothing)
         record === nothing ? nothing : copy(record)
     end
@@ -605,7 +605,7 @@ tool_body_snapshot(::ProcessToolMsg, content) = isempty(content)
 # Each update of a job redraws the open cards of the calls still running on it.
 function refresh_job_cards!(chat::ChatModel, job_id::AbstractString)
     s = shared(chat)
-    ids = lock(s.lock) do
+    ids = @lock s.lock begin
         [tool_id(m) for m in s.msgs_store if m isa ProcessToolMsg && m.job_id == job_id &&
              !(tool_status(m) in ("completed", "failed"))]
     end

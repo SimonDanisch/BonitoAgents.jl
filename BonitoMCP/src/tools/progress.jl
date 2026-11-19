@@ -10,7 +10,7 @@ function progress_handler(args::AbstractDict)
     id = String(get(args,"id",""))
     isempty(id) && return tool_error("A stable job id is required")
     try
-        job = lock(SERVER.progress_lock) do
+        job = @lock SERVER.progress_lock let
             job = get(SERVER.progress_jobs,id,nothing)
             job === nothing && action != "start" && throw(ArgumentError("No job handle for '$id'; use action=start to begin a job"))
             if action == "start"

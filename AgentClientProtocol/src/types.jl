@@ -130,7 +130,7 @@ struct SessionNoticeNotif <: SessionUpdate
     record::Dict{String,Any}
 end
 
-session_notice_capability() = Dict("jetbrains" => Dict("air" => Dict(
+session_notice_capability() = Dict{String,Any}("jetbrains" => Dict{String,Any}("air" => Dict(
     "version" => 1, "capabilities" => ["sessionFailure"])))
 
 # The version-1 AIR envelope (`_meta.jetbrains.air`) a frame carries, or nothing.

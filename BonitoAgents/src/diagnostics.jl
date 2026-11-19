@@ -23,7 +23,7 @@ record_timing!(state::ServerState, kind::Symbol, seconds::Real; kw...) =
 
 function record_timing!(t::Timings, kind::Symbol, seconds::Real; keep::Int = 500, detail...)
     entry = TimingEntry(time(), Float64(seconds), Dict{String,Any}(String(k) => v for (k, v) in detail))
-    lock(t.lock) do
+    @lock t.lock let
         list = get!(Vector{TimingEntry}, t.kinds, kind)
         push!(list, entry)
         length(list) > keep && deleteat!(list, 1:(length(list) - keep))
@@ -93,7 +93,7 @@ function register_tab!(state::ServerState, session::Bonito.Session, user::User,
     lock(() -> (tabs.open[rec.id] = rec), tabs.lock)
     on(root.on_close) do closed
         closed || return
-        lock(tabs.lock) do
+        @lock tabs.lock begin
             rec.closed == 0 || return
             delete!(tabs.open, rec.id)
             rec.last_view = rec.view === nothing ? "" : rec.view[]
@@ -115,7 +115,7 @@ an open websocket is not asked again whether its login still holds.
 """
 function close_user_sessions!(state::ServerState, name::AbstractString)
     tabs = root_state(state).tabs
-    sessions = lock(tabs.lock) do
+    sessions = @lock tabs.lock begin
         Bonito.Session[r.session for r in values(tabs.open) if r.user == name && r.session !== nothing]
     end
     foreach(close, sessions)
@@ -125,7 +125,7 @@ end
 # The tab a dev tool names, by a prefix of its id (the log's 8-character `tab`).
 function find_tab(state::ServerState, prefix::AbstractString)
     tabs = root_state(state).tabs
-    found = lock(tabs.lock) do
+    found = @lock tabs.lock begin
         [r for r in Iterators.flatten((values(tabs.open), Iterators.reverse(tabs.closed)))
          if startswith(r.id, prefix)]
     end
@@ -136,7 +136,7 @@ function find_tab(state::ServerState, prefix::AbstractString)
 end
 
 subsession_count(s::Bonito.Session) =
-    lock(Bonito.deletion_lock(s)) do
+    @lock Bonito.deletion_lock(s) let
         sum((1 + subsession_count(c) for c in values(s.children)); init = 0)
     end
 
@@ -278,7 +278,7 @@ function console_beacon_response(state::ServerState, request::HTTP.Request;
         push!(fresh, ConsoleEntry(t isa Real ? Float64(t) : 0.0,
                                   level in CONSOLE_LEVELS ? level : "log", string(get(e, "text", ""))))
     end
-    lock(tabs.lock) do
+    @lock tabs.lock begin
         append!(rec.console, fresh)
         length(rec.console) > keep && deleteat!(rec.console, 1:(length(rec.console) - keep))
         rec.visibility = string(get(msg, "state", ""))

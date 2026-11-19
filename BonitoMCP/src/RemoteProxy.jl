@@ -57,7 +57,7 @@ function send_frame(d::BridgeDriver, tag::UInt8, payload::AbstractVector{UInt8})
     buf = Vector{UInt8}(undef, length(payload) + 1)
     @inbounds buf[1] = tag
     copyto!(buf, 2, payload, firstindex(payload), length(payload))
-    lock(d.wlock) do
+    @lock d.wlock let
         ws = d.ws[]
         if ws === nothing
             # Not dialed yet. A result rendered at eval-time (its `proxy_asset_add`
@@ -169,14 +169,14 @@ function open_page_root!(b::RemoteBridge; compression::Bool = false)
                         asset_server = similar(b.parent.asset_server),
                         compression_enabled = compression)
     isready(pr.connection_ready) || put!(pr.connection_ready, true)
-    lock(b.plock) do
+    @lock b.plock begin
         b.page_roots[prefix] = pr
     end
     return prefix
 end
 
 function close_page_root!(b::RemoteBridge, prefix::AbstractString)
-    pr = lock(b.plock) do
+    pr = @lock b.plock begin
         pop!(b.page_roots, String(prefix), nothing)
     end
     pr === nothing || close(pr)
@@ -188,7 +188,7 @@ end
 function page_root_for(b::RemoteBridge, prefix::AbstractString)
     p = String(prefix)
     p == b.parent.id && return b.parent
-    lock(b.plock) do
+    @lock b.plock begin
         get(b.page_roots, p, nothing)
     end
 end
@@ -333,7 +333,7 @@ function serve_bridge(ws)
     # under wlock: a concurrent `send_frame` either ran before (its frame is in
     # `pending`, so the flush below sends it) or after (it sees `ws` set and sends
     # directly) — never lost, never out of order.
-    lock(d.wlock) do
+    @lock d.wlock let
         d.ws[] = ws
         if !isempty(d.pending)
             n = length(d.pending)
@@ -378,7 +378,7 @@ function serve_bridge(ws)
         e isa WebSockets.WebSocketError || e isa EOFError || e isa Base.IOError ||
             @warn "RemoteProxy.serve_bridge loop ended" exception = (e, catch_backtrace())
     finally
-        lock(d.wlock) do
+        @lock d.wlock begin
             d.ws[] = nothing
         end
     end
@@ -424,7 +424,7 @@ The parked value of the Julia file `path`, and the prefix of the bridge it is
 parked on.
 """
 function share_value(path::AbstractString)
-    lock(SHARED_LOCK) do
+    @lock SHARED_LOCK let
         parent = get_parent_session()
         stamp = mtime(path)
         cached = get(SHARED, path, nothing)

@@ -43,7 +43,7 @@ ShareLink(d::AbstractDict) = ShareLink(String(d["id"]), String(d["owner"]), Stri
     String(get(d, "password_salt", "")), String(get(d, "password_hash", "")), DateTime(d["created"]),
     String(get(d, "project_id", "")), String(get(d, "result_ref", "")))
 
-Base.Dict(l::ShareLink) = Dict("id" => l.id, "owner" => l.owner, "worker_id" => l.worker_id,
+Base.Dict(l::ShareLink) = Dict{String,Any}("id" => l.id, "owner" => l.owner, "worker_id" => l.worker_id,
     "path" => l.path, "env_path" => l.env_path, "title" => l.title,
     "password_salt" => l.password_salt, "password_hash" => l.password_hash,
     "created" => string(l.created), "project_id" => l.project_id, "result_ref" => l.result_ref)
@@ -58,7 +58,7 @@ share_url(state::ServerState, l::ShareLink) = root_state(state).base_url[] * "/s
 
 function load_shares!(s::ServerState)
     reg = s.shares
-    lock(reg.lock) do
+    @lock reg.lock begin
         load_records!(reg.links[], shares_file(s), "shares.json", ShareLink)
         empty!(reg.tokens)
         for id in keys(reg.links[])
@@ -68,11 +68,11 @@ function load_shares!(s::ServerState)
     return nothing
 end
 
-save_shares!(s::ServerState) = lock(s.shares.lock) do
+save_shares!(s::ServerState) = @lock s.shares.lock let
     atomic_write_json(shares_file(s), [Dict(l) for l in values(s.shares.links[])]; mode = 0o600)
 end
 
-share_by_token(state::ServerState, token::AbstractString) = lock(state.shares.lock) do
+share_by_token(state::ServerState, token::AbstractString) = @lock state.shares.lock let
     id = get(state.shares.tokens, String(token), nothing)
     id === nothing ? nothing : get(state.shares.links[], id, nothing)
 end
@@ -157,7 +157,7 @@ function create_share!(state::ServerState, owner::AbstractString, worker_id::Abs
                   salt, hash, now(UTC), String(project_id), "")
     check_share(kind, state, l, info)
     reg = state.shares
-    lock(reg.lock) do
+    @lock reg.lock begin
         reg.links[][l.id] = l
         reg.tokens[share_token(state, l.id)] = l.id
         save_shares!(state)
@@ -206,7 +206,7 @@ end
 
 function set_share_password!(state::ServerState, id::AbstractString, password::AbstractString)
     reg = state.shares
-    lock(reg.lock) do
+    @lock reg.lock let
         l = get(reg.links[], id, nothing)
         l === nothing && error("that link is gone")
         salt, hash = password_fields(password)
@@ -245,7 +245,7 @@ function is_share_target(reg::ShareRegistry, target::AbstractString)
 end
 
 function share_asset(reg::ShareRegistry, path::AbstractString)
-    sessions, hosts, checks = lock(reg.lock) do
+    sessions, hosts, checks = @lock reg.lock begin
         (collect(values(reg.pages)), [b.assets for b in values(reg.bridges)],
          collect(values(reg.asset_checks)))
     end
@@ -583,7 +583,7 @@ function open_share_page!(state::ServerState, root::Bonito.Session)
     reg = state.shares
     lock(() -> (reg.pages[root.id] = root), reg.lock)
     on(root.on_close) do _
-        lock(reg.lock) do
+        @lock reg.lock begin
             delete!(reg.pages, root.id)
             delete!(reg.asset_checks, root.id)
         end
@@ -689,7 +689,7 @@ function accept_share_host_channel(state::ServerState, worker_id::String, ch::Wo
 end
 
 share_bridge_keys(state::ServerState, worker_id::AbstractString) =
-    lock(state.shares.lock) do
+    @lock state.shares.lock begin
         [share_bridge_key(p) for (p, b) in state.shares.bridges if b.worker_id == worker_id]
     end
 
@@ -747,7 +747,7 @@ function share_result!(state::ServerState, project_id::AbstractString, payload::
     l = ShareLink(bytes2hex(rand(Random.RandomDevice(), UInt8, 16)), acting_owner(state),
                   wid, "", "", "Julia result", "", "", now(UTC), String(project_id), desc.ref)
     reg = state.shares
-    lock(reg.lock) do
+    @lock reg.lock begin
         reg.links[][l.id] = l
         reg.tokens[share_token(state, l.id)] = l.id
         save_shares!(state)

@@ -123,7 +123,7 @@ end
 
 # Start over: the server no longer has our state. Caller must not hold the lock.
 function reset!(link::Link, reason::AbstractString)
-    lock(link.lock) do
+    @lock link.lock begin
         for ch in values(link.channels)
             ch.aborted = String(reason)
             empty!(ch.outq)

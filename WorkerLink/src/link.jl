@@ -122,7 +122,7 @@ function Link(role::Symbol;
                 nothing, 0, 0.0, 0.0, 0.0, NaN, 0.0, time(), Base.Event(true), 0.0, window,
                 window, Float64(grace), Float64(ping_interval), Float64(ping_deadline),
                 on_open, on_state, "", false, String(name))
-    lock(lk) do
+    @lock lk begin
         link.channels[0] = new_channel(link, UInt32(0), 0, UInt8[])
     end
     errormonitor(Threads.@spawn writer_loop(link))
@@ -142,7 +142,7 @@ new_channel(link::Link, id::UInt32, priority::Int, header::Vector{UInt8}) =
                 Tuple{Vector{UInt8},Bool,Int}[], UInt8[], 0, link.window, 0, false, nothing)
 
 "The control channel (id 0): present on both sides from the start, never closed."
-control_channel(link::Link) = lock(link.lock) do
+control_channel(link::Link) = @lock link.lock begin
     link.state === :dead && throw(LinkDead(link.dead_reason))
     link.channels[0]
 end
@@ -160,7 +160,7 @@ Change how often `link` pings, and how long it waits for traffic before it
 drops the connection. Takes effect at the next tick.
 """
 function set_liveness!(link::Link; ping_interval::Real, ping_deadline::Real)
-    lock(link.lock) do
+    @lock link.lock begin
         link.ping_interval = Float64(ping_interval)
         link.ping_deadline = Float64(ping_deadline)
     end
@@ -177,7 +177,7 @@ description of what it is for — this package does not interpret it). Lower
 """
 function open_channel(link::Link, header::Vector{UInt8}; priority::Int = 1)
     0 <= priority < NPRIORITIES || throw(ArgumentError("priority must be in 0:$(NPRIORITIES - 1)"))
-    return lock(link.lock) do
+    return @lock link.lock let
         link.state === :dead && throw(LinkDead(link.dead_reason))
         id = link.next_channel
         link.next_channel += UInt32(2)
@@ -462,7 +462,7 @@ function Base.flush(link::Link; timeout::Real = 5.0)
     deadline = time() + timeout
     timer = Timer(_ -> lock(() -> notify(link.wake), link.lock), timeout)
     try
-        return lock(link.lock) do
+        return @lock link.lock begin
             while true
                 link.state === :dead && return false
                 delivered(link) && return true
@@ -492,7 +492,7 @@ Put `link` on a new connection whose handshake is done. The peer said it has
 every frame up to `peer_last_received`; everything after that is sent again.
 """
 function attach!(link::Link, t::Transport, peer_last_received::UInt64)
-    old = lock(link.lock) do
+    old = @lock link.lock let
         link.state === :dead && throw(LinkDead(link.dead_reason))
         prev = link.transport
         trim_log!(link, peer_last_received)

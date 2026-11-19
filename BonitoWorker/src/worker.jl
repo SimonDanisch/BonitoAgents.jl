@@ -117,7 +117,7 @@ new_link(w::Worker) = WorkerLink.Link(:client; name = "the server",
 # gets its relay before it connects, and a reset (`:reset` comes before the new
 # connection delivers anything) swaps it, so neither ever races a channel.
 function swap_relay!(w::Worker, relay::MCPRelay)
-    old = lock(w.lock) do
+    old = @lock w.lock let
         prev = w.relay
         w.relay = relay
         prev
@@ -137,6 +137,49 @@ function link_state!(w::Worker, link::WorkerLink.Link, st::Symbol)
 end
 
 updating(w::Worker) = lock(() -> w.update.pending, w.lock)
+
+"""
+    persist_identity!(c::WorkerConfig) -> Bool
+
+Put back what the next `start` reads, if it went missing while this worker runs:
+the `worker_id` file and, for an installed worker (`update_config`), `config.json`
+with everything it was started with, credential included. Called before anything
+that outlives this process is spawned and before the config is rewritten.
+
+On 11-16 the whole Scratch space was wiped under a running worker. It ran on
+from memory for two days; the spawn path then minted a NEW id for its agents, and
+the reboot found neither config nor identity: the service crash-looped, and the
+reinstall registered the machine as a stranger. Returns whether anything was
+written. An id on disk that is not ours is left alone (a copied config, another
+install) and reported.
+"""
+function persist_identity!(c::WorkerConfig)
+    isempty(c.worker_id) && return false
+    path = worker_id_path()
+    mkpath(dirname(path))
+    return FileWatching.Pidfile.mkpidlock(path * ".lock"; stale_age = 60, mode = 0o600) do
+        written = false
+        on_disk = isfile(path) ? String(strip(read(path, String))) : ""
+        if isempty(on_disk)
+            write_private_file(path, c.worker_id)
+            @warn "BonitoWorker: the worker identity file was missing; wrote this run's back" path worker_id = c.worker_id
+            written = true
+        elseif on_disk != c.worker_id
+            @error "BonitoWorker: the identity on disk is not this worker's; left as is (a restart would come up as that other worker)" path on_disk running_as = c.worker_id
+            return false
+        end
+        c.update_config === nothing && return written
+        cfg = config_path()
+        if !isfile(cfg)
+            config = Dict{String,Any}(c.update_config)
+            config["worker_id"] = c.worker_id
+            write_private_file(cfg, JSON.json(config))
+            @warn "BonitoWorker: the install config was missing; wrote this run's back" path = cfg
+            written = true
+        end
+        return written
+    end
+end
 
 # What runs for the server: agents and eval hosts. A patient update waits for none.
 worker_load(w::Worker) = lock(() -> length(w.sessions) + length(w.eval_hosts), w.lock) +
@@ -172,7 +215,7 @@ function serve(w::Worker; retry_delay::Real = 5.0, repeat_log_interval::Real = 6
             w.closed && break
             failure = sprint(showerror, e)
             if failure != last_failure || time() - logged_at > repeat_log_interval
-                log_connect_failure(e)
+                log_connect_failure(w, e)
                 @info "BonitoWorker: reconnecting every $(retry_delay)s"
                 last_failure, logged_at = failure, time()
             end
@@ -183,15 +226,24 @@ function serve(w::Worker; retry_delay::Real = 5.0, repeat_log_interval::Real = 6
     return nothing
 end
 
-log_connect_failure(e::WorkerLink.LinkRefused) =
-    @error "BonitoWorker: the server refused this worker" reason = e.reason
+function log_connect_failure(w::Worker, e::WorkerLink.LinkRefused)
+    message = "BonitoWorker: the server refused this worker"
+    hint = refusal_hint(w.config)
+    @error (isempty(hint) ? message : message * ". " * hint) reason = e.reason
+end
+# A worker without a credential is refused by every server but one on its own
+# machine; the refusal names the cure, since the log is where it is looked for.
+refusal_hint(c::WorkerConfig) = isempty(c.credential) ?
+    "This worker dials without a credential, and $(c.server_url) admits none such. Run the " *
+    "install command from \"Add worker\" on $(c.server_url), with the credential it shows: " *
+    install_command(c.server_url) : ""
 # The proxy turned the handshake away. Its status is all there is to say, so no
 # backtrace.
-log_connect_failure(e::WebSockets.WebSocketError) =
+log_connect_failure(::Worker, e::WebSockets.WebSocketError) =
     @error "BonitoWorker: the server did not take the connection ($(sprint(showerror, e))). " *
            "401 or 403 means this worker's credential is wrong or was revoked: reinstall it " *
            "with the command from \"Add worker\" on the dashboard."
-log_connect_failure(e) = @error "BonitoWorker: connection failed" exception = (e, catch_backtrace())
+log_connect_failure(::Worker, e) = @error "BonitoWorker: connection failed" exception = (e, catch_backtrace())
 
 # One connection: dial, handshake, and hold it until it ends.
 function connect_once!(w::Worker)
@@ -267,7 +319,7 @@ Keep the managed agent adapters at `spec` (harnesses.jl): one task per worker,
 which picks up the newest spec whenever it gets to it.
 """
 function schedule_harness_sync!(w::Worker, spec::HarnessSpec)
-    lock(w.lock) do
+    @lock w.lock let
         w.harness.spec = spec
         w.harness.pending = true
         t = w.harness.task
@@ -310,7 +362,7 @@ end
 # An install starts only while nothing runs and no agent session is starting;
 # checked and claimed under the lock, so a session cannot slip in between.
 function begin_harness_sync!(w::Worker)
-    return lock(w.lock) do
+    return @lock w.lock begin
         (worker_idle(w) && w.harness.sessions == 0) || return false
         w.harness.syncing = true
         return true
@@ -342,7 +394,7 @@ function report_harnesses(w::Worker, installed::AbstractDict, err::AbstractStrin
     ctrl = lock(() -> w.control, w.lock)
     ctrl === nothing && return nothing
     try
-        send_control(ctrl, Dict("type" => "harness_status", "installed" => installed, "error" => err))
+        send_control(ctrl, Dict{String,Any}("type" => "harness_status", "installed" => installed, "error" => err))
     catch e
         (e isa WebSockets.WebSocketError || e isa WorkerLink.LinkDead) || rethrow()
     end
@@ -356,7 +408,7 @@ Kill every agent and eval host `w` runs for the server, and abort the agents'
 channels with `reason`.
 """
 function reap!(w::Worker, reason::AbstractString)
-    sessions, hosts = lock(w.lock) do
+    sessions, hosts = @lock w.lock let
         s = collect(w.sessions)
         h = collect(values(w.eval_hosts))
         empty!(w.sessions)
@@ -421,7 +473,7 @@ function dispatch_command(w::Worker, ws, cmd::AbstractDict)
     elseif t == "kill_file_writers"
         @async handle_kill_file_writers(ws, cmd)
     elseif t == "scan_sessions"
-        @async handle_scan_sessions(ws, cmd)
+        @async handle_scan_sessions(w, ws, cmd)
     elseif t == "clone_repo"
         @async handle_clone_repo(ws, cmd)
     elseif t == "git_diff"
@@ -492,7 +544,7 @@ function serve_channel(w::Worker, ch::WorkerLink.LinkChannel)
     return nothing
 end
 
-channel_ready(ch::WorkerLink.LinkChannel) = WebSockets.send(ch, MsgPack.pack(Dict("ok" => true)))
+channel_ready(ch::WorkerLink.LinkChannel) = WebSockets.send(ch, MsgPack.pack(Dict{String,Any}("ok" => true)))
 
 function refuse_channel(ch::WorkerLink.LinkChannel, reason::AbstractString)
     @error "BonitoWorker: refused the server's request" reason
@@ -540,7 +592,8 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
             end
         end
 
-        env = provider_env(provider, c.agent_env)
+        persist_identity!(c)
+        env = provider_env(provider, c.worker_id, c.agent_env)
         isempty(agent.path) || (env["PATH"] = agent.path * (Sys.iswindows() ? ';' : ':') * get(env, "PATH", ""))
         # `provider.args` carries any required subcommand (`["acp"]` for
         # mimo/opencode/kimi, whose ACP server lives under that subcommand).

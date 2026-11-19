@@ -24,6 +24,22 @@ pieces fit together.
 
 ### Fixed
 
+- In a chat's Julia session, logging a value that can't be shown (`@info "x" v`
+  with a `show` that throws) no longer aborts the eval. The logger reports it, as
+  the REPL does.
+- Less code to compile, at precompile time and on first use: `lock(...) do`
+  blocks are `@lock` blocks (no closure and no `lock` copy per call site), and
+  string-keyed messages are built as `Dict{String,Any}` (an untyped literal with
+  mixed values compiled five times as much).
+- The precompile statements are captured fresh: `capture.sh` runs the e2e items
+  without the shipped statements, and `generate.jl` no longer merges the old file
+  in, so statements for code that no longer runs drop out. 295 of the 3619
+  statements no longer applied; there are 3131 now, 7 of them stale.
+- A server update needs less memory and time. The installer no longer
+  precompiles everything into the installing user's depot, which the server
+  never reads, so BonitoAgents compiles once instead of twice. That compile
+  peaks at about 3.2 GB instead of 4.7 GB (one thread for the native code, an
+  earlier GC), for about a minute more. A small server ran out of memory there.
 - An eval shows its result with the methods it loaded or defined itself.
   `using WGLMakie; scatter(1:10)` in one call failed with "method too new to be
   called from this world context" instead of showing the plot, and a type defined

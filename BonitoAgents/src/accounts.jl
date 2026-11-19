@@ -40,13 +40,13 @@ load_accounts!(s::ServerState) =
 load_invites!(s::ServerState) =
     load_records!(s.invites[], invites_file(s), "invites.json", Invite)
 
-save_worker_credentials!(s::ServerState) = lock(s.lock) do
+save_worker_credentials!(s::ServerState) = @lock s.lock let
     atomic_write_json(credentials_file(s), [Dict(c) for c in values(s.worker_credentials[])]; mode = 0o600)
 end
-save_accounts!(s::ServerState) = lock(s.lock) do
+save_accounts!(s::ServerState) = @lock s.lock let
     atomic_write_json(accounts_file(s), [Dict(a) for a in values(s.accounts[])]; mode = 0o600)
 end
-save_invites!(s::ServerState) = lock(s.lock) do
+save_invites!(s::ServerState) = @lock s.lock let
     atomic_write_json(invites_file(s), [Dict(i) for i in values(s.invites[])]; mode = 0o600)
 end
 
@@ -128,7 +128,7 @@ function apply_proxy!(auth::LoginAuth, root::ServerState)
     writer = root.proxy_writer
     # Rendered and written as one step, one writer at a time: two changes at
     # once must not leave the earlier state on disk.
-    lock(writer.lock) do
+    @lock writer.lock let
         write_front!(auth, root)
         users = lock(() -> render_users_yaml(values(root.accounts[])), root.lock)
         # Authelia rereads its users database when the file changes, but a
@@ -184,7 +184,7 @@ function add_worker_credential!(state::ServerState, owner::AbstractString)
     password = bytes2hex(rand(Random.RandomDevice(), UInt8, 24))
     cred = WorkerCredential(name, caddy_password_hash(root.auth, password), String(owner), now(UTC),
                             credential_digest(password))
-    lock(root.lock) do
+    @lock root.lock begin
         root.worker_credentials[][name] = cred
         save_worker_credentials!(root)
     end
@@ -202,7 +202,7 @@ connected with it is disconnected (its reconnect meets the refusal).
 """
 function revoke_worker_credential!(state::ServerState, name::AbstractString)
     root = root_state(state)
-    removed = lock(root.lock) do
+    removed = @lock root.lock let
         c = pop!(root.worker_credentials[], String(name), nothing)
         c === nothing || save_worker_credentials!(root)
         c
@@ -225,7 +225,7 @@ end
 function update_accounts!(f::Function, state::ServerState)
     root = root_state(state)
     proxy_config(root.auth)
-    lock(root.lock) do
+    @lock root.lock begin
         f(root.accounts[])
         save_accounts!(root)
     end
@@ -244,7 +244,7 @@ end
 function check_admin_remains(state::ServerState, name::AbstractString)
     state.user !== nothing && state.user.name == name &&
         error("you cannot do that to your own account")
-    others = lock(state.lock) do
+    others = @lock state.lock begin
         count(a -> a.name != name && is_admin(a) && !a.disabled, values(root_state(state).accounts[]))
     end
     others == 0 && error("'$(name)' is the last admin who can log in")
@@ -415,7 +415,7 @@ function create_invite!(state::ServerState, groups::Vector{String}; valid_for::P
     token = bytes2hex(rand(Random.RandomDevice(), UInt8, 32))
     t = now(UTC)
     invite = Invite(invite_id(token), groups, acting_owner(state), t, t + valid_for)
-    lock(root.lock) do
+    @lock root.lock begin
         filter!(((_, i),) -> i.expires > t, root.invites[])   # expired ones go with it
         root.invites[][invite.id] = invite
         save_invites!(root)
@@ -427,7 +427,7 @@ end
 
 function revoke_invite!(state::ServerState, id::AbstractString)
     root = root_state(state)
-    removed = lock(root.lock) do
+    removed = @lock root.lock let
         i = pop!(root.invites[], String(id), nothing)
         i === nothing || save_invites!(root)
         i
@@ -503,7 +503,7 @@ function import_setup_link!(state::ServerState)
     d = JSON.parsefile(f)
     invite = Invite(String(d["token_sha256"]), String[], "installer", now(UTC),
                     DateTime(String(d["expires"])), String(d["account"]))
-    lock(state.lock) do
+    @lock state.lock begin
         state.invites[][invite.id] = invite
         save_invites!(state)
     end
@@ -642,7 +642,7 @@ worker shares its machine: their agents run there as the worker's user.
 """
 function share_worker!(state::ServerState, worker_id::AbstractString, groups::Vector{String})
     root = root_state(state)
-    lock(root.lock) do
+    @lock root.lock let
         w = get(root.workers[], String(worker_id), nothing)
         w === nothing && error("there is no worker '$(worker_id)'")
         w.shared_with = groups
@@ -671,7 +671,7 @@ function set_harness_spec!(state::ServerState, spec::Dict{String,Any})
     for (wid, link) in links
         WorkerLink.state(link) === :connected || continue
         try
-            send_command(root, wid, Dict("type" => "harness_spec", "spec" => spec))
+            send_command(root, wid, Dict{String,Any}("type" => "harness_spec", "spec" => spec))
         catch e
             # The worker dropped between the check and the send; its next hello
             # acknowledgement carries the spec.

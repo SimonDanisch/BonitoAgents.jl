@@ -294,11 +294,11 @@ function export_chat_markdown(model::ChatModel)::String
     # finalize! clears live_todo before appending history, and removes the bar
     # item only afterwards. Reading in this order covers that transfer gap.
     bar = chat_taskbar(model)
-    plans = lock(bar.lock) do
+    plans = @lock bar.lock begin
         [TodoListMsg(m.id, copy(m.entries), m.started_at, m.finished_at, nothing)
          for m in bar.items[] if m isa TodoListMsg]
     end
-    messages = lock(s.lock) do
+    messages = @lock s.lock let
         current = s.live_todo[]
         if current isa TodoListMsg && !any(m -> m.id == current.id, plans)
             push!(plans, TodoListMsg(current.id, copy(current.entries), current.started_at, current.finished_at, nothing))

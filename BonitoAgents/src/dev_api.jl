@@ -102,7 +102,7 @@ function push_log_record!(ring::LogRing, level, message, _module, file, line, kw
                     string(_module), string(something(file, "")),
                     line isa Integer ? Int(line) : 0,
                     Dict{String,String}(string(k) => log_value_string(v) for (k, v) in kwargs))
-    lock(ring.lock) do
+    @lock ring.lock begin
         push!(ring.records, rec)
         while length(ring.records) > ring.capacity
             popfirst!(ring.records)
@@ -153,7 +153,7 @@ safe to call from every `serve()`: the second call is a no-op, so N servers in
 one process wrap the logger once between them.
 """
 function install_log_ring!()
-    lock(LOG_RING.lock) do
+    @lock LOG_RING.lock begin
         LOG_RING.installed && return nothing
         LOG_RING.installed = true
         CoreLogging.global_logger(RingLogger(LOG_RING, CoreLogging.global_logger()))
@@ -240,7 +240,7 @@ server_uptime() = SERVER_STARTED[] == 0.0 ? 0.0 : round(time() - SERVER_STARTED[
 
 function dev_section(state::ServerState, ::Val{:overview}, ::String)
     workers, projects = state.workers[], state.projects[]
-    chat_ids, bound = lock(state.lock) do
+    chat_ids, bound = @lock state.lock begin
         (collect(keys(state.chat_models)), copy(state.bound_lru))
     end
     tabs = root_state(state).tabs
@@ -310,7 +310,7 @@ end
 
 function project_report(p::ProjectInfo)
     idx = p.file_index
-    nfiles, loaded = lock(idx.lock) do
+    nfiles, loaded = @lock idx.lock begin
         (length(idx.files), idx.loaded_at)
     end
     return Dict{String,Any}(
@@ -416,10 +416,10 @@ function dev_section(state::ServerState, ::Val{:chats}, project_id::String)
 end
 
 function eval_bridge_report(project_id::AbstractString, eb)
-    parked_queues, parked_bytes = lock(eb.parked_lock) do
+    parked_queues, parked_bytes = @lock eb.parked_lock begin
         (Dict{String,Int}(k => length(v) for (k, v) in eb.parked), eb.parked_bytes)
     end
-    pages, tabs = lock(eb.pc_lock) do
+    pages, tabs = @lock eb.pc_lock begin
         (collect(keys(eb.page_conns)), length(eb.tab_prefix))
     end
     return Dict{String,Any}(
@@ -481,7 +481,7 @@ end
 
 # ── logs ────────────────────────────────────────────────────────────────────
 
-const LOG_LEVEL_ORDER = Dict("debug" => 0, "info" => 1, "warn" => 2, "error" => 3)
+const LOG_LEVEL_ORDER = Dict{String,Int}("debug" => 0, "info" => 1, "warn" => 2, "error" => 3)
 
 # Julia prints levels as "Debug"/"Info"/"Warn"/"Error"; anything else (a custom
 # LogLevel) sorts as Info so it isn't silently filtered out.
@@ -585,7 +585,7 @@ function dev_op(state::ServerState, ::Val{:logs}, args::AbstractDict)
     limit = clamp(limit, 1, LOG_RING.capacity)
     minrank = log_level_rank(String(get(args, "level", "info")))
     needle = lowercase(String(get(args, "contains", "")))
-    recs, dropped, total = lock(LOG_RING.lock) do
+    recs, dropped, total = @lock LOG_RING.lock begin
         (copy(LOG_RING.records), LOG_RING.dropped, length(LOG_RING.records))
     end
     matches(r) = log_level_rank(r.level) >= minrank &&
@@ -795,7 +795,7 @@ function dev_control(state::ServerState, ::Val{:open_chat}, args::AbstractDict)
     # exists (including old servers whose close operation only hid the row).
     if p.dismissed
         p.dismissed = false
-        lock(state.lock) do; save_projects!(state); end
+        @lock state.lock begin; save_projects!(state); end
         notify_projects!(state)
     end
     ensure_project_session!(state, p)
@@ -833,7 +833,7 @@ end
 function dev_control(state::ServerState, ::Val{:close_chat}, args::AbstractDict)
     p = dev_project(state, String(get(args, "project_id", "")))
     p.dismissed = true
-    lock(state.lock) do; save_projects!(state); end
+    @lock state.lock begin; save_projects!(state); end
     notify_projects!(state)
     # Match the sidebar's × button: closing a chat means tearing its live
     # session down as well as hiding its row. Merely setting `dismissed` leaves
@@ -967,7 +967,7 @@ function set_dev_mode!(state::ServerState, project_id::AbstractString, on::Bool)
     p = dev_project(state, project_id)
     if p.dev_mode != on
         p.dev_mode = on
-        lock(state.lock) do; save_projects!(state); end
+        @lock state.lock begin; save_projects!(state); end
         notify_projects!(state)
     end
     return p
@@ -1025,7 +1025,7 @@ function ensure_debug_project!(state::ServerState; worker_id::AbstractString = "
         existing.dev_mode = true
         existing.dismissed = false
         if changed
-            lock(state.lock) do; save_projects!(state); end
+            @lock state.lock begin; save_projects!(state); end
             notify_projects!(state)
         end
         # An untitled chat takes the debug title; the write persists by itself.

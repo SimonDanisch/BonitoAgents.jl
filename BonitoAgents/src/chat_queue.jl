@@ -47,7 +47,7 @@ function submission_payload(entry; dispatched_at = now(UTC))
 end
 
 origin_wire(::Nothing) = nothing
-origin_wire(o::PeerMessageOrigin) = Dict("id" => o.id, "project_id" => o.project_id,
+origin_wire(o::PeerMessageOrigin) = Dict{String,Any}("id" => o.id, "project_id" => o.project_id,
     "title" => o.title, "worker_id" => o.worker_id, "worker_name" => o.worker_name,
     "sent_at" => string(o.sent_at))
 origin_from_wire(::Nothing) = nothing
@@ -58,7 +58,7 @@ const HELD_DETAIL = "You pressed Stop: this goes out with your next message."
 const PEER_DISABLED_DETAIL = "Not sent: Chat messaging was turned off. Enable it in both chats, then send again or remove this message."
 
 function pause_disallowed_peer_sends!(model; revoked_project = "")
-    lock(model.lock) do
+    @lock model.lock let
         changed = false
         for entry in model.pending_sends
             entry isa PendingSend && entry.origin !== nothing &&
@@ -139,12 +139,12 @@ pending_path(m) = joinpath(m.chat_dir, "pending-messages.json")
 
 function save_pending_sends!(model)
     s = shared(model)
-    lock(s.lock) do
-        rows = [Dict("id" => e.id, "text" => e.bubble.text, "auto" => e.bubble.auto,
+    @lock s.lock let
+        rows = [Dict{String,Any}("id" => e.id, "text" => e.bubble.text, "auto" => e.bubble.auto,
             "origin" => origin_wire(e.origin),
             "riders" => [r.text for r in e.riders],
             "mode" => String(e.mode), "status" => String(e.status), "detail" => e.detail,
-            "images" => [Dict("mime" => i.mime, "data" => Base64.base64encode(i.data))
+            "images" => [Dict{String,Any}("mime" => i.mime, "data" => Base64.base64encode(i.data))
                          for i in e.message.images])
             for e in s.pending_sends if e isa PendingSend && e.status != :sent]
         mkpath(s.chat_dir)
@@ -210,8 +210,8 @@ function wake_outbox!(model)
 end
 
 function queue_event(model)
-    lock(shared(model).lock) do
-        items = [Dict("id" => e.id,
+    @lock shared(model).lock let
+        items = [Dict{String,Any}("id" => e.id,
             "text" => e.origin === nothing ? e.bubble.text : peer_message_text(e.origin, e.bubble.text), "mode" => String(e.mode),
             "status" => String(e.status), "detail" => e.detail)
             for e in shared(model).pending_sends if e isa PendingSend && e.status != :sent]
@@ -271,7 +271,7 @@ end
 
 function next_submission(model)
     s = shared(model)
-    lock(s.lock) do
+    @lock s.lock let
         pause_disallowed_peer_sends!(s)
         # Already-steered spans must settle before a new ordinary turn starts.
         for ready in (in((:sent, :submitted)), in((:waiting, :offline)))
@@ -324,7 +324,7 @@ function submission_sent!(model, e, span; text = e.bubble.text)
     e.span = span === nothing ? nothing : (turn=span, nstore0=length(model.msgs_store))
     # Native steering joins an existing turn, whose original prompt already
     # owns completion. It creates no second span to await or finalize.
-    span === nothing && lock(model.lock) do
+    span === nothing && @lock model.lock begin
         filter!(x -> x !== e, model.pending_sends)
     end
     save_pending_sends!(model)
@@ -402,7 +402,7 @@ end
 
 function settle_submission!(model, entry, failure)
     go_on = true
-    lock(model.lock) do
+    @lock model.lock let
         if entry.status === :submitted
             if entry.mode === :idle
                 # An unconsumed continuation belongs to the old turn. Never
@@ -444,7 +444,7 @@ end
 # the chat queued on its own is held for the user's next message.
 function drop_queued_sends!(model::ChatModel)
     s = shared(model)
-    count = lock(s.lock) do
+    count = @lock s.lock let
         n = 0
         for e in s.pending_sends
             if e isa PendingSend && e.status === :submitted
@@ -502,7 +502,7 @@ function deliver_boundary_message!(model)
         span = if native
             injected = AgentClientProtocol.steer!(c, with_prelude(s, payload.message.text); images=payload.message.images)
             if !injected
-                lock(s.lock) do
+                @lock s.lock begin
                     if entry.status === :sending
                         entry.status = :waiting
                         entry.mode = :done
@@ -525,12 +525,12 @@ function deliver_boundary_message!(model)
             end
         end
         !native && span === nothing && return nothing
-        lock(s.lock) do
+        @lock s.lock let
             native && submission_sent!(s, entry, span; text = payload.text)
         end
         native && wake_agent_waits!(s)
     catch err
-        lock(s.lock) do
+        @lock s.lock begin
             # A rejected steer was not delivered. Preserve a concurrent Stop
             # rather than rearming its paused entry when the response arrives.
             if entry.status === :sending

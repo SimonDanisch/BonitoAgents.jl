@@ -4,7 +4,7 @@
 chat_icon_dir(state, p) = joinpath(state.state_dir, "chats", p.id, "icon")
 
 function chat_icon_state(state::ServerState, p::ProjectInfo)
-    lock(state.lock) do
+    @lock state.lock begin
         get!(state.chat_icons, p.id) do
             dir = chat_icon_dir(state, p)
             selection = joinpath(dir, "selected")
@@ -55,7 +55,7 @@ end
 # an existing selection stays visible while a worker transfer runs.
 function select_chat_icon!(state, p, candidates::Vector{Tuple{Bool,String}}; force::Bool = false)
     icon = chat_icon_state(state, p)
-    lock(icon.lock) do
+    @lock icon.lock let
         current = lock(() -> icon.path, state.lock)
         !force && current !== nothing && return current
         isempty(candidates) && return nothing
@@ -86,7 +86,7 @@ function select_chat_icon!(state, p, candidates::Vector{Tuple{Bool,String}}; for
                 selection = joinpath(dir, "selected")
                 write(selection * ".partial", name)
                 mv(selection * ".partial", selection; force = true)
-                lock(state.lock) do; icon.path = path; end
+                @lock state.lock begin; icon.path = path; end
                 # The previous picture is unreferenced now; every tab re-renders
                 # its rows on the notify that follows.
                 for f in readdir(dir)
@@ -132,7 +132,7 @@ function request_chat_icon!(state::ServerState, p::ProjectInfo)
             finally
                 # Clear before notifying so listeners can request another scan
                 # if a message arrived while a worker file was being fetched.
-                lock(state.lock) do; icon.task = nothing; end
+                @lock state.lock begin; icon.task = nothing; end
                 lock(() -> icon.path, state.lock) === nothing || notify_chats!(state)
                 request_chat_icon!(state, p)
             end

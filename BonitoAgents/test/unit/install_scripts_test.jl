@@ -108,3 +108,55 @@ end
     @test any(l -> occursin("systemctl restart \"\$UNIT_SERVER\"", l), lines)
     @test !any(l -> occursin("systemctl start \"\$UNIT_SERVER\"", l), lines)
 end
+
+# The server ran out of memory every second or third update, precompiling
+# BonitoAgents next to the running server (2026-11-18). An update compiled the
+# whole env twice: once into the INSTALLER's depot, which the server never reads,
+# then into the service's. And BonitoAgents' compile peaked at 4.7 GB; one image
+# thread and a heap hint bring it to 3.2 GB. Here the installer's own functions
+# run with a `sudo` and two `julia`s that print what they were given.
+@testitem "unit:install_server_precompile_env" tags = [:unit] begin
+    using BonitoAgents
+    const BT = BonitoAgents
+
+    if !Sys.iswindows()
+        src = read(joinpath(BT.ASSETS_DIR, "install_server.sh"), String)
+        fn(name) = match(Regex("^$name\\(\\) \\{.*?^\\}", "ms"), src).match
+        as_service = match(r"^as_service\(\) \{.*\}$"m, src).match
+        dir = mktempdir()
+        data = mkpath(joinpath(dir, "data"))
+        for name in ("installer-julia", "service-julia")
+            path = joinpath(dir, name)
+            write(path, """
+                #!/usr/bin/env bash
+                echo "$name auto=\${JULIA_PKG_PRECOMPILE_AUTO-unset} threads=\${JULIA_IMAGE_THREADS-unset} heap=\${JULIA_HEAP_SIZE_HINT-unset} home=\$HOME pwd=\$PWD \$*"
+                """)
+            chmod(path, 0o755)
+        end
+        prog = """
+        set -euo pipefail
+        sudo() { [[ "\$1" == -u ]] && shift 2; "\$@"; }   # as root: runs the command
+        SERVICE_USER=bonitoagents DATA_DIR=$data MONOREPO_DIR=/repo
+        JULIA_BIN=$(joinpath(dir, "installer-julia")) SERVICE_JULIA=$(joinpath(dir, "service-julia"))
+        $as_service
+        $(fn("update_env"))
+        $(fn("precompile_service"))
+        update_env
+        precompile_service
+        """
+        # Only what the installer sets: the caller's own settings are removed (an
+        # eval session runs with JULIA_PKG_PRECOMPILE_AUTO=0).
+        lines = readlines(addenv(`bash -c $prog`, "JULIA_PKG_PRECOMPILE_AUTO" => nothing,
+                                 "JULIA_IMAGE_THREADS" => nothing, "JULIA_HEAP_SIZE_HINT" => nothing))
+        update = only(filter(startswith("installer-julia"), lines))
+        @test occursin("auto=0", update)                 # no compile into the installer's depot
+        @test occursin("Pkg.update()", update)
+        service = only(filter(startswith("service-julia"), lines))
+        @test occursin("auto=unset", service)            # the server's depot IS compiled
+        @test occursin("threads=1", service)
+        @test occursin("heap=2G", service)
+        @test occursin("home=$data pwd=$data", service)
+        @test occursin("--project=/repo", service)
+        @test occursin("using BonitoAgents", service)
+    end
+end

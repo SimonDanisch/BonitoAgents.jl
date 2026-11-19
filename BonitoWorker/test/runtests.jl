@@ -241,7 +241,7 @@ end
             "OPENCODE_AGENT_ACP" => "/nonexistent/opencode",
             "CODEX_AGENT_ACP" => "/nonexistent/codex-acp") do
         AgentProviders.refresh_providers!()
-        @test BW.scan_acp_providers() == Dict{String,Any}[]
+        @test BW.scan_acp_providers("w-test") == Dict{String,Any}[]
     end
     AgentProviders.refresh_providers!()
 
@@ -266,7 +266,7 @@ end
                 "OPENCODE_AGENT_ACP" => fast, "CODEX_AGENT_ACP" => "/nonexistent/codex-acp") do
             AgentProviders.refresh_providers!()
             rows = nothing
-            t = @elapsed rows = BW.scan_acp_providers(; timeout = 2.0)
+            t = @elapsed rows = BW.scan_acp_providers("w-test"; timeout = 2.0)
             @test t < 5.0                    # two silent agents, in parallel: ~2 s
             @test [(r["provider"], r["session_id"]) for r in rows] == [("OpenCode", "s1")]
         end
@@ -431,6 +431,11 @@ end
     @test occursin("Environment=PATH=/usr/bin:/home/u/.local/bin", u)
     # Crash-restart, memory cap, boot target, workdir.
     @test occursin("Restart=on-failure", u)
+    # A config error (status 78) is for a person; a restart never fixes it. And
+    # whatever keeps failing stops after a burst instead of every 5 s for hours.
+    @test occursin("RestartPreventExitStatus=$(BW.EXIT_CONFIG)", u)
+    @test BW.EXIT_CONFIG == 78
+    @test occursin(r"\[Unit\][^\[]*StartLimitIntervalSec=600\n\s*StartLimitBurst=5"s, u)
     @test occursin("MemoryMax=80%", u)
     @test occursin("WantedBy=default.target", u)
     @test occursin("WorkingDirectory=/home/u/projs", u)

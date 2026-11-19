@@ -736,7 +736,7 @@ function attachment_upload(state::ServerState, request::HTTP.Request, project_id
     # Removed from the composer before it finished: drop what arrived.
     if request.method == "DELETE"
         rm(part; force = true)
-        return json_response(Dict("removed" => true))
+        return json_response(Dict{String,Any}("removed" => true))
     end
     request.method == "POST" || return plain_response(405, "POST one chunk per request, or DELETE the upload")
     offset = tryparse(Int, get(params, "offset", ""))
@@ -751,9 +751,9 @@ function attachment_upload(state::ServerState, request::HTTP.Request, project_id
     have == offset || return plain_response(409, "expected the chunk at offset $(have)")
     open(io -> write(io, chunk), part, "a")
     received = offset + length(chunk)
-    received < total && return json_response(Dict("received" => received))
+    received < total && return json_response(Dict{String,Any}("received" => received))
     rel, on_worker = finish_attachment_upload!(state, proj, part, get(params, "name", ""))
-    return json_response(Dict("received" => received, "path" => rel, "on_worker" => on_worker))
+    return json_response(Dict{String,Any}("received" => received, "path" => rel, "on_worker" => on_worker))
 end
 
 json_response(d::AbstractDict) =
@@ -859,7 +859,7 @@ reaches the workers without a restart.
 """
 function worker_update_spec(state::ServerState; max_age::Real = 60.0)
     b = state.worker_build
-    return lock(b.lock) do
+    return @lock b.lock begin
         if time() - b.tried_at > max_age && (b.resolving === nothing || istaskdone(b.resolving))
             b.tried_at = time()
             b.resolving = Base.errormonitor(@async resolve_worker_build!(b))

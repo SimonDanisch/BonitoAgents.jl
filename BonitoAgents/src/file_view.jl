@@ -41,7 +41,7 @@ abstract type ViewMode end
 struct InlineView <: ViewMode end
 struct PanelView  <: ViewMode end
 
-const VIEW_AUDIO_MIME = Dict(".mp3" => "audio/mpeg", ".wav" => "audio/wav",
+const VIEW_AUDIO_MIME = Dict{String,String}(".mp3" => "audio/mpeg", ".wav" => "audio/wav",
     ".ogg" => "audio/ogg", ".oga" => "audio/ogg", ".flac" => "audio/flac",
     ".m4a" => "audio/mp4", ".aac" => "audio/aac", ".opus" => "audio/opus")
 const VIEW_MESH_EXTS  = (".obj", ".stl", ".ply", ".off", ".glb", ".gltf")

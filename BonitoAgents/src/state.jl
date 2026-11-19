@@ -49,7 +49,7 @@ sorted_apps(r::AppRegistry) = lock(() -> [r.apps[id] for id in sort!(collect(key
 
 "Add a started app under `id`, and tell the dashboards."
 function add_app!(r::AppRegistry, id::String, app::AgentApp)
-    lock(r.lock) do
+    @lock r.lock begin
         haskey(r.apps, id) && error("two apps with the id '$id'")
         r.apps[id] = app
         r.changed.val += 1
@@ -847,7 +847,7 @@ end
 #
 # Use `view = copy(state, session)` at the top of every `App() do session ... end` body.
 function Base.copy(s::ServerState, session::Bonito.Session, user::Union{User,Nothing} = s.user)
-    lock(s.lock) do
+    @lock s.lock begin
         ServerState(
             s.lock,
             s.state_dir, s.working_dir,
@@ -918,7 +918,7 @@ settings_file(s::ServerState)   = joinpath(s.state_dir, "settings.json")
 # Persist the server-wide defaults (the home "Defaults" control). Snapshot under
 # the lock, atomic write — same shape as `save_projects!`.
 function save_settings!(s::ServerState)
-    data = lock(s.lock) do
+    data = @lock s.lock let
         d = Dict{String,Any}("default_session_config" => copy(s.default_session_config[]))
         spec = s.harness_spec[]
         spec === nothing || (d["harnesses"] = spec)
@@ -1411,7 +1411,7 @@ notify_turn!(s::ServerState) = timed(() -> safe_notify!(root_state(s).turn_signa
 # A chat's turn ended now: the sidebar's order among the inactive chats.
 function turn_ended!(s::ServerState, project_id::AbstractString)
     s = root_state(s)
-    lock(s.lock) do
+    @lock s.lock begin
         s.turns_ended[String(project_id)] = time()
         save_projects!(s)
     end
@@ -1435,7 +1435,7 @@ notify_workers!(s::ServerState)  = timed(() -> safe_notify!(root_state(s).worker
 # new record themselves, and the loader has nothing new to write.
 function track_project!(s::ServerState, p::ProjectInfo; new_chat::Bool = false)
     isempty(p.owner) && (p.owner = acting_owner(s))
-    lock(s.lock) do
+    @lock s.lock let
         if new_chat && p.title[] == default_title(p)
             used = Set(q.title[] for q in values(s.projects[]) if
                        q.id != p.id && q.owner == p.owner && !q.dismissed)
@@ -1557,8 +1557,8 @@ end
 # inside also serialises concurrent saves of the SAME file so they can't race
 # the rename.
 function save_workers!(s::ServerState)
-    lock(s.lock) do
-        data = [Dict("worker_id" => w.worker_id,
+    @lock s.lock let
+        data = [Dict{String,Any}("worker_id" => w.worker_id,
                      "name" => w.name, "initials" => w.initials,
                      "owner" => w.owner, "credential" => w.credential,
                      "shared_with" => w.shared_with,
@@ -1622,8 +1622,8 @@ end
 # mutated the dict, and two of them could share a temp file and rename a
 # half-written projects.json into place (T2).
 function save_projects!(s::ServerState)
-    lock(s.lock) do
-        data = [Dict("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
+    @lock s.lock let
+        data = [Dict{String,Any}("id" => p.id, "name" => p.name, "worker_id" => p.worker_id,
                      "server_path" => p.server_path, "worker_path" => p.worker_path,
                      "created" => string(p.created),
                      "last_turn_ended" => get(s.turns_ended, p.id, 0.0),
@@ -1716,7 +1716,7 @@ end
 # Persist / restore the per-worker discovered-sessions cache. Best-effort:
 # it's a cache (re-derivable by Rescan), so a corrupt file just starts empty.
 function save_discovered!(s::ServerState)
-    lock(s.lock) do
+    @lock s.lock begin
         # Snapshot under the lock so we don't serialise the dict while a
         # locked writer (`scan_and_store!`) is mutating it (T2).
         atomic_write_json(discovered_file(s), copy(s.discovered[]))
@@ -1758,7 +1758,7 @@ function find_project_by_location(state::ServerState,
                                    worker_path::AbstractString)
     key = (String(worker_id), rstrip(String(worker_path), '/'))
     # Iterate under the lock (T14) — writers rehash `state.projects[]`.
-    lock(state.lock) do
+    @lock state.lock begin
         for p in values(state.projects[])
             project_location_key(p) == key && return p
         end
@@ -1808,7 +1808,7 @@ function find_thread(state::ServerState,
     chat_id === nothing && return nothing
     key = (String(worker_id), rstrip(String(worker_path), '/'), String(chat_id))
     # Iterate under the lock (T14) — writers rehash `state.projects[]`.
-    lock(state.lock) do
+    @lock state.lock begin
         for p in values(state.projects[])
             (p.worker_id, rstrip(p.worker_path, '/'), p.resume_session_id) == key &&
                 return p

@@ -24,3 +24,19 @@ using BonitoMCP, Logging, Test, UUIDs, ProgressLogging
     @test jobs["Typed record"]["status"]=="running"
     @test length(jobs)==3
 end
+
+# A value whose `show` throws, logged inside an eval: the logger reports it and
+# the eval goes on, as under a plain ConsoleLogger. ProgressLogger said it did
+# not catch, so the eval that logged it failed.
+struct ProgressUnprintable end
+Base.show(::IO, ::ProgressUnprintable) = error("this show method always throws")
+
+@testset "ProgressLogger: a log record that can't be shown doesn't throw" begin
+    logger = BonitoMCP.BonitoProgress.progress_logger(ConsoleLogger(IOBuffer()); context = Dict{String,String}())
+    @test Logging.catch_exceptions(logger)
+    reached = with_logger(logger) do
+        @info "unshowable" value = ProgressUnprintable()
+        true
+    end
+    @test reached
+end

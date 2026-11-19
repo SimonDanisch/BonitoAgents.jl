@@ -36,8 +36,8 @@ function WebSockets.send(ch::LinkChannel, x::Union{AbstractString,AbstractVector
     typeflag = text ? FLAG_TEXT : 0x00
     link = ch.link::Link
     n = length(bytes)
-    lock(ch.sendlock) do
-        lock(link.lock) do
+    @lock ch.sendlock begin
+        @lock link.lock let
             check_sendable(ch)
             if n == 0
                 enqueue!(ch, Frame(F_DATA, ch.id; flags = FLAG_EOM | typeflag))
@@ -65,7 +65,7 @@ end
 
 function WebSockets.receive(ch::LinkChannel)
     link = ch.link::Link
-    return lock(link.lock) do
+    return @lock link.lock let
         while isempty(ch.inbox)
             ch.aborted === nothing || throw(closed_error(1011, ch.aborted))
             (ch.remote_closed || ch.local_closed) && throw(closed_error(1000))
@@ -93,8 +93,8 @@ Close `ch` cleanly: everything already sent is delivered first, then the peer's
 function Base.close(ch::LinkChannel)
     ch.id == 0 && throw(ArgumentError("the control channel ends with the link"))
     link = ch.link::Link
-    lock(ch.sendlock) do              # after a message that is mid-send
-        lock(link.lock) do
+    @lock ch.sendlock begin              # after a message that is mid-send
+        @lock link.lock begin
             (ch.local_closed || ch.aborted !== nothing) && return nothing
             ch.local_closed = true
             for (_, _, owed) in ch.inbox
@@ -134,7 +134,7 @@ function abort(ch::LinkChannel, reason::AbstractString = "aborted")
 end
 
 WebSockets.isclosed(ch::LinkChannel) =
-    lock((ch.link::Link).lock) do
+    @lock (ch.link::Link).lock begin
         isempty(ch.inbox) && (ch.aborted !== nothing || (ch.local_closed && ch.remote_closed))
     end
 

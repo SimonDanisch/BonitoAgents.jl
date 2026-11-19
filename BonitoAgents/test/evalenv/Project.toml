@@ -45,4 +45,4 @@ Makie = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdi
 ComputePipeline = {url = "https://github.com/MakieOrg/Makie.jl.git", rev = "master", subdir = "ComputePipeline"}
 
 [compat]
-Bonito = "5.3"
+Bonito = "5.3.1"

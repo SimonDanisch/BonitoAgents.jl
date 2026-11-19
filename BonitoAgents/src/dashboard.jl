@@ -33,7 +33,7 @@ function claim_project!(state::ServerState, p::ProjectInfo, worker_id::String)
 end
 
 function release_project!(state::ServerState, p::ProjectInfo)
-    lock(state.lock) do
+    @lock state.lock begin
         p.locked_by = nothing
         p.locked_at = nothing
         save_projects!(state)
@@ -48,7 +48,7 @@ end
 # while a concurrent writer is mutating it; `release_project!` re-takes the
 # lock per project (reentrant, harmless).
 function release_projects_for_worker!(state::ServerState, worker_id::String)
-    targets = lock(state.lock) do
+    targets = @lock state.lock begin
         [p for p in values(state.projects[]) if p.locked_by == worker_id]
     end
     foreach(p -> release_project!(state, p), targets)
@@ -251,7 +251,7 @@ function create_project_from_worker!(state::ServerState, worker_name::String,
         @info "Registering project from worker (no sync)" worker=worker_name worker_path
     end
 
-    lock(state.lock) do
+    @lock state.lock begin
         save_projects!(state)
     end
     notify_projects!(state)
@@ -276,7 +276,7 @@ function sync_project_to_server!(state::ServerState, p::ProjectInfo; on_progress
     # "is it :syncing? → set :syncing" had a window where two receivers both
     # passed the check and both started writing the same server directory. One
     # locked transition makes the loser error out cleanly.
-    lock(state.lock) do
+    @lock state.lock begin
         p.backup_status === :syncing &&
             error("Project '$(p.name)' is already syncing")
         p.backup_status = :syncing
@@ -340,7 +340,7 @@ function ensure_project_session!(state::ServerState, p::ProjectInfo; progress = 
         try
             return fetch_bring_up(task)
         finally
-            lock(state.lock) do
+            @lock state.lock begin
                 get(state.session_inflight, p.id, nothing) === task &&
                     delete!(state.session_inflight, p.id)
             end
@@ -387,7 +387,7 @@ function bring_up_project_session!(state::ServerState, p::ProjectInfo;
     # the user closed).
     if p.dismissed
         p.dismissed = false
-        lock(state.lock) do; save_projects!(state); end
+        @lock state.lock begin; save_projects!(state); end
         notify_projects!(state)
     end
 
@@ -524,7 +524,7 @@ ChatModel from `state.chat_models`, and release the project lock. Safe to
 call when no session is active — it just no-ops.
 """
 function stop_session!(state::ServerState, p::ProjectInfo)
-    model = lock(state.lock) do
+    model = @lock state.lock let
         m = get(state.chat_models, p.id, nothing)
         m === nothing || delete!(state.chat_models, p.id)
         filter!(!=(p.id), state.bound_lru)   # drop from the live-agent LRU
@@ -623,7 +623,7 @@ function delete_chat!(state::ServerState, p::ProjectInfo;
     # Closed first: a tab showing this chat would otherwise bring it back up the
     # moment its session stops. The agent has to be gone before its transcript is,
     # or it writes the transcript back.
-    lock(state.lock) do
+    @lock state.lock begin
         p.dismissed = true
         save_projects!(state)
     end
@@ -634,11 +634,11 @@ function delete_chat!(state::ServerState, p::ProjectInfo;
             provider = provider_name(project_provider(p)), cwd = p.worker_path,
             session_id = something(session_id, ""), session = session_id !== nothing, memory)
     end
-    links = lock(state.shares.lock) do
+    links = @lock state.shares.lock begin
         [id for (id, link) in state.shares.links[] if link.project_id == p.id]
     end
     foreach(id -> revoke_share!(state, id), links)
-    lock(state.lock) do
+    @lock state.lock let
         delete!(state.projects[], p.id)
         delete!(state.review_states, p.id)
         delete!(state.turns_ended, p.id)
