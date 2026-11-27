@@ -1,0 +1,16 @@
+WEBVTT
+
+00:00.000 --> 00:07.800
+Change the model. The plot recomputes in Julia.
+
+00:08.000 --> 00:16.500
+Ask a follow-up. Results stream into the conversation.
+
+00:16.500 --> 00:23.300
+Open the full calculation, then fold it out of the way.
+
+00:23.400 --> 00:31.500
+Move the live app into its own workspace panel.
+
+00:31.500 --> 00:38.900
+The app stays interactive beside the code and conversation.

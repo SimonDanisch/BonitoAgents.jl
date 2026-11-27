@@ -1,0 +1,275 @@
+.VPHome .VPHero {
+  max-width: 1200px;
+  padding: 36px 24px 24px;
+  gap: 0;
+}
+.VPHome .VPHero .heading {
+  margin: 0;
+}
+.VPHome .VPHero .name {
+  font-size: 15px;
+  line-height: 1.5;
+  margin-bottom: 12px;
+  letter-spacing: 0;
+}
+.VPHome .VPHero .text {
+  font-size: clamp(32px, 4vw, 50px);
+  line-height: 1.12;
+  max-width: 900px;
+  letter-spacing: -0.035em;
+}
+.VPHome .VPHero .tagline {
+  max-width: 740px;
+  font-size: 18px;
+  line-height: 1.6;
+  padding-top: 12px;
+  margin: 0;
+}
+.VPHome .VPHero .actions {
+  padding-top: 20px;
+  gap: 10px;
+}
+.VPHome > .VPDoc {
+  padding: 8px 24px 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.ba-home {
+  width: 100%;
+}
+.VPHome .ba-home h2 {
+  border: 0;
+  padding: 0;
+  margin: 0 0 12px;
+  font-size: 30px;
+  line-height: 1.2;
+  letter-spacing: -0.025em;
+}
+.VPHome .ba-home h3 {
+  margin: 8px 0 12px;
+  font-size: 20px;
+  line-height: 1.3;
+}
+.VPHome .ba-home p {
+  margin: 0 0 16px;
+  line-height: 1.65;
+}
+.VPHome .ba-home figure {
+  margin: 0;
+  min-width: 0;
+}
+.ba-eyebrow {
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vp-c-brand-1);
+}
+.ba-meta, .ba-home figcaption {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--vp-c-text-2);
+}
+.ba-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+.VPHome .ba-section-heading .ba-eyebrow {
+  margin-bottom: 12px;
+}
+.ba-demo {
+  overflow: hidden;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+}
+.ba-demo video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  background: #f8fafc;
+}
+.ba-demo video::cue {
+  font-size: 18px;
+  font-family: system-ui, sans-serif;
+}
+.ba-home .ba-demo figcaption {
+  padding: 10px 16px;
+  border-top: 1px solid var(--vp-c-divider);
+}
+.ba-chapters {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+  margin-top: 12px;
+}
+.ba-chapters button {
+  position: relative;
+  padding: 12px 12px 12px 42px;
+  text-align: left;
+  border: 0;
+  border-top: 2px solid var(--vp-c-divider);
+  background: transparent;
+  color: var(--vp-c-text-1);
+  cursor: pointer;
+  font: inherit;
+}
+.ba-chapters button span {
+  position: absolute;
+  left: 8px;
+  top: 12px;
+  font-size: 12px;
+  color: var(--vp-c-text-2);
+}
+.ba-chapters strong {
+  display: block;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.ba-chapters small {
+  display: block;
+  font-size: 13px;
+  color: var(--vp-c-text-2);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+.ba-chapters button:hover, .ba-chapters button[aria-current] {
+  border-color: var(--vp-c-brand-1);
+  background: var(--vp-c-bg-soft);
+}
+.ba-chapters button:focus-visible, .ba-home a:focus-visible {
+  outline: 2px solid var(--vp-c-brand-1);
+  outline-offset: 4px;
+}
+.ba-section {
+  margin-top: 56px;
+}
+.ba-pillars {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 28px;
+  margin-top: 20px;
+}
+.ba-pillars article {
+  border-top: 1px solid var(--vp-c-divider);
+  padding-top: 20px;
+}
+.VPHome .ba-overview {
+  margin-top: 32px;
+}
+.VPHome .ba-overview img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.ba-pillars p:not(.ba-eyebrow), .ba-workspace p, .ba-start p {
+  color: var(--vp-c-text-2);
+  font-size: 15px;
+}
+.ba-pillars a, .ba-workspace a, .ba-start a:not(.VPButton) {
+  font-size: 14px;
+  font-weight: 550;
+}
+.ba-workspace {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.8fr) minmax(0, 1.6fr);
+  gap: 36px;
+  align-items: center;
+}
+.VPHome .ba-workspace img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 10px;
+}
+.ba-workspace figcaption {
+  margin-top: 8px;
+}
+.ba-share {
+  grid-template-columns: minmax(200px, 0.7fr) minmax(0, 1.3fr);
+  background: var(--vp-c-bg-soft);
+  border-radius: 12px;
+  padding: 28px 36px;
+}
+.ba-share figure {
+  display: flex;
+  justify-content: center;
+}
+.VPHome .ba-share img {
+  max-width: 210px;
+  max-height: 390px;
+  object-fit: contain;
+  border: 0;
+}
+.ba-start {
+  display: grid;
+  grid-template-columns: 1.5fr 1fr;
+  gap: 32px;
+  align-items: center;
+  padding: 32px 0;
+  border-top: 1px solid var(--vp-c-divider);
+}
+.ba-start-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 12px;
+}
+.VPHome .vp-doc > h1 {
+  display: none;
+}
+.VPHome .vp-doc > .admonition {
+  margin-top: 24px;
+}
+@media (max-width: 760px) {
+  .VPHome .VPHero {
+    text-align: left;
+    padding-top: 24px;
+  }
+  .VPHome .VPHero .main {
+    width: 100%;
+  }
+  .VPHome .VPHero .tagline {
+    font-size: 16px;
+    margin-left: 0;
+  }
+  .VPHome .VPHero .actions {
+    justify-content: flex-start;
+  }
+  .ba-section-heading {
+    display: block;
+  }
+  .ba-section-heading .ba-meta {
+    display: none;
+  }
+  .ba-pillars, .ba-workspace, .ba-start {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+  .ba-section {
+    margin-top: 36px;
+  }
+  .ba-chapters {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .ba-chapters button {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+  .ba-demo video::cue {
+    font-size: 12px;
+  }
+  .ba-chapters small {
+    display: none;
+  }
+  .ba-share {
+    padding: 24px;
+  }
+  .ba-share figure {
+    order: 2;
+  }
+}
