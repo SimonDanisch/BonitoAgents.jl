@@ -56,6 +56,13 @@
 #                         with no output at all, the way the adapter settles a
 #                         turn queued during an interrupt ("no in-flight SDK
 #                         work to interrupt"). The user's message vanishes.
+#   cancel_pending_tool — announce a tool call `pending` (Claude still writing
+#                         its input), and on cancel send what claude-agent-acp
+#                         sends: the result (cost, origin human), THEN the
+#                         call's `failed` close ("stopped before it ran"), THEN
+#                         the `cancelled` answer. The close after the reply's
+#                         end opened a turn nothing ended: the chat stayed busy
+#                         until Force stop.
 #
 # Stdin EOF → exit(0). The `LocalTransport` close(); `kill` cycle relies on
 # this: closing stdin makes us drop out of the dispatcher loop cleanly.
@@ -307,7 +314,7 @@ function handle_prompt(prompt_id, scenario::AbstractString; prompt_text = LAST_P
         # Background bash via two frames: the initial `tool_call` opens
         # the bubble with status="pending" so the per-tool snap channel
         # stays open, then a `tool_call_update` ships the "completed"
-        # status WITH the "Running in background, output written to: …"
+        # status WITH Claude Code's "Command running in background with ID: …"
         # content snap — that's what the chat-side update loop iterates
         # to push the bash into the taskbar. (One frame with status=completed
         # closes the channel synchronously with no snap delivered, so the
@@ -338,7 +345,7 @@ function handle_prompt(prompt_id, scenario::AbstractString; prompt_text = LAST_P
                 "status"  => "completed",
                 "content" => [Dict("type"    => "content",
                                    "content" => Dict("type" => "text",
-                                                     "text" => "Running in background, output written to: /tmp/mock-bg.log"))]))))
+                                                     "text" => "Command running in background with ID: bash1. Output is being written to: /tmp/mock-bg.log"))]))))
         while true
             sleep(1.0)
         end
@@ -371,6 +378,19 @@ function handle_prompt(prompt_id, scenario::AbstractString; prompt_text = LAST_P
         for i in 1:3
             agent_chunk("after-cancel$i "); sleep(0.05)
         end
+        resp(prompt_id, Dict("stopReason" => "cancelled"))
+    elseif scenario == "cancel_pending_tool"
+        # The frames after the cancel, in the order of the real adapter
+        # (AgentClientProtocol/test/fixtures/claude_cancel_pending_tool_wire.jsonl).
+        id = "toolu_pending_$(take_tool_seq!())"
+        tool_call("pending"; id, title = "Terminal")
+        while !cancelled[]
+            sleep(0.05)
+        end
+        emit_usage(Dict{String,Any}("used" => 32252, "size" => 1000000, "cost" => 0.31,
+                                    "origin" => "human"))
+        tool_call_update(id, Dict{String,Any}("status" => "failed", "content" => pack_tool_content(
+            [Dict("text" => "Claude stopped this tool call before it ran.")])))
         resp(prompt_id, Dict("stopReason" => "cancelled"))
     elseif scenario == "slow_cancel"
         # Stream until cancelled, then keep going for the grace window before

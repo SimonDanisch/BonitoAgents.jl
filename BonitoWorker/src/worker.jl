@@ -273,6 +273,11 @@ function hello(w::Worker)
         "mcp_path"      => c.mcp_command,
         "mcp_args"      => c.mcp_arguments,
         "projects_root" => c.projects_root,
+        # Where this machine keeps scratch space: the server may forget a chat
+        # whose folder in here is gone, and no other (`prune_missing_projects!`).
+        # Both spellings: on macOS `tempdir()` is /var/folders/…, its realpath
+        # /private/var/folders/….
+        "scratch_dirs"  => filter!(!isempty, unique!([String(rstrip(d, ['/', '\\'])) for d in (tempdir(), realpath(tempdir()))])),
         "auto_update"   => c.update_config !== nothing && auto_update_enabled(c.update_config),
         "update_spec"   => c.update_config === nothing ? nothing : configured_update_spec(c.update_config),
         "harnesses"     => installed_harnesses(harness_root(), AgentProviders.managed_packages()),
@@ -282,7 +287,7 @@ function hello(w::Worker)
         # sends a request only to a worker that lists it, so an older one is
         # skipped instead of waited on (it ignores an unknown request unanswered).
         "capabilities"  => ["kill_processes", "watch_file", "watch_file_end", "managed_process", "sync_paths",
-                            "password_prompts"],
+                            "password_prompts", "replay_tail"],
     )
 end
 
@@ -619,8 +624,9 @@ function run_agent_session(w::Worker, ch::WorkerLink.LinkChannel, header::Abstra
         @info "BonitoWorker: ACP session started" project_id cwd provider = provider_str pid = getpid(proc)
         try
             channel_ready(ch)
-            to_agent   = @async relay_ws_to_proc(ch, proc, relay, owner)
-            from_agent = @async relay_proc_to_ws(proc, ch)
+            cut = ReplayCut()   # both directions: a replay tail the server asks for
+            to_agent   = @async relay_ws_to_proc(ch, proc, relay, owner; cut)
+            from_agent = @async relay_proc_to_ws(proc, ch; cut)
             try
                 wait(to_agent)
             finally

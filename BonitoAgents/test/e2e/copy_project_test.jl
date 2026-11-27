@@ -206,6 +206,11 @@
             # a test that waited for "gone" would pass on either.
             @test TK.wait_for(server, "transfer completes",
                 "document.querySelector('.bt-prog.bt-prog-ok') !== null"; timeout = 120) == true
+            # A finished card has nothing to copy or download; both belong to
+            # errors (they used to show here, `.bw-btn` outranked their rule).
+            @test TK.eval_js(server, """[...document.querySelectorAll(
+                '.bt-prog-ok .bt-prog-copy, .bt-prog-ok .bt-prog-download')]
+                .map(e => getComputedStyle(e).display)""") == ["none", "none"]
 
             TK.screenshot(server, joinpath(tempdir(), "copy_project_done.png"))
         end

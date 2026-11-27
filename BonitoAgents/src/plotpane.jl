@@ -62,16 +62,17 @@ show_toast!(pane::PlotPane, msg::AbstractString) = busy_done!(pane.progress, msg
 show_toast!(::Nothing, ::AbstractString) = nothing
 
 """
-    show_problem!(pane::PlotPane, headline, detail = "")
+    show_problem!(pane::PlotPane, headline, detail = "", download = "")
 
 Report a failure in the window's progress card. It STAYS until the user
 dismisses it and its text is selectable and copyable — the whole reason this is
 not a toast. `detail` is the full error (see `error_detail`); the headline says
-which operation failed.
+which operation failed. A `download` URL adds a Download button.
 """
-show_problem!(pane::PlotPane, headline::AbstractString, detail::AbstractString = "") =
-    busy_fail!(pane.progress, headline, detail)
-show_problem!(::Nothing, ::AbstractString, ::AbstractString = "") = nothing
+show_problem!(pane::PlotPane, headline::AbstractString, detail::AbstractString = "",
+              download::AbstractString = "") =
+    busy_fail!(pane.progress, headline, detail, download)
+show_problem!(::Nothing, ::AbstractString, ::AbstractString = "", ::AbstractString = "") = nothing
 
 file_tab_id(path::AbstractString) = "file:" * String(path)
 # Per-embed panel id. One panel per detached `bt_show_app`, keyed by its tool id

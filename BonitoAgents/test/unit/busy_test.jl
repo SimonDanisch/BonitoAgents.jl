@@ -39,7 +39,7 @@ function launch_bg_bash!(model, id)
     BT.send!(model, m)
     put!(ch, ACP.BashCall(id, "execute", "monitor loop", "completed",
           ACP.ToolContent[ACP.TextContent(
-              "running in background. Output is being written to: /tmp/$id.output")],
+              "Command running in background with ID: $id. Output is being written to: /tmp/$id.output")],
           ch, "monitor loop", true, nothing))
     close(ch)
     BT.process_update!(m, bc)

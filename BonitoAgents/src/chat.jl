@@ -5195,8 +5195,14 @@ function process_update!(b::BashToolMsg, m::AgentClientProtocol.ToolCall; from::
     return nothing
 end
 
-# Pull the output-file path from a background-launch result, e.g.
-# "… Output is being written to: /tmp/…/<id>.output".
+# Pull the output-file path from a background-launch result. That result is
+# Claude Code's whole answer for a command it put in the background, in a
+# console fence:
+#   Command running in background with ID: b1fzuzp65. Output is being written
+#   to: /tmp/claude-1000/…/tasks/b1fzuzp65.output. You will be notified …
+# Anchored at the start: a foreground command's OUTPUT can contain the same
+# words (one that printed old chat logs was filed as a live background task,
+# 11-27), but only a launch's result begins with them.
 function parse_bg_output_path(content)
     for c in content
         txt = try
@@ -5208,7 +5214,7 @@ function parse_bg_output_path(content)
             e isa Union{MethodError, ArgumentError, InexactError} || rethrow()
             ""
         end
-        mm = match(r"written to:\s*(\S+)", txt)
+        mm = match(r"\A\s*(?:```\w*\s*)?Command running in background with ID: \S+? Output is being written to:\s*(\S+)", txt)
         # The sentence ends "…/<id>.output. You will be notified" — `\S+`
         # greedily eats the trailing period, yielding a path that doesn't
         # exist. Strip trailing sentence punctuation. (Bug: the dotted path
@@ -7014,7 +7020,19 @@ function note_bound!(state::ServerState, pid::AbstractString)
     return nothing
 end
 
-function start_chat_client!(model::ChatModel)
+# Whether a replay cut to its tail (`start!`'s `replay_tail`) misses this chat's
+# newest messages: the session went on elsewhere for longer than the tail, and
+# the reconciler would find no anchor and rebuild the chat from the tail alone.
+function tail_misses_history(model::ChatModel)
+    replay_cut(model.agent) || return false
+    existing = lock(() -> copy(model.msgs_store), model.lock)
+    return plan_reconcile(existing, filter(keep_in_history, replay(model.agent)), 0).mode == :diverged
+end
+
+# `replay_tail`: a chat that has its history asks a resumed session for only the
+# end of its replay (agents.jl `start!`). The reconciler needs no more: it
+# anchors on our newest messages and adopts what follows them.
+function start_chat_client!(model::ChatModel; replay_tail::Int = 200)
     # fs/* RPCs delegate to the stock FSRequestHandler; permission requests
     # render as interactive cards (see ChatPermissionHandler above).
     # `agent_cwd(agent)` is the path the agent sees (cwd locally, worker_path
@@ -7032,7 +7050,14 @@ function start_chat_client!(model::ChatModel)
     prev_session_id = model.chat_session.session_id
     # `on_frame` taps every raw ACP frame (both directions) into
     # chat_dir/acp.jsonl — inspectable live via GET /acp-log/<project_id>.
-    start!(model.agent; on_frame = acp_frame_logger(model.chat_dir))
+    on_frame = acp_frame_logger(model.chat_dir)
+    has_history = lock(() -> !isempty(model.msgs_store), model.lock)
+    start!(model.agent; on_frame, replay_tail = has_history ? replay_tail : 0)
+    if tail_misses_history(model)
+        @info "the replay's tail does not reach this chat's newest messages; loading the whole replay" project_id = model.project_id
+        stop!(model.agent)
+        start!(model.agent; on_frame)
+    end
     cli = client(model.agent)
     if cli !== nothing
         # A subagent's updates are ADDRESSED to it (`parentToolUseId`), so they
@@ -9617,6 +9642,18 @@ function open_guard_reject_reason(info::NamedTuple, path::AbstractString)
     return nothing
 end
 
+# A refused file that is there (only its size stops the viewer) can still be
+# downloaded: the URL for the refusal card's Download button, "" for none. The
+# signed worker-file URL, since an agent may name a file outside the project.
+refused_file_download(::ServerState, ::AbstractString, ::Union{Nothing,String}, ::AbstractString) = ""
+function refused_file_download(state::ServerState, project_id::AbstractString,
+                               info::NamedTuple, path::AbstractString)
+    info.isfile || return ""
+    proj = get(state.projects[], project_id, nothing)
+    proj === nothing && return ""
+    return worker_file_url(state, proj.worker_id, String(path))
+end
+
 # Short one-line reason for a fetch/build failure toast.
 open_error_brief(e) = e isa EOFError ? "couldn't read the file" :
                       first(split(sprint(showerror, e), '\n'))
@@ -9706,7 +9743,7 @@ function open_project_file!(pane::PlotPane, state::ServerState, project_id::Abst
         reason = open_guard_reject_reason(info, target)
         if reason !== nothing
             @info "file not opened" path = target reason project_id tab
-            show_problem!(pane, reason)
+            show_problem!(pane, reason, "", refused_file_download(state, project_id, info, target))
             return
         end
         elem = try

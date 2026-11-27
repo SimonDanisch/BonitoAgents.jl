@@ -41,16 +41,22 @@ struct WorkerFileTree
     expanded::Set{String}
     children::Dict{String,Any}            # dir abspath → sorted entries
     inflight::Set{String}                 # dirs whose list_dir RPC is running
+    # Dirs whose listing failed → why. Not cached as an empty folder: a worker
+    # that was offline or slow when the chat opened left its tree "empty" for
+    # good (11-24, after a laptop's worker reconnected). Listed again on Retry and
+    # when the worker comes back.
+    failed::Dict{String,String}
     index_files::Ref{Vector{String}}
     index_ready::Ref{Bool}
+    index_error::Ref{String}              # why the file index failed, "" if it didn't
     root_loaded::Ref{Bool}
 end
 
 WorkerFileTree(state::ServerState, project_id::AbstractString, pane::PlotPane) =
     WorkerFileTree(state, String(project_id), pane, Observable(false),
                    Observable(0), Observable(""), Observable(""),
-                   Set{String}(), Dict{String,Any}(), Set{String}(),
-                   Ref(String[]), Ref(false), Ref(false))
+                   Set{String}(), Dict{String,Any}(), Set{String}(), Dict{String,String}(),
+                   Ref(String[]), Ref(false), Ref(""), Ref(false))
 
 """
     WorkerFileTree(prototype) -> WorkerFileTree
@@ -70,8 +76,16 @@ still land" lives.
 WorkerFileTree(t::WorkerFileTree) =
     WorkerFileTree(t.state, t.project_id, t.pane, t.active,
                    t.tick, t.search, t.clicked,
-                   t.expanded, t.children, t.inflight,
-                   t.index_files, t.index_ready, t.root_loaded)
+                   t.expanded, t.children, t.inflight, t.failed,
+                   t.index_files, t.index_ready, t.index_error, t.root_loaded)
+
+# What a failed listing shows. A worker that is away is named as the sidebar
+# names it (the errors carry its id); anything else is the first line of the
+# error: a timeout, the worker's own error ("permission denied").
+function tree_failure(state::ServerState, worker_id::AbstractString, e)
+    worker_connected(state, worker_id) || return "$(last(worker_label(state.workers[], worker_id))) is not connected"
+    return String(first(split(sprint(showerror, e), '\n')))
+end
 
 # Cap on rendered search hits — keep the DOM small on a big index.
 const FILE_TREE_SEARCH_LIMIT = 300
@@ -132,6 +146,16 @@ function tree_dir_row(path, name, depth, is_open)
         dataPath = path, dataDir = "true")
 end
 
+# A folder that could not be listed: why, and a Retry that lists it again.
+function tree_failed_row(path, why, depth)
+    DOM.div(
+        DOM.span("Couldn't list this folder: " * why; class = "bt-tree-failed-why", title = why),
+        DOM.span("Retry"; class = "bt-tree-retry");
+        class = "bt-tree-row bt-tree-failed",
+        style = "padding-left:$(6 + depth * 12)px",
+        dataPath = path, dataDir = "retry")
+end
+
 function tree_file_row(path, name, depth)
     DOM.div(
         DOM.span(""; class = "bt-tree-arrow"),
@@ -183,8 +207,10 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
     expanded    = t.expanded
     children    = t.children
     inflight    = t.inflight
+    failed      = t.failed
     index_files = t.index_files
     index_ready = t.index_ready
+    index_error = t.index_error
     root_loaded = t.root_loaded
 
     tick    = t.tick
@@ -192,8 +218,11 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
     clicked = t.clicked
     bump() = (tick[] = tick[] + 1)
 
+    # Only an expand, a Retry, activation or a reconnect lists a dir, never a
+    # render, so a failure that is not cached cannot loop.
     fetch_dir!(dir) = begin
         (haskey(children, dir) || dir in inflight) && return
+        delete!(failed, dir)
         push!(inflight, dir)
         Base.errormonitor(@async begin
             try
@@ -201,7 +230,7 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
                 children[dir] = sort_tree_entries(res.entries)
             catch e
                 @warn "file tree: list_dir failed" dir exception = e
-                children[dir] = []           # cache the failure so we don't loop
+                failed[dir] = tree_failure(t.state, worker_id, e)
             finally
                 delete!(inflight, dir)
                 bump()
@@ -212,19 +241,30 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
 
     load_index!() = begin
         index_ready[] && return
+        index_error[] = ""
         Base.errormonitor(@async begin
             try
                 task = ensure_project_file_index!(t.state, proj)
                 task === nothing || wait(task)
                 index_files[] = project_index_files(proj)
-            catch e
-                @warn "file tree: index load failed" project = t.project_id exception = e
-            finally
                 index_ready[] = true
+            catch e
+                # Not "ready": a search would answer "no matches" for good.
+                @warn "file tree: index load failed" project = t.project_id exception = e
+                index_error[] = tree_failure(t.state, worker_id, e)
+            finally
                 bump()
             end
         end)
         return
+    end
+
+    # The worker is back: list again what failed while it was away.
+    worker = get(t.state.workers[], worker_id, nothing)
+    worker === nothing || on(session, worker.online) do online
+        online || return
+        foreach(fetch_dir!, collect(keys(failed)))
+        isempty(index_error[]) || load_index!()
     end
 
     activate!() = begin
@@ -243,10 +283,16 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
         isempty(payload) && return
         parts = split(payload, '\t'; limit = 2)
         length(parts) == 2 || return
-        is_dir = parts[1] == "true"
-        path   = String(parts[2])
+        kind = parts[1]
+        path = String(parts[2])
         isempty(path) && return
-        if is_dir
+        if kind == "retry"
+            fetch_dir!(path)
+            bump()
+        elseif kind == "retry-index"
+            load_index!()
+            bump()
+        elseif kind == "true"
             if path in expanded
                 delete!(expanded, path)
             else
@@ -270,7 +316,13 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
         query = strip(String(q))
         if !isempty(query)
             if !index_ready[]
-                return DOM.div("indexing…"; class = "bt-tree-empty")
+                isempty(index_error[]) && return DOM.div("indexing…"; class = "bt-tree-empty")
+                return DOM.div(DOM.div(
+                        DOM.span("Couldn't index the files: " * index_error[];
+                                 class = "bt-tree-failed-why", title = index_error[]),
+                        DOM.span("Retry"; class = "bt-tree-retry");
+                        class = "bt-tree-row bt-tree-failed", style = "padding-left:6px",
+                        dataPath = worker_root, dataDir = "retry-index"); class = "bt-tree-rows")
             end
             # Score EVERY file, then rank — never truncate before ranking, or an
             # exact match that sorts late alphabetically gets cut. Tie-break by
@@ -290,12 +342,17 @@ function Bonito.jsrender(session::Session, t::WorkerFileTree)
         if !root_loaded[] || (!haskey(children, worker_root) && worker_root in inflight)
             return DOM.div("loading…"; class = "bt-tree-empty")
         end
+        if haskey(failed, worker_root)
+            return DOM.div(tree_failed_row(worker_root, failed[worker_root], 0); class = "bt-tree-rows")
+        end
         rows = tree_visible_rows(worker_root, expanded, children)
         isempty(rows) && return DOM.div("empty"; class = "bt-tree-empty")
         nodes = Any[]
         for (path, name, isdir, depth) in rows
             push!(nodes, isdir ? tree_dir_row(path, name, depth, path in expanded) :
                                   tree_file_row(path, name, depth))
+            isdir && path in expanded && haskey(failed, path) &&
+                push!(nodes, tree_failed_row(path, failed[path], depth + 1))
         end
         DOM.div(nodes; class = "bt-tree-rows")
     end

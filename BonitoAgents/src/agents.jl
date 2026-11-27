@@ -68,6 +68,9 @@ mutable struct WorkerAgent <: AgentProvider
     # From the agent's own `initialize` handshake: can it session/load? Gates
     # whether we persist its session id.
     loads_sessions     :: Bool
+    # Whether `replay` is only the tail of the session's history: the worker cut
+    # it (`start!`'s `replay_tail`, BonitoWorker's replay_tail.jl).
+    replay_cut         :: Bool
 end
 
 # Default provider is ClaudeCode, overridable via `BT_DEFAULT_PROVIDER` — set by
@@ -100,11 +103,14 @@ WorkerAgent(state::ServerState, worker_id::AbstractString, worker_path::Abstract
     WorkerAgent(state, String(worker_id), String(worker_path), String(project_id),
                 collect(ACP.MCPServer, mcp), resume_session_id, provider, handler,
                 Ref{Any}(nothing), nothing, ACP.Message[], ReentrantLock(), false,
-                false)   # loads_sessions: set by the handshake in start!
+                false,   # loads_sessions: set by the handshake in start!
+                false)   # replay_cut: set by start!
 
 # The agent the worker sees as its cwd is the worker-side path.
 agent_cwd(a::WorkerAgent) = a.worker_path
 replay(a::WorkerAgent)    = a.replay
+replay_cut(::AgentProvider) = false
+replay_cut(a::WorkerAgent)  = a.replay_cut
 client(a::WorkerAgent)    = a.client
 Base.isopen(a::WorkerAgent) = a.client !== nothing && isopen(a.client)
 provider_name(a::WorkerAgent) = provider_name(a.provider)
@@ -123,7 +129,12 @@ ACP.WorkerTransport(a::WorkerAgent) = ACP.WorkerTransport(a.ws)
 # The worker's I/O is an `ACP.WorkerTransport` over the session's channel, so the
 # generic ACP `Connection` can drive line-level frames over it. The WorkerAgent
 # owns one; `start!` wires its `ws` Ref to the agent's.
-function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
+# `replay_tail > 0` asks for only the last that many messages of a resumed
+# session's replay. The worker receives the whole replay from the agent and sends
+# the server only that tail: the replay used to cross a slow uplink whole (3591
+# messages with images from a laptop, 11-27) and held up everything else on
+# the worker's connection. A worker that cannot cut sends it whole.
+function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing, replay_tail::Int = 0)
     a.client === nothing || return a       # fast idempotent path
     lock(a.bind_lock)
     try
@@ -191,6 +202,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
     new_session() = ACP.send_request(conn, "session/new",
         merge(Dict{String,Any}("cwd" => a.worker_path, "mcpServers" => mcp_list), prompt_meta))
 
+    a.replay_cut = false
     session_id, msgs, result = if a.resume_session_id !== nothing
         @info "ACP: resuming session" cwd=a.worker_path resume=a.resume_session_id
         load_params = merge(Dict(
@@ -198,6 +210,13 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
             "cwd"        => a.worker_path,
             "mcpServers" => mcp_list,
         ), prompt_meta)
+        w = get(a.state.workers[], a.worker_id, nothing)
+        if replay_tail > 0 && w !== nothing && can(w, "replay_tail")
+            meta = copy(get(prompt_meta, "_meta", Dict{String,Any}()))
+            meta["bonito/replayTail"] = replay_tail
+            load_params["_meta"] = meta
+            a.replay_cut = true
+        end
         # A stored id the agent can't load any more (rotated, pruned, or written
         # by a different agent) must open a fresh session, not kill the chat.
         # The project self-heals: `record_bound_session!` writes the fresh id
@@ -209,6 +228,7 @@ function start!(a::WorkerAgent; on_frame::Union{Function,Nothing} = nothing)
             e isa InterruptException && rethrow()
             @warn "ACP: session/load failed, starting a fresh session" exception=e cwd=a.worker_path resume=a.resume_session_id
             a.resume_session_id = nothing
+            a.replay_cut = false
             fresh = new_session()
             fresh["sessionId"], ACP.Message[], fresh
         end
@@ -253,6 +273,7 @@ function stop!(a::WorkerAgent; permanent::Bool = false)
         a.client === nothing || close(a.client)
         a.client = nothing
         a.replay = ACP.Message[]
+        a.replay_cut = false
         a.ws[] = nothing
     end
     return a

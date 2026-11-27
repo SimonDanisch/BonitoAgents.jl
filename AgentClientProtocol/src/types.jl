@@ -232,6 +232,13 @@ origin (captured in test/fixtures/claude_idle_compaction_wire.jsonl). A turn it
 opened would stay open until the next prompt's answer or a forced close. Work
 after a compaction still opens a turn.
 
+A tool call's last update (`completed` / `failed`) ends work that is already
+under way, so it starts nothing. claude-agent-acp closes a call that never ran
+(the prompt was cancelled while its input still streamed) after the result that
+ends the prompt's reply, and just before the `cancelled` answer, which ends no
+turn of the agent's own. A turn that frame opened had no end on the wire
+(test/fixtures/claude_cancel_pending_tool_wire.jsonl).
+
 `SubagentUpdate` is work, but reaches this only in tests — on the wire it is
 addressed to its owner before liveness is ever consulted.
 """
@@ -240,7 +247,7 @@ is_agent_work(::AgentMessageChunk) = true
 is_agent_work(::AgentThoughtChunk) = true
 is_agent_work(::PlanUpdate) = true
 is_agent_work(u::ToolCallNotif) = u.tool_name != CONTEXT_COMPACTION_TOOL
-is_agent_work(u::ToolCallUpdateNotif) = u.tool_name != CONTEXT_COMPACTION_TOOL
+is_agent_work(u::ToolCallUpdateNotif) = u.tool_name != CONTEXT_COMPACTION_TOOL && !tool_is_terminal(u)
 is_agent_work(::SubagentUpdate) = true
 
 # ── Autonomous cycles ────────────────────────────────────────────────────────

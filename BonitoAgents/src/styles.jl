@@ -560,8 +560,14 @@ const BASE_STYLES = Styles(APP_THEME, BonitoWidgets.BUTTON_STYLES, THEME_TOKENS,
         "padding" => "6px 8px"),
     # Copy belongs to the error state; dismissing a running transfer would only
     # hide it (the work keeps going), so ✕ is for the states that have ended.
-    CSS(".bt-prog-copy", "display" => "none"),
-    CSS(".bt-prog-err .bt-prog-copy", "display" => "inline-flex"),
+    # Scoped under `.bt-prog`: a bare `.bt-prog-copy` ties with `.bw-btn`'s
+    # `display: inline-flex`, which the page emits later, so Copy showed on
+    # running and finished cards too.
+    CSS(".bt-prog .bt-prog-copy", "display" => "none"),
+    CSS(".bt-prog.bt-prog-err .bt-prog-copy", "display" => "inline-flex"),
+    # Download only for an error that carries a URL (`href` is "" otherwise).
+    CSS(".bt-prog .bt-prog-download", "display" => "none", "text-decoration" => "none"),
+    CSS(".bt-prog.bt-prog-err .bt-prog-download:not([href=\"\"])", "display" => "inline-flex"),
     CSS(".bt-prog-close", "flex" => "0 0 auto"),
     CSS(".bt-prog-run .bt-prog-close", "display" => "none"),
 )

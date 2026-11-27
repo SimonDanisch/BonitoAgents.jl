@@ -18,6 +18,7 @@ include("harnesses.jl")
 include("adapter_patches.jl")
 include("managed_processes.jl")
 include("password_prompts.jl")
+include("replay_tail.jl")
 include("worker.jl")
 include("processes.jl")
 include("file_watch.jl")
@@ -2654,12 +2655,16 @@ function inject_mcp_grant(line::String, relay::MCPRelay, owner::AbstractString)
 end
 
 # Line shuttle from the session's channel to the agent's stdin, granting our
-# MCP server its relay access on the way (`inject_mcp_grant`).
-function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString)
+# MCP server its relay access on the way (`inject_mcp_grant`). A `session/load`
+# that asks for a replay tail is noted before the agent sees it, so none of its
+# replay can slip past `cut` (replay_tail.jl).
+function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString;
+                          cut::ReplayCut = ReplayCut())
     try
         while !WebSockets.isclosed(ws)
             frame = WebSockets.receive(ws)
             line  = inject_mcp_grant(String(frame), relay, owner)
+            note_replay_load!(cut, line)
             endswith(line, '\n') || (line *= "\n")
             write(proc.in, line)
             flush(proc.in)
@@ -2676,12 +2681,12 @@ function relay_ws_to_proc(ws, proc, relay::MCPRelay, owner::AbstractString)
     end
 end
 
-function relay_proc_to_ws(proc, ch)
+function relay_proc_to_ws(proc, ch; cut::ReplayCut = ReplayCut())
     try
         while isopen(proc)
             line = readline(proc.out; keep = true)
             isempty(line) && break
-            WebSockets.send(ch, line)
+            forward_agent_line!(cut, ch, line)
         end
     catch e
         # The agent's end, or the server's (a closed or aborted channel).
