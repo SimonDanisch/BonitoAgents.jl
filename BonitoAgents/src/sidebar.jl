@@ -1171,6 +1171,13 @@ const SidebarStyles = Bonito.Styles(
     CSS(".bt-tree-download:hover", "color" => "var(--bw-accent)"),
     CSS(".bt-tree-empty",
         "padding" => "4px 12px", "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)"),
+    # A folder (or the index) that could not be listed: why, muted, and a Retry.
+    CSS(".bt-tree-failed-why",
+        "flex" => "0 1 auto", "min-width" => "0", "overflow" => "hidden", "text-overflow" => "ellipsis",
+        "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-text-muted)"),
+    CSS(".bt-tree-retry",
+        "flex" => "0 0 auto", "margin-left" => "auto", "padding" => "0 4px",
+        "font-size" => "var(--bw-font-size-xs)", "color" => "var(--bw-accent)"),
     # No trees / hint in the collapsed icon rail.
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-wrap", "display" => "none"),
     CSS(".bt-sidebar.bt-collapsed .bt-side-tree-hint", "display" => "none"),

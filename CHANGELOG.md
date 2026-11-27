@@ -21,8 +21,44 @@ pieces fit together.
   chat's taskbar and the user can stop it. Later calls find it by its id alone. A
   sudo there asks for the password on a card that names that worker, and the
   password goes from the chat to that worker's sudo, never to the agent.
+- A file too large to open ("Can't open slides.pptx — 77.1 MB is too large to
+  open as text") can be downloaded from that message: it has a Download button.
 
 ### Fixed
+
+- Stop while Claude was still writing a tool call (its card said pending) left
+  the chat busy: the call's closing frame, sent after the reply had ended, counted
+  as the start of the agent's own work, and nothing ended that. Every later Stop
+  reached an agent with nothing to stop, and only Force stop got out. One Stop
+  ends the turn now.
+- A worker that came back while a project's folder was missing (a disk being
+  moved, a share not mounted yet) had the server delete that chat. Only chats
+  in the worker's scratch space (its temp folder) are forgotten when their folder
+  is gone now; every other chat stays. The worker names its scratch space when it
+  connects, so a worker that hasn't been updated yet has nothing forgotten.
+- The sidebar's file tree said "empty" for good when its folder could not be
+  listed (the worker was away or slow when the tree opened), and a search said
+  "no matches" when the file index could not be loaded. Both say why now, with a
+  Retry, and list again by themselves when the worker reconnects.
+- An ordinary command whose output quoted Claude Code's "Command running in
+  background … Output is being written to: …" was put in the taskbar as a running
+  background task until the session ended. Only a result that begins with that
+  sentence is a background launch.
+- Resuming a chat sent the agent's whole replay of its session across the
+  worker's connection, though the server already has the chat's history: on a
+  slow uplink (3591 messages with images from a laptop) that held up everything
+  else on that connection for over ten minutes, and the chat sat busy with no
+  session. The worker now receives the replay from the agent and sends only its
+  last 200 messages, which is all the server needs to pick up what happened
+  elsewhere; a session that went on elsewhere for longer is loaded whole, once.
+  The same for every agent. Workers that haven't been updated yet send it whole.
+- A request to a worker behind a busy connection (a chat's history replay over a
+  slow uplink) failed after 5 s with "worker may be offline or stuck". It waits
+  longer by the connection's measured round trip now, and says whether the
+  worker is not connected, its connection is slow, or it is connected and did not
+  answer.
+- The progress card's Copy button showed on running and finished operations,
+  not only on errors.
 
 - In a chat's Julia session, logging a value that can't be shown (`@info "x" v`
   with a `show` that throws) no longer aborts the eval. The logger reports it, as

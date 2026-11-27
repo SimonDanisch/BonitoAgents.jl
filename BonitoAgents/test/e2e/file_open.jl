@@ -204,6 +204,9 @@ function run_suite(server)
                 timeout = 15) == true
             @test TK.eval_js(server,
                 "document.querySelectorAll('$(panel_sel("subdir"))').length") == 0
+            # A folder has nothing to download: no Download button on its card.
+            @test TK.eval_js(server,
+                "document.querySelector('.bt-prog-err .bt-prog-download').offsetParent === null") == true
 
             # LAN http:// origins do not expose the async Clipboard API. Force
             # that browser condition and verify the textarea fallback copies the

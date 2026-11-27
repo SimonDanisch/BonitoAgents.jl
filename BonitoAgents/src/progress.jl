@@ -43,7 +43,9 @@ end
 #   :err  — it failed. The card stays until the user dismisses it, shows
 #           `detail` (the full error, selectable) and offers a Copy button.
 #           A failure the user cannot read or copy is the one state that must
-#           never expire on a timer.
+#           never expire on a timer. `download`, when set, is a URL the card
+#           offers as a Download button: a file too large to open can still
+#           be fetched.
 #
 # The card updates by *deriving Observable{String}s* off this one snapshot and
 # binding each to its own <span>. That hits Bonito's fast-path
@@ -52,12 +54,13 @@ end
 # fires thousands of file events and a fresh DOM tree per event would flash.
 
 const BUSY_IDLE = (
-    kind   = :idle,
-    title  = "",
-    msg    = "",
-    detail = "",
-    done   = 0,
-    total  = 0,
+    kind     = :idle,
+    title    = "",
+    msg      = "",
+    detail   = "",
+    download = "",
+    done     = 0,
+    total    = 0,
 )
 
 # The ONE predicate the "don't pile up two of these" guards ask. Deliberately
@@ -71,12 +74,13 @@ is_busy_running(s) = s.kind === :run
 function busy_start!(obs::Observable, title::AbstractString, msg::AbstractString = "")
     BUSY_LAST_FILE_NS[] = UInt64(0)   # reset throttle so the very first file event lands
     safe_set!(obs, (
-        kind   = :run,
-        title  = String(title),
-        msg    = String(msg),
-        detail = "",
-        done   = 0,
-        total  = 0,
+        kind     = :run,
+        title    = String(title),
+        msg      = String(msg),
+        detail   = "",
+        download = "",
+        done     = 0,
+        total    = 0,
     ))
 end
 
@@ -87,18 +91,23 @@ The operation finished. The card shows `msg` and fades itself out after a few
 seconds (the JS owns the timer, see `progress_overlay`).
 """
 busy_done!(obs::Observable, msg::AbstractString) = safe_set!(obs, (
-    kind = :ok, title = String(msg), msg = "", detail = "", done = 0, total = 0))
+    kind = :ok, title = String(msg), msg = "", detail = "", download = "", done = 0, total = 0))
 
 """
-    busy_fail!(obs, title, detail)
+    busy_fail!(obs, title, detail, download = "")
 
 The operation failed. Unlike every other state this one has NO timer: it stays
 until the user dismisses it, renders `detail` as selectable text and offers a
 Copy button. Use [`error_detail`](@ref) to build `detail` from an exception.
+A non-empty `download` URL adds a Download button.
 """
-busy_fail!(obs::Observable, title::AbstractString, detail::AbstractString) =
+# `download` is positional, not a keyword: a keyword method adds a generated
+# name, which renumbers every later closure and makes their precompile
+# statements stale.
+busy_fail!(obs::Observable, title::AbstractString, detail::AbstractString,
+           download::AbstractString = "") =
     safe_set!(obs, (kind = :err, title = String(title), msg = "",
-                    detail = String(detail), done = 0, total = 0))
+                    detail = String(detail), download = String(download), done = 0, total = 0))
 
 busy_clear!(obs::Observable) = safe_set!(obs, BUSY_IDLE)
 
@@ -217,6 +226,7 @@ progress_payload(s) = JSON.json(Dict{String,Any}(
     "title"  => s.title,
     "msg"    => s.msg,
     "detail" => s.detail,
+    "download" => s.download,
     "pct"    => s.total > 0 ? round(Int, 100 * s.done / max(s.total, 1)) : -1))
 
 function progress_overlay(session::Bonito.Session, busy::Observable)
@@ -250,13 +260,18 @@ function progress_overlay(session::Bonito.Session, busy::Observable)
     # connects (or reconnects) while a transfer is running must show it, and
     # `onjs` only fires on later updates.
     now = busy[]
+    # Shown only while an error carries a URL (`href` empty hides it, styles.jl).
+    download_link = DOM.a("Download";
+        href = now.download, download = "",
+        class = "bw-btn bw-btn-secondary bw-btn-sm bt-prog-download",
+        title = "Download the file to this computer")
     card = DOM.div(
         DOM.div(
             DOM.span(; class = "bt-prog-spin"),
             DOM.span(now.title; class = "bt-prog-title"),
             DOM.span(""; class = "bt-prog-pct"),
             DOM.span(now.msg; class = "bt-prog-msg"),
-            copy_btn, close_btn;
+            download_link, copy_btn, close_btn;
             class = "bt-prog-row"),
         DOM.div(DOM.div(; class = "bt-prog-fill"); class = "bt-prog-bar"),
         DOM.pre(now.detail; class = "bt-prog-detail");
@@ -276,6 +291,7 @@ function progress_overlay(session::Bonito.Session, busy::Observable)
         el.querySelector('.bt-prog-title').textContent  = s.title;
         el.querySelector('.bt-prog-msg').textContent    = s.msg;
         el.querySelector('.bt-prog-detail').textContent = s.detail;
+        el.querySelector('.bt-prog-download').setAttribute('href', s.download);
         el.querySelector('.bt-prog-pct').textContent    = s.pct >= 0 ? s.pct + '%' : '';
         el.querySelector('.bt-prog-fill').style.width   = (s.pct >= 0 ? s.pct : 0) + '%';
     }""")

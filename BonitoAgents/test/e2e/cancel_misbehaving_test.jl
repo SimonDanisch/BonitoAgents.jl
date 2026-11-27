@@ -202,4 +202,43 @@ end
     end
 end
 
+# ── 4. A Stop while a tool call is still being written ends the turn ─────────
+# Shipped bug (11-22 to 11-27, 15 force-closes on the server): Stop while a
+# tool card was `pending`. claude-agent-acp ends the prompt's reply first and
+# closes the call that never ran after it, and that closing frame opened a turn
+# of the agent's own that nothing ended. The chat stayed busy, every later Stop
+# reached an agent with nothing to stop, and only Force stop got out.
+@testset "a Stop while a tool call is written settles the chat" begin
+    s = scenario_server("cancel_pending_tool")
+    try
+        TK.new_chat(s)
+        TK.send_message(s, "write a long command")
+        card = "[...document.querySelectorAll('.bt-tool-msg')].find(m => m.offsetParent !== null)"
+        @test TK.wait_for(s, "the tool card is up",
+            "($card)?.querySelector('.bt-tool-status')?.textContent === 'pending'"; timeout = 20) == true
+
+        @test stop!(s) == true
+
+        # THE INVARIANT: one Stop is enough. The card is closed and the chat is
+        # idle again, without a second click and without Force stop.
+        @test TK.wait_for(s, "the card is closed",
+            "($card)?.querySelector('.bt-tool-status')?.textContent === 'failed'"; timeout = 20) == true
+        settled = try
+            TK.wait_for(s, "chat is idle after one Stop",
+                "(() => { const b = [...document.querySelectorAll('.bt-busy')]" *
+                ".find(e => e.offsetParent !== null); " *
+                "return !!b && !b.classList.contains('bt-busy-active'); })()";
+                timeout = 20)
+        catch e
+            # Only `wait_for`'s timeout means "still busy"; say which half holds it.
+            (e isa ErrorException && startswith(e.msg, "wait_for timed out")) || rethrow()
+            @info "cancel_misbehaving: chat stayed busy after a Stop on a pending tool" diag = busy_diag(s)
+            false
+        end
+        @test settled == true
+    finally
+        close(s)
+    end
+end
+
 end

@@ -171,6 +171,20 @@ function run_suite(server)
             @test occursin("huge.txt", msg) && occursin("Can't open", msg)
             sleep(1.0)
             @test TK.eval_js(server, "document.querySelectorAll('.bw-ws-panel').length") == before
+
+            # The file is there, only too big to show: the card offers it as a
+            # download, and the link brings the whole file under its own name.
+            link = TK.eval_js(server, """(() => {
+                const a = document.querySelector('.bt-prog-err .bt-prog-download');
+                return a && a.offsetParent !== null && a.hasAttribute('download')
+                    ? a.getAttribute('href') : false; })()""")
+            @test link isa String && !isempty(link)
+            if link isa String && !isempty(link)
+                r = TK.BT.HTTP.get(server.h.url * link)
+                @test r.status == 200
+                @test length(r.body) == 3_000_000
+                @test occursin("filename=\"huge.txt\"", TK.BT.HTTP.header(r, "Content-Disposition"))
+            end
         end
 
         @testset "the hint collapses the tree again" begin

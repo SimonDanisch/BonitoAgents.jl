@@ -139,6 +139,13 @@ end
             # An image is NOT a refusal any more: the file viewer opens every
             # kind, so the guard only stops files that can't be opened at all.
             @test BT.open_guard_reject_reason(h.state, pid, "logo.png") === nothing
+
+            # Only a refused file that exists gets a Download button.
+            dl(p) = BT.refused_file_download(h.state, pid, BT.open_guard_stat(h.state, pid, p), p)
+            big = joinpath(root, "big.txt")
+            @test dl(big) == BT.worker_file_url(h.state, wid, big)
+            @test dl(joinpath(root, "src")) == ""
+            @test dl(joinpath(root, "nope.jl")) == ""
         end
 
         @testset "project file index: cache + single-flight" begin

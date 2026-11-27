@@ -182,11 +182,38 @@ end
 # Take from a pending-RPC channel with a bounded wait. If `timeout` seconds
 # elapse without the worker replying, evict the entry (so a late reply gets
 # "unknown id") and surface a clear error to the caller.
-take_pending!(state::ServerState, ch::Channel, key::String, timeout::Real, op_name::AbstractString) =
-    timed(() -> wait_pending!(state, ch, key, timeout, op_name), state, :worker_rpc; op = String(op_name))
+#
+# With `worker_id`, the wait grows by two of that link's ping round trips: a link
+# busy with bulk data (a chat's history replay, a sync) delays every reply about
+# as long as a ping, and a fixed 5 s failed a stat on a laptop while its link
+# was carrying a 114 MB replay (11-24). The error then says what was true.
+take_pending!(state::ServerState, ch::Channel, key::String, timeout::Real, op_name::AbstractString;
+              worker_id::AbstractString = "") =
+    timed(() -> wait_pending!(state, ch, key, timeout + 2 * link_rtt(state, worker_id), op_name, worker_id),
+          state, :worker_rpc; op = String(op_name))
+
+# The worker's last measured ping round trip, 0.0 before the first or without a link.
+function link_rtt(state::ServerState, worker_id::AbstractString)
+    isempty(worker_id) && return 0.0
+    link = worker_link(state, worker_id)
+    link === nothing && return 0.0
+    rtt = WorkerLink.ping_rtt(link)
+    return isnan(rtt) ? 0.0 : rtt
+end
+
+# Why a request to `worker_id` got no answer within `waited` seconds.
+function rpc_timeout_detail(state::ServerState, worker_id::AbstractString, waited::Real)
+    after = "no answer within $(round(waited; digits = 1)) s"
+    isempty(worker_id) && return "$after; the worker may be offline or stuck"
+    worker_connected(state, worker_id) || return "$after; the worker is not connected"
+    rtt = link_rtt(state, worker_id)
+    rtt >= WorkerLink.SLOW_PING_S &&
+        return "$after; its connection is slow (a ping takes $(round(rtt; digits = 1)) s)"
+    return "$after, although the worker is connected and its connection is fast"
+end
 
 function wait_pending!(state::ServerState, ch::Channel, key::String,
-                       timeout::Real, op_name::AbstractString)
+                       timeout::Real, op_name::AbstractString, worker_id::AbstractString = "")
     # Fire the timeout from a `Timer` rather than an `@async sleep(timeout)`
     # task (T15): the old design left one sleeping task alive for the FULL
     # timeout (15–120 s, and the 1 Hz bg poller calls this every tick) even when
@@ -224,8 +251,7 @@ function wait_pending!(state::ServerState, ch::Channel, key::String,
     end
     if val === nothing
         log_rpc_timeout(state, String(op_name), timeout)
-        throw(WorkerUnreachableError(String(op_name),
-            "timed out after $(timeout)s — worker may be offline or stuck"))
+        throw(WorkerUnreachableError(String(op_name), rpc_timeout_detail(state, worker_id, timeout)))
     end
     # A definitive failure arrives as an Exception (`deliver_rpc_error!`), so
     # the caller fails fast instead of waiting out the timeout.
@@ -445,7 +471,7 @@ function handle_worker_link(state::ServerState, ws, request)
             # One reader per link: a resume keeps the control channel, and so
             # the reader that already serves it.
             Base.errormonitor(@async serve_worker_control(state, worker_id, link))
-            worker_came_online!(state, worker_id)
+            worker_came_online!(state, worker_id, info)
             # Registered and online: the chats a crash of its previous run cut off
             # can be continued now.
             worker_run_started!(state, worker_id, info)
@@ -599,10 +625,11 @@ end
 
 # First contact of a new link: reconcile the worker's projects with its disk.
 # Async, so the round trips never hold up the connection.
-function worker_came_online!(state::ServerState, worker_id::String)
-    # Drop projects whose folder is gone (scratch dirs cleared on reboot).
+function worker_came_online!(state::ServerState, worker_id::String, hello::AbstractDict)
+    # Drop projects whose scratch folder is gone (cleared on reboot).
+    scratch = String[String(d) for d in get(hello, "scratch_dirs", Any[]) if d isa AbstractString && !isempty(d)]
     Base.errormonitor(@async try
-        prune_missing_projects!(state, worker_id)
+        prune_missing_projects!(state, worker_id, scratch)
     catch e
         @warn "prune_missing_projects! failed" worker = worker_id exception = e
     end)
@@ -979,8 +1006,7 @@ function open_worker_channel(state::ServerState, worker_id::AbstractString,
         timed_out[] = true
         WorkerLink.abort(ch, "no answer within $(timeout)s")
     end
-    unreachable() = WorkerUnreachableError(what,
-        "timed out after $(timeout)s — worker may be offline or stuck")
+    unreachable() = WorkerUnreachableError(what, rpc_timeout_detail(state, worker_id, timeout))
     reply = try
         WebSockets.receive(ch)
     catch e
@@ -1104,7 +1130,7 @@ function list_worker_dir(state::ServerState, worker_name::String, path::Abstract
             "request_id" => rid,
             "path"       => String(path),
         ))
-        take_pending!(state, ch, rid, timeout, "list_dir on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "list_dir on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)   # T10: no leak on send failure
     end
@@ -1137,7 +1163,7 @@ function make_worker_dir(state::ServerState, worker_name::String,
             "parent"     => String(parent),
             "name"       => String(name),
         ))
-        take_pending!(state, ch, rid, timeout, "make_dir on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "make_dir on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1167,7 +1193,7 @@ function ensure_worker_dir(state::ServerState, worker_name::String,
             "request_id" => rid,
             "path"       => String(path),
         ))
-        take_pending!(state, ch, rid, timeout, "ensure_dir on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "ensure_dir on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1197,7 +1223,7 @@ function stat_worker_path(state::ServerState, worker_name::String, path::Abstrac
             "request_id" => rid,
             "path"       => String(path),
         ))
-        take_pending!(state, ch, rid, timeout, "stat_path on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "stat_path on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1222,7 +1248,7 @@ function read_worker_file_range(state::ServerState, worker_id::String,
     resp = try
         send_command(state, worker_id, Dict{String,Any}("type" => "read_file_range",
             "request_id" => rid, "path" => path, "start" => start, "count" => count))
-        take_pending!(state, ch, rid, 30.0, "read_file_range on '$worker_id'")
+        take_pending!(state, ch, rid, 30.0, "read_file_range on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1250,7 +1276,7 @@ function list_worker_project_files(state::ServerState, worker_name::String,
             "request_id" => rid,
             "path"       => String(root),
         ))
-        take_pending!(state, ch, rid, timeout, "list_project_files on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "list_project_files on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1328,7 +1354,7 @@ function kill_worker_file_writers(state::ServerState, worker_id::AbstractString,
     resp = try
         send_command(state, worker_id, Dict(
             "type" => "kill_file_writers", "request_id" => rid, "path" => String(path)))
-        take_pending!(state, ch, rid, timeout, "kill_file_writers on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "kill_file_writers on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1359,16 +1385,29 @@ function worker_path_missing(state::ServerState, worker_id::AbstractString,
     return !st.isdir
 end
 
-# Drop this worker's registered projects whose `worker_path` no longer exists
-# (e.g. `/tmp/jl_*` scratch dirs cleared on reboot). Conservative: only
-# definitively-missing paths, and never an in-use (locked) project. Returns the
-# number pruned. Runs the inspect round-trips serially — fine off the hot path.
-function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
+# Whether `path` is `dir` or inside it, in the worker's own spelling of paths
+# (a Windows worker reports `C:\…`).
+function inside_dir(path::AbstractString, dir::AbstractString)
+    sep = occursin('\\', dir) ? '\\' : '/'
+    return path == dir || startswith(path, dir * sep)
+end
+
+# Drop this worker's registered projects in its scratch space (`scratch_dirs`,
+# from its hello: `/tmp/jl_*` folders a reboot clears) whose folder is gone.
+# Only there: a folder anywhere else that is missing when the worker connects is
+# missing for now (a disk being moved, a share not mounted yet), and the chat is
+# the user's. Pruning everything missing deleted 26 chats on 11-18, an app's chat
+# and its data among them, while the worker's disk was being moved. A worker too old to name
+# its scratch space prunes nothing. Never an in-use (locked) project, and only
+# definitively-missing paths. Returns the number pruned.
+function prune_missing_projects!(state::ServerState, worker_id::AbstractString,
+                                 scratch_dirs::Vector{String})
     # Snapshot candidates under the lock (T14) so we don't iterate
     # `state.projects[]` while a locked writer rehashes it.
     candidates = @lock state.lock begin
         [(id, p.worker_path) for (id, p) in state.projects[]
-         if p.worker_id == worker_id && p.locked_by === nothing]
+         if p.worker_id == worker_id && p.locked_by === nothing &&
+            any(d -> inside_dir(p.worker_path, d), scratch_dirs)]
     end
     dead = String[]
     for (id, wp) in candidates
@@ -1386,7 +1425,7 @@ function prune_missing_projects!(state::ServerState, worker_id::AbstractString)
         save_projects!(state)
     end
     notify_projects!(state)
-    @info "pruned project(s) with missing worker paths" worker = worker_id count = length(dead) ids = dead
+    @info "pruned project(s) whose scratch folder is gone" worker = worker_id count = length(dead) ids = dead
     return length(dead)
 end
 
@@ -1406,7 +1445,7 @@ function scan_worker_sessions(state::ServerState, worker_name::String;
     resp = try
         send_command(state, worker_name, Dict{String,Any}("type" => "scan_sessions", "request_id" => rid,
                                               "agents" => agents))
-        take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "scan_sessions on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)   # T10
     end
@@ -1581,7 +1620,7 @@ function clone_repo_on_worker(state::ServerState, worker_name::String,
     pr_number === nothing || (payload["pr_number"] = Int(pr_number))
     resp = try
         send_command(state, worker_name, payload)
-        take_pending!(state, ch, rid, timeout, "clone_repo on '$worker_name'")
+        take_pending!(state, ch, rid, timeout, "clone_repo on '$worker_name'"; worker_id = worker_name)
     finally
         unregister_rpc!(state, rid)   # T10
     end
@@ -1606,7 +1645,7 @@ function worker_state(state::ServerState, worker_id::AbstractString; timeout::Re
     rid, ch = register_rpc!(state)
     resp = try
         send_command(state, worker_id, Dict{String,Any}("type" => "worker_state", "request_id" => rid))
-        take_pending!(state, ch, rid, timeout, "worker_state on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "worker_state on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1738,7 +1777,7 @@ function worker_log(state::ServerState, worker_id::AbstractString;
         send_command(state, worker_id, Dict{String,Any}("type" => "read_log", "request_id" => rid,
                                             "lines" => Int(lines), "since" => String(since),
                                             "until" => String(until), "grep" => String(grep)))
-        take_pending!(state, ch, rid, timeout, "worker_log on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "worker_log on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1773,7 +1812,7 @@ function debug_checkout_on_worker(state::ServerState, worker_id::AbstractString;
             "repo"       => String(repo),
             "rev"        => String(rev),
             "packages"   => packages))
-        take_pending!(state, ch, rid, timeout, "debug_checkout on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "debug_checkout on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1796,7 +1835,7 @@ function worker_rpc(state::ServerState, worker_id::AbstractString, kind::Abstrac
     resp = try
         send_command(state, String(worker_id),
                      merge(Dict{String,Any}("type" => kind, "request_id" => rid), fields))
-        take_pending!(state, ch, rid, timeout, what)
+        take_pending!(state, ch, rid, timeout, what; worker_id = String(worker_id))
     finally
         unregister_rpc!(state, rid)
     end
@@ -1933,7 +1972,7 @@ function git_diff_on_worker(state::ServerState, worker_id::AbstractString,
         send_command(state, worker_id, Dict(
             "type" => "git_diff", "request_id" => rid,
             "path" => String(path), "base" => String(base)))
-        take_pending!(state, ch, rid, timeout, "git_diff on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "git_diff on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end
@@ -1973,7 +2012,7 @@ function find_repos_on_worker(state::ServerState, worker_id::AbstractString,
         send_command(state, worker_id, Dict(
             "type" => "find_repos", "request_id" => rid,
             "path" => String(path), "max_depth" => max_depth))
-        take_pending!(state, ch, rid, timeout, "find_repos on '$worker_id'")
+        take_pending!(state, ch, rid, timeout, "find_repos on '$worker_id'"; worker_id = worker_id)
     finally
         unregister_rpc!(state, rid)
     end

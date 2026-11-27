@@ -656,8 +656,11 @@ function serve_worker_file(state::ServerState, request, worker_id::String, path:
         if range === nothing && !isempty(range_header)
             return HTTP.Response(416, ["Content-Range" => "bytes */$(info.size)"])
         end
+        # `inline` keeps previews showing; the filename names a download of this
+        # URL (the open refusal's Download button) instead of "worker-file".
         headers = ["Content-Type" => mime, "Cache-Control" => "no-cache", "ETag" => etag,
-                   "Accept-Ranges" => "bytes"]
+                   "Accept-Ranges" => "bytes",
+                   "Content-Disposition" => "inline; filename=\"$(download_filename(basename(path)))\""]
         if range === nothing
             return HTTP.Response(200, headers;
                 body = worker_file_body(WorkerFileStream(state, worker_id, path, 0, info.size - 1)))
